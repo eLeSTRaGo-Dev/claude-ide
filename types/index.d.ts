@@ -2,7 +2,8 @@ export type ExplorerState = {
   root: string
   mode: 'files' | 'unity'
   expanded: string[]
-  selected?: string
+  selected?: string // the file shown in the preview (Enter or click)
+  cursor?: string // the row the arrows are on (the focus ring)
   offset: number
   previewOffset: number // first preview line shown
 }

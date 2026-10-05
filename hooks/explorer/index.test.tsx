@@ -389,6 +389,39 @@ test('focus moving past the window edge scrolls the tree', async ($, on) => {
   expect(shown).not.toContain('row:/big/f00.txt')
 })
 
+test('focus moves the cursor, Enter moves the selection', async ($, on) => {
+  mock.store(on)
+  fake(on)
+  TREE['/cur'] = ['a.txt', 'b.txt'].map(name => entry(name, 'file'))
+  FILES['/cur/a.txt'] = 'alpha'
+  FILES['/cur/b.txt'] = 'bravo'
+  on('ui.focus', () => ({}))
+  await $.session.start({ cwd: '/cur', surface: 'terminal', isInteractive: true })
+  const ui = await $.ui.mount({
+    plugin: PLUGIN,
+    surface: 'terminal',
+    component: 'Pane',
+    props: PROPS,
+    requestId: 'ide-explorer',
+    viewport: VIEWPORT,
+  })
+
+  const code = async () => (await ui.find({ type: 'Code' }))?.text ?? ''
+  await ui.press({ key: 'row:/cur/a.txt' })
+  expect(await code()).toContain('alpha')
+  await $.ui.focus({
+    component: 'Pane',
+    requestId: 'ide-explorer',
+    plugin: PLUGIN,
+    element: 'row:/cur/b.txt',
+    origin: { kind: 'person' },
+  })
+  // the preview stays on the selected file while the cursor moves
+  expect(await code()).toContain('alpha')
+  await ui.press({ key: 'row:/cur/b.txt' })
+  expect(await code()).toContain('bravo')
+})
+
 test('command opens the pane and sets the mode', async ($, on) => {
   const store = new Map<string, unknown>()
   on('store.get', (_$, e) => ({ value: store.get(e.key) }))

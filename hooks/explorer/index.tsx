@@ -67,6 +67,10 @@ const isMode = (value: unknown): value is Mode =>
 
 // The session's `/color` as the transcript last recorded it (`agent-color`
 // entries); nothing recorded leaves the current value.
+// Background of the selected row (the file in the preview); the cursor is
+// the engine's focus ring, drawn inverse on top.
+const SELECTED = 'ansi256(238)'
+
 const syncColor = async ($: EngineInterface): Promise<void> => {
   try {
     const id = await $.session.id()
@@ -233,9 +237,12 @@ const setMode = async ($: EngineInterface, mode: Mode): Promise<void> => {
   await $.store.set(modeKey(root), mode)
 }
 
+// Enter or a click: the row becomes the selection (shown in the preview);
+// a dir also opens or closes.
 const press = async ($: EngineInterface, row: Row): Promise<void> => {
   await update($, explorer, s => ({
     ...s,
+    cursor: row.path,
     selected: row.path,
     previewOffset: s.selected === row.path ? s.previewOffset : 0,
     expanded:
@@ -279,6 +286,7 @@ const jump = async ($: EngineInterface, path: string): Promise<void> => {
   await update($, explorer, s => ({
     ...s,
     selected: path,
+    cursor: path,
     previewOffset: s.selected === path ? s.previewOffset : 0,
     expanded,
     offset: win.offset,
@@ -370,6 +378,7 @@ export const register = (on: On): void => {
         mode: isMode(saved) ? saved : 'files',
         expanded: isSame ? s.expanded : [],
         selected: isSame ? s.selected : undefined,
+        cursor: isSame ? s.cursor : undefined,
         offset: isSame ? s.offset : 0,
         previewOffset: isSame ? (s.previewOffset ?? 0) : 0,
       }
@@ -458,13 +467,9 @@ export const register = (on: On): void => {
         treeRows,
         state.offset,
       )
-      if (state.selected !== path || state.offset !== win.offset) {
-        await update($, explorer, s => ({
-          ...s,
-          selected: path,
-          previewOffset: s.selected === path ? s.previewOffset : 0,
-          offset: win.offset,
-        }))
+      // The focus ring is the cursor; the selection moves only on Enter.
+      if (state.cursor !== path || state.offset !== win.offset) {
+        await update($, explorer, s => ({ ...s, cursor: path, offset: win.offset }))
       }
     }
 
@@ -493,21 +498,16 @@ export const register = (on: On): void => {
       const rows = flatten(listings, new Set(state.expanded), root, {
         mode: state.mode,
       })
-      const at = rows.findIndex(row => row.path === state.selected)
+      const at = rows.findIndex(row => row.path === (state.cursor ?? state.selected))
       const target = rows[clamp(at < 0 ? 0 : at + e.by, rows.length - 1)]
-      if (target !== undefined && target.path !== state.selected) {
+      if (target !== undefined && target.path !== state.cursor) {
         const win = windowOf(
           rows,
           rows.indexOf(target),
           treeRows,
           state.offset,
         )
-        await update($, explorer, s => ({
-          ...s,
-          selected: target.path,
-          previewOffset: 0,
-          offset: win.offset,
-        }))
+        await update($, explorer, s => ({ ...s, cursor: target.path, offset: win.offset }))
         await $.ui.focus({ requestId: PANE, key: 'row:' + target.path })
       }
     } else {
@@ -579,13 +579,15 @@ export const register = (on: On): void => {
         : Math.min(refs.length, Math.max(1, Math.floor((treeRows - 1) / 2)))
     const hidden = refs.length - shown
     const refLines = refs.length === 0 ? 0 : 1 + shown + (hidden > 0 ? 1 : 0)
-    // A row scrolled out of the window is not focused: autoFocus would move
-    // the selection to whatever row the wheel brought in.
+    // The focus ring starts on the cursor (else the selection). A row scrolled
+    // out of the window is not focused: autoFocus would move the cursor to
+    // whatever row the wheel brought in.
+    const home = state.cursor ?? current?.path
     const focusKey =
-      current === undefined
+      home === undefined
         ? win.rows[0]?.path
-        : win.rows.some(row => row.path === current.path)
-          ? current.path
+        : win.rows.some(row => row.path === home)
+          ? home
           : undefined
     const previewTotal = preview?.type === 'code' ? preview.lines.length : 0
     const previewRows = Math.max(1, treeRows - refLines)
@@ -663,8 +665,14 @@ export const register = (on: On): void => {
             {rows.length === 0 && <Text dimColor>(empty)</Text>}
             {win.rows.map(row => (
               // Selection mark, a dim rail per depth level, then the row.
-              <Box key={'line:' + row.path} flexDirection="row">
-                <Text>{row.path === state.selected ? '>' : ' '}</Text>
+              <Box
+                key={'line:' + row.path}
+                flexDirection="row"
+                backgroundColor={row.path === state.selected ? SELECTED : undefined}
+              >
+                <Text color={border.borderColor}>
+                  {row.path === state.selected ? '▌' : ' '}
+                </Text>
                 {row.depth > 0 && <Text dimColor>{'│ '.repeat(row.depth)}</Text>}
                 <Button
                   key={'row:' + row.path}
