@@ -21,6 +21,8 @@ type On = Parameters<Register>[0]
 
 // Black behind the whole pane, as the console default.
 const BACKGROUND = 'black'
+// Frame around each section so the blocks read apart.
+const BORDER = { borderStyle: 'round', borderColor: 'gray' } as const
 const PANE = 'ide-git'
 const PAGE = 200
 // Pane body columns from which the three-column layout is used.
@@ -216,11 +218,14 @@ export const register = (on: On): void => {
     const area = Math.max(4, bodyRows - 1)
     const topRows = isWide ? area : Math.max(3, Math.floor(area * 0.55))
     const detailRows = isWide ? area : Math.max(3, area - topRows)
-    graphRows = Math.max(3, topRows - 1)
+    // Each section is framed: 2 rows and 2 columns go to the border.
+    const topInner = Math.max(3, topRows - 2)
+    const detailInner = Math.max(3, detailRows - 2)
+    graphRows = Math.max(2, topInner - 1)
     const graphWidth = isWide
-      ? Math.floor(columns * 0.4) - 2
-      : columns - Math.floor(columns * 0.3) - 2
-    const sideWidth = isWide ? Math.floor(columns * 0.2) : Math.floor(columns * 0.3)
+      ? Math.floor(columns * 0.4) - 4
+      : columns - Math.floor(columns * 0.3) - 4
+    const sideWidth = (isWide ? Math.floor(columns * 0.2) : Math.floor(columns * 0.3)) - 2
 
     const branches = await branchesOf($, cwd)
     const lines = await graphOf($, cwd, state)
@@ -232,14 +237,14 @@ export const register = (on: On): void => {
     const focusKey = selected === undefined ? undefined : keyOf(current as GraphLine)
     const details =
       selected === undefined ? undefined : await detailsOf($, cwd, selected.sha)
-    const headRows = Math.max(3, Math.floor(detailRows / 2))
+    const headRows = Math.max(3, Math.floor(detailInner / 2))
     const head = details === undefined ? [] : details.head.slice(0, headRows)
-    const diffRows = Math.max(1, detailRows - head.length)
+    const diffRows = Math.max(1, detailInner - head.length)
     const head0 = branches.find(branch => branch.isHead)
     const branchRows = windowOf(
       branches,
       branches.findIndex(branch => branch.name === state.ref),
-      Math.max(3, topRows - 1),
+      Math.max(2, topInner - 1),
     ).rows
 
     const select = (ref: string) =>
@@ -252,7 +257,7 @@ export const register = (on: On): void => {
       }))
 
     const branchColumn = (
-      <Box flexDirection="column" width={isWide ? '20%' : '30%'}>
+      <Box flexDirection="column" width={isWide ? '20%' : '30%'} height={topRows} {...BORDER}>
         <Button
           key="all"
           hotkey="a"
@@ -281,7 +286,7 @@ export const register = (on: On): void => {
     )
 
     const graphColumn = (
-      <Box flexDirection="column" flexGrow={isWide ? undefined : 1} width={isWide ? '40%' : undefined}>
+      <Box flexDirection="column" flexGrow={isWide ? undefined : 1} width={isWide ? '40%' : undefined} height={topRows} {...BORDER}>
         {lines.length === 0 && <Text dimColor>(no commits)</Text>}
         {win.rows.map((line, i) =>
           line.commit === undefined ? (
@@ -318,7 +323,7 @@ export const register = (on: On): void => {
     )
 
     const detailColumn = (
-      <Box flexDirection="column" flexGrow={1}>
+      <Box flexDirection="column" flexGrow={1} height={detailRows} {...BORDER}>
         {selected === undefined && <Text dimColor>Select a commit.</Text>}
         {head.map((text, i) => (
           <Text key={'head:' + i} bold={i === 0} wrap="truncate-end">
@@ -354,14 +359,14 @@ export const register = (on: On): void => {
           />
         </Box>
         {isWide ? (
-          <Box flexDirection="row" gap={1}>
+          <Box flexDirection="row">
             {branchColumn}
             {graphColumn}
             {detailColumn}
           </Box>
         ) : (
           <Box flexDirection="column">
-            <Box flexDirection="row" gap={1}>
+            <Box flexDirection="row">
               {branchColumn}
               {graphColumn}
             </Box>

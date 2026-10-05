@@ -29,6 +29,8 @@ type On = Parameters<Register>[0]
 
 // Black behind the whole pane, as the console default.
 const BACKGROUND = 'black'
+// Frame around each section so the blocks read apart.
+const BORDER = { borderStyle: 'round', borderColor: 'gray' } as const
 const PANE = 'ide-explorer'
 const MODES: readonly Mode[] = ['files', 'unity']
 
@@ -434,7 +436,9 @@ export const register = (on: On): void => {
       state.mode === 'unity' && !(await isUnityProject($, root))
     const index = rows.findIndex(row => row.path === state.selected)
     const bodyRows = e.props.scroll.bodyRows
-    treeRows = Math.max(3, bodyRows - 2)
+    // One header row, then the bordered sections: 2 rows of frame each.
+    const sectionRows = Math.max(5, bodyRows - 1)
+    treeRows = sectionRows - 2
     const win = windowOf(rows, index, treeRows, state.offset)
     const current = index < 0 ? undefined : rows[index]
     const isUnity = state.mode === 'unity' && !isNotUnity
@@ -486,8 +490,8 @@ export const register = (on: On): void => {
             }}
           />
         </Box>
-        <Box flexDirection="row" gap={1}>
-          <Box flexDirection="column" width="35%">
+        <Box flexDirection="row">
+          <Box flexDirection="column" width="35%" height={sectionRows} {...BORDER}>
             {rows.length === 0 && <Text dimColor>(empty)</Text>}
             {win.rows.map(row => (
               <Button
@@ -505,7 +509,7 @@ export const register = (on: On): void => {
               />
             ))}
           </Box>
-          <Box flexDirection="column" flexGrow={1}>
+          <Box flexDirection="column" flexGrow={1} height={sectionRows} {...BORDER}>
             {preview === undefined && <Text dimColor>Select a file.</Text>}
             {preview?.type === 'text' &&
               preview.lines.map(line => <Text>{line}</Text>)}

@@ -363,7 +363,7 @@ test('focus moving past the window edge scrolls the tree', async ($, on) => {
     plugin: PLUGIN,
     surface: 'terminal',
     component: 'Pane',
-    props: { ...PROPS, scroll: { offset: 0, bodyRows: 6 } },
+    props: { ...PROPS, scroll: { offset: 0, bodyRows: 7 } },
     requestId: 'ide-explorer',
     viewport: VIEWPORT,
   })
