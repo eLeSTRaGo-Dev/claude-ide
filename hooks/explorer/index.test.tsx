@@ -452,13 +452,33 @@ test('command opens the pane and sets the mode', async ($, on) => {
   expect(bad.text).toContain('Usage')
 })
 
-test('session.start registers both /explorer and /git', async ($, on) => {
+test('session.start registers /explorer, /git and /ide-panels', async ($, on) => {
   mock.store(on)
   const names: string[] = []
   fake(on, [], [], names)
   await $.session.start(start('terminal'))
 
-  expect(names.sort()).toEqual(['explorer', 'git'])
+  expect(names.sort()).toEqual(['explorer', 'git', 'ide-panels'])
+})
+
+test('/ide-panels opens explorer and git, explorer focused in front', async ($, on) => {
+  mock.store(on)
+  const opened: unknown[] = []
+  fake(on, [], opened)
+  await $.session.start(start('terminal'))
+  const ran = await $.command.run({
+    command: 'ide-panels',
+    args: '',
+    origin: { kind: 'composer' },
+    presentation: PRESENTATION,
+  })
+
+  expect(ran.text).toContain('Explorer and Git')
+  expect(opened).toEqual([
+    { id: 'ide-explorer', focus: undefined },
+    { id: 'ide-git', focus: undefined },
+    { id: 'ide-explorer', focus: true },
+  ])
 })
 
 for (const surface of ['terminal', 'desktop'] as const) {

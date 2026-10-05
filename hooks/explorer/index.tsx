@@ -14,7 +14,7 @@ import {
   window as windowOf,
 } from './tree'
 import type { Entry, Mode, Row } from './tree'
-import { GIT_COMMAND } from '../git/git'
+import { GIT_COMMAND, GIT_PANE } from '../git/git'
 import { borderOf, lastAgentColor, parseColorAnswer } from '../shared/color'
 import { scrollbar } from '../shared/scrollbar'
 import {
@@ -368,6 +368,10 @@ export const register = (on: On): void => {
     })
     // the git view's command: one session.start hook per plugin
     await $.command.register(GIT_COMMAND)
+    await $.command.register({
+      name: 'ide-panels',
+      description: 'Open every ide-panes pane (explorer and git)',
+    })
     const saved = await $.store.get(modeKey(e.cwd))
     await update($, explorer, s => {
       const isSame = s.root === '' || s.root === e.cwd
@@ -450,6 +454,16 @@ export const register = (on: On): void => {
     const { mode } = await read($, explorer)
 
     return { text: `Explorer opened (${mode} mode).` }
+  })
+
+  // Every pane at once. They are tabs in open order (Explorer, Git); the
+  // explorer is opened again with focus to bring it in front.
+  on('command.run', { command: 'ide-panels' }, async $ => {
+    await $.ui.open({ id: PANE, title: 'Explorer' })
+    await $.ui.open({ id: GIT_PANE, title: 'Git' })
+    await $.ui.open({ id: PANE, title: 'Explorer', focus: true })
+
+    return { text: 'Opened Explorer and Git (ctrl+x tab, or click a tab, to switch).' }
   })
 
   on('ui.focus', { requestId: PANE }, async ($, e, next) => {

@@ -6,6 +6,7 @@ import { window as windowOf } from '../explorer/tree'
 import { borderOf } from '../shared/color'
 import { scrollbar } from '../shared/scrollbar'
 import {
+  GIT_PANE,
   branchTree,
   remoteArgv,
   remoteSummary,
@@ -32,7 +33,7 @@ const sessionColor = atom<'ide-panes', 'sessionColor'>(
   { plugin: 'ide-panes', key: 'sessionColor' } as const,
   '',
 )
-const PANE = 'ide-git'
+const PANE = GIT_PANE
 // Background of the selected branch, as the explorer's selected row.
 const SELECTED = 'ansi256(238)'
 
