@@ -12,3 +12,20 @@ export const STAT =
 
 export const PATCH =
   'diff --git a/CHANGELOG.md b/CHANGELOG.md\nindex 2ab3741..af8640a 100644\n--- a/CHANGELOG.md\n+++ b/CHANGELOG.md\n@@ -7,6 +7,32 @@ its `version` is bumped on `main`.\n \n ## [Unreleased]\n \n+## [0.7.1] - 2026-07-09\n+\n+### Design & develop streams rewritten for legibility\n+\n+Restructure both work-stream skills to a thin-router + shared-grammar shape: the shared law lives in\n+one place (the router `SKILL.md`) and each activity reference carries only its distinctive loop.\n+Behaviour-preserving apart from one flagged reconciliation.\n+\n+#### Changed\n+- **Design skill rewritten as a thin router + three-shape reference grammar.** `SKILL.md` is now the\n+  single home for the shared law — the acceptance gate, session lifecycle, the no-code rule, fan-out\n+  doctrine, and the feature-map/Status lifecycle. The five references drop the duplicated blocks and\n+  carry only their distinctive working section: single-loop (`competitive-research`, `spec`),\n+  mode-split (`ui-ux`, `feature-owner`), or part-split (`completeness-audit`). Each activity\'s\n+  loop/modes are written as paste-ready checklist-Plan boxes. Every load-bearing invariant is retained.\n+- **`spec` close reconciled.** The `spec` activity now stages durable learnings to the promote-buffer\n+  and stops, instead of spawning the curator per activity — aligning it with the\n+  chain-consolidates-once rule the skill body already states.\n+- **Develop skill rewritten for legibility** on the same grammar — a thin router `SKILL.md` with the\n+  verify gates and session lifecycle stated once, and paste-ready checklist-Plan loops in\n+  `feature`/`fix`/`refactor`. The generic checklist template + action are aligned with the paste-ready\n+  loop convention.\n'
+
+// `git show --name-status -M --diff-merges=first-parent --format=` of the v0.7.1 commit.
+export const NAME_STATUS =
+  'M\tCHANGELOG.md\nM\tplugin/package.json\nA\tdocs/read me.md\nD\told.txt\nR100\tsrc/a.ts\tsrc/b.ts\n'
+
+// The same commit's patch, one block per listed file.
+export const MULTI_PATCH =
+  'diff --git a/CHANGELOG.md b/CHANGELOG.md\nindex 2ab3741..af8640a 100644\n--- a/CHANGELOG.md\n+++ b/CHANGELOG.md\n@@ -1 +1,2 @@\n keep\n+changelog line\n' +
+  'diff --git a/plugin/package.json b/plugin/package.json\nindex 111..222 100644\n--- a/plugin/package.json\n+++ b/plugin/package.json\n@@ -1 +1 @@\n-\"version\": \"0.7.0\"\n+\"version\": \"0.7.1\"\n' +
+  'diff --git a/docs/read me.md b/docs/read me.md\nnew file mode 100644\nindex 0000000..333\n--- /dev/null\n+++ b/docs/read me.md\n@@ -0,0 +1 @@\n+spaced path\n' +
+  'diff --git a/old.txt b/old.txt\ndeleted file mode 100644\nindex 444..0000000\n--- a/old.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-gone\n' +
+  'diff --git a/src/a.ts b/src/b.ts\nsimilarity index 100%\nrename from src/a.ts\nrename to src/b.ts\n'
+
+// A merge commit against its first parent (`--diff-merges=first-parent`).
+export const MERGE_NAME_STATUS = 'M\tfrom-develop.txt\n'
+export const MERGE_PATCH =
+  'diff --git a/from-develop.txt b/from-develop.txt\nindex 555..666 100644\n--- a/from-develop.txt\n+++ b/from-develop.txt\n@@ -1 +1 @@\n-first parent\n+merged in\n'

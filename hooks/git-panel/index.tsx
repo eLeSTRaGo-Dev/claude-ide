@@ -5,6 +5,7 @@ import type { GitState } from '../../types'
 import { window as windowOf } from '../explorer-panel/tree'
 import { borderOf } from '../shared/color'
 import { scrollbar } from '../shared/scrollbar'
+import { fractionOf, splitAt } from '../shared/split'
 import {
   GIT_PANE,
   branchTree,
@@ -18,7 +19,12 @@ import {
   changeRows,
   cellRuns,
   changeWords,
+  fileDiff,
+  filesArgv,
+  DIFF_COLS,
   fitStart,
+  graphColumns,
+  maxLanesFor,
   isUntracked,
   diffLines,
   infoHead,
@@ -27,15 +33,16 @@ import {
   PALETTE_SIZE,
   parseBranches,
   parseLog,
-  parseStatus,
+  parseNameStatus,
   patchArgv,
+  parseStatus,
   sliceDiff,
   splitShow,
   statArgv,
   statusArgv,
   trackLabel,
 } from './git'
-import type { Branch, BranchRow, Change, ChangeRow, Commit, RemoteAction } from './git'
+import type { Branch, BranchRow, Change, ChangeRow, Commit, GraphRow, RemoteAction } from './git'
 
 type On = Parameters<Register>[0]
 
@@ -77,8 +84,28 @@ const refColor = (ref: string, remotes: ReadonlySet<string>): string =>
   ref.startsWith('tag: ') ? 'yellow' : remotes.has(ref) ? 'red' : 'green'
 
 const PAGE = 200
-// Pane body columns from which the three-column layout is used.
+// Each side of a splitter keeps at least this many columns / rows.
+const MIN_COLS = 12
+const MIN_ROWS = 4
+// Pane body columns from which Branches takes its narrower (wide) fraction.
 const WIDE = 140
+// Default split fractions: Branches' width (`sideWide` from WIDE columns, else
+// `sideNarrow`), Info's share of the Overview's right column, Files' width in
+// Change Log. Each is applied in one place in the render hook.
+const SPLIT = { sideWide: 0.2, sideNarrow: 0.3, info: 0.4, files: 0.3 } as const
+
+type Tab = 'overview' | 'graph' | 'changelog'
+
+// An old persisted `'changes'` is Change Log; any other unknown value, Overview.
+const tabOf = (s: GitState): Tab => {
+  const tab = s.tab as string | undefined
+
+  return tab === 'changes' || tab === 'changelog'
+    ? 'changelog'
+    : tab === 'graph'
+      ? 'graph'
+      : 'overview'
+}
 
 const git = atom<'ide-panes', 'git'>(
   { plugin: 'ide-panes', key: 'git' } as const,
@@ -92,26 +119,42 @@ let branchCache: Branch[] | undefined
 let statusCache: Change[] | undefined
 const graphCache = new Map<string, Commit[]>()
 const showCache = new Map<string, { head: string[]; diff: string }>()
+// A commit's changed files and whole patch, for the diff view. Cleared by
+// `clear()` only: commits do not change on Write/Edit.
+const diffCache = new Map<string, { files: Change[]; patch: string }>()
 const changeCache = new Map<string, { head: string[]; diff: string }>()
 let hasHead: boolean | undefined
-// Rows the graph and the changes list show; set by render, read by the focus hook.
+// Rows the graph and the Files list show; set by render, read by the focus hook.
 let graphRows = 20
+// Commit rows of each tab, so a tab switch can window the list for the tab it goes to.
+const tabRows = { overview: 20, graph: 20 }
 let changeRoom = 20
 // The last drawing's geometry, set by render and read by the scroll hook: where
-// each section sits (columns split at `branchEnd` and `graphEnd`; stacked, the
-// details start at row `topRows`), each section's furthest offset and the rows
-// the details show.
+// each section sits (Overview: columns split at `branchEnd`, the right column's
+// rows at `infoTop`; Change Log: columns split at `filesEnd`), each section's
+// furthest offset (`filesMax`: the Files list of Change Log or the diff view) and
+// the rows Info and Diff Preview show.
 const view = {
-  isWide: true,
+  columns: 0, // the totals the splitters divide: the body's columns, the sections' rows
+  area: 0,
   branchEnd: 0,
-  graphEnd: 0,
-  topRows: 0,
+  filesEnd: 0,
+  infoTop: 0,
   branchMax: 0,
   graphMax: 0,
-  changeMax: 0,
+  infoMax: 0,
+  filesMax: 0,
   detailMax: 0,
   detailRows: 1,
+  infoRows: 1,
 }
+
+// The splitters' messages: which `split` fraction each sets, and its axis.
+const SEAMS = {
+  'split:side': { key: 'side', axis: 'x', min: MIN_COLS },
+  'split:info': { key: 'info', axis: 'y', min: MIN_ROWS },
+  'split:files': { key: 'files', axis: 'x', min: MIN_COLS },
+} as const
 
 const clamp = (value: number, max: number): number =>
   Math.min(Math.max(0, value), Math.max(0, max))
@@ -122,6 +165,7 @@ const clear = (): void => {
   statusCache = undefined
   graphCache.clear()
   showCache.clear()
+  diffCache.clear()
   changeCache.clear()
   hasHead = undefined
 }
@@ -216,20 +260,42 @@ const detailsOf = async (
   let shown = showCache.get(sha)
   if (shown === undefined) {
     const before = threw
-    const [stat, patch] = await Promise.all([
-      run($, cwd, statArgv(sha)),
-      run($, cwd, patchArgv(sha)),
-    ])
-    shown = {
-      head: splitShow(stat ?? ''),
-      diff: (patch ?? '').replace(/^\n+/, ''),
-    }
+    // Overview's Info shows no patch; the full-panel commit diff fetches it.
+    const stat = await run($, cwd, statArgv(sha))
+    shown = { head: splitShow(stat ?? ''), diff: '' }
     if (threw !== before) return shown
     showCache.set(sha, shown)
   }
 
   return shown
 }
+
+// The files a commit changed and its whole patch (a merge against its first
+// parent), one fetch of each.
+const diffOf = async (
+  $: EngineInterface,
+  cwd: string,
+  sha: string,
+): Promise<{ files: Change[]; patch: string }> => {
+  let shown = diffCache.get(sha)
+  if (shown === undefined) {
+    const before = threw
+    const names = await run($, cwd, filesArgv(sha))
+    const patch = await run($, cwd, patchArgv(sha))
+    shown = { files: parseNameStatus(names ?? ''), patch: patch ?? '' }
+    if (threw !== before) return shown
+    diffCache.set(sha, shown)
+  }
+
+  return shown
+}
+
+// The Diff Preview head of one change: its path, what happened, a rename's source.
+const changeHead = (change: Change): string[] => [
+  change.path,
+  changeWords(change),
+  ...(change.from === undefined ? [] : ['from ' + change.from]),
+]
 
 // Head lines and the diff of one change against HEAD, run from the repo root
 // (status paths are relative to it). An untracked file is
@@ -254,11 +320,7 @@ const changeDetailsOf = async (
       isUntracked(change) ? [0, 1] : [0],
     )
     shown = {
-      head: [
-        change.path,
-        changeWords(change),
-        ...(change.from === undefined ? [] : ['from ' + change.from]),
-      ],
+      head: changeHead(change),
       diff: (out ?? '').replace(/^\n+/, ''),
     }
     if (threw !== before) return shown
@@ -268,10 +330,11 @@ const changeDetailsOf = async (
   return shown
 }
 
-// The changes list as drawn now, from the cached status.
+// The Files list as drawn now: the cached status, or in the diff view the open
+// commit's files.
 const rowsOf = (state: GitState): ChangeRow[] =>
   changeRows(
-    statusCache ?? [],
+    state.diff === undefined ? (statusCache ?? []) : (diffCache.get(state.diff)?.files ?? []),
     state.changeView ?? 'list',
     new Set(state.changeCollapsed ?? []),
   )
@@ -403,7 +466,7 @@ export const register = (on: On): void => {
           ...s,
           selected: sha,
           offset: win.offset,
-          detailOffset: s.selected === sha ? s.detailOffset : 0,
+          infoOffset: s.selected === sha ? s.infoOffset : 0,
         }))
       }
     }
@@ -428,6 +491,26 @@ export const register = (on: On): void => {
       }
     }
 
+    if (element !== undefined && element.startsWith('dfile:')) {
+      const path = element.slice('dfile:'.length)
+      const state = await read($, git)
+      const rows = rowsOf(state)
+      const win = windowOf(
+        rows,
+        rows.findIndex(row => row.kind === 'leaf' && row.item.path === path),
+        changeRoom,
+        state.diffFileOffset ?? 0,
+      )
+      if (state.diffFile !== path || state.diffFileOffset !== win.offset) {
+        await update($, git, s => ({
+          ...s,
+          diffFile: path,
+          diffFileOffset: win.offset,
+          detailOffset: s.diffFile === path ? s.detailOffset : 0,
+        }))
+      }
+    }
+
     return next(e)
   })
 
@@ -436,47 +519,59 @@ export const register = (on: On): void => {
   // is never used, so the hook always answers `{}` without `next`.
   on('ui.scroll', { requestId: PANE }, async ($, e) => {
     const state = await read($, git)
-    const isChanges = state.tab === 'changes'
+    // The diff view replaces whichever tab it was opened from.
+    const isDiff = state.diff !== undefined
+    const isChanges = !isDiff && tabOf(state) === 'changelog'
+    const isGraph = !isDiff && tabOf(state) === 'graph'
+    const isFiles = isDiff || isChanges
+    const filesPart = isDiff ? 'diffFileOffset' : 'changeOffset'
     const pointer = e.pointer
     if (pointer !== undefined) {
-      const isTop = view.isWide || pointer.row - 1 < view.topRows
-      const middle = isChanges ? 'changeOffset' : 'offset'
-      const part =
-        isTop && pointer.column < view.branchEnd
+      // Change Log and the diff view: Files | Diff Preview. Graph: one list.
+      // Overview: Branches | Commits over Info.
+      const part = isGraph
+        ? 'offset'
+        : isFiles
+        ? pointer.column < view.filesEnd
+          ? filesPart
+          : 'detailOffset'
+        : pointer.column < view.branchEnd
           ? 'branchOffset'
-          : isTop && (!view.isWide || pointer.column < view.graphEnd)
-            ? middle
-            : 'detailOffset'
+          : pointer.row < view.infoTop
+            ? 'offset'
+            : 'infoOffset'
       const max =
         part === 'branchOffset'
           ? view.branchMax
           : part === 'offset'
             ? view.graphMax
-            : part === 'changeOffset'
-              ? view.changeMax
-              : view.detailMax
+            : part === 'infoOffset'
+              ? view.infoMax
+              : part === 'changeOffset' || part === 'diffFileOffset'
+                ? view.filesMax
+                : view.detailMax
       const was = state[part] ?? 0
       const next = clamp(was + e.by, max)
       if (next !== was) await update($, git, s => ({ ...s, [part]: next }))
-    } else if (Math.abs(e.by) === 1 && isChanges) {
+    } else if (Math.abs(e.by) === 1 && isFiles) {
       const rows = rowsOf(state)
       const leaves = rows.flatMap(row => (row.kind === 'leaf' ? [row.item.path] : []))
-      const at = leaves.indexOf(state.change ?? leaves[0] ?? '')
+      const current = isDiff ? state.diffFile : state.change
+      const at = leaves.indexOf(current ?? leaves[0] ?? '')
       const path = leaves[clamp(at < 0 ? 0 : at + e.by, leaves.length - 1)]
-      if (path !== undefined && path !== state.change) {
+      if (path !== undefined && path !== current) {
         const win = windowOf(
           rows,
           rows.findIndex(row => row.kind === 'leaf' && row.item.path === path),
           changeRoom,
-          state.changeOffset ?? 0,
+          state[filesPart] ?? 0,
         )
-        await update($, git, s => ({
-          ...s,
-          change: path,
-          changeOffset: win.offset,
-          detailOffset: 0,
-        }))
-        await $.ui.focus({ requestId: PANE, key: 'change:' + path })
+        await update($, git, s =>
+          isDiff
+            ? { ...s, diffFile: path, diffFileOffset: win.offset, detailOffset: 0 }
+            : { ...s, change: path, changeOffset: win.offset, detailOffset: 0 },
+        )
+        await $.ui.focus({ requestId: PANE, key: (isDiff ? 'dfile:' : 'change:') + path })
       }
     } else if (Math.abs(e.by) === 1) {
       const lines = graphCache.get(state.ref + '\0' + state.limit) ?? []
@@ -493,17 +588,25 @@ export const register = (on: On): void => {
           ...s,
           selected: sha,
           offset: win.offset,
-          detailOffset: 0,
+          infoOffset: 0,
         }))
         await $.ui.focus({ requestId: PANE, key: 'commit:' + sha })
       }
-    } else {
+    } else if (isFiles) {
       const was = state.detailOffset ?? 0
       const detailOffset = clamp(
         was + Math.sign(e.by) * view.detailRows,
         view.detailMax,
       )
       if (detailOffset !== was) await update($, git, s => ({ ...s, detailOffset }))
+    } else if (isGraph) {
+      const was = state.offset
+      const offset = clamp(was + Math.sign(e.by) * graphRows, view.graphMax)
+      if (offset !== was) await update($, git, s => ({ ...s, offset }))
+    } else {
+      const was = state.infoOffset ?? 0
+      const infoOffset = clamp(was + Math.sign(e.by) * view.infoRows, view.infoMax)
+      if (infoOffset !== was) await update($, git, s => ({ ...s, infoOffset }))
     }
     $.ui.invalidate('ui.render')
 
@@ -512,13 +615,34 @@ export const register = (on: On): void => {
 
   // A scrollbar dragged: the window moves, the selection stays (as the wheel).
   on('ui.message', { requestId: PANE }, async ($, e) => {
-    const data = e.data as { offset?: unknown } | null
+    const data = e.data as { offset?: unknown; start?: unknown; delta?: unknown } | null
+    const seam = SEAMS[e.element as keyof typeof SEAMS]
+    if (seam !== undefined) {
+      // A splitter dragged: the section's new size is where it started plus
+      // the pointer's travel, kept as a fraction so a resize keeps it.
+      const { start, delta } = data ?? {}
+      if (typeof start !== 'number' || typeof delta !== 'number') return {}
+      if (!Number.isFinite(start) || !Number.isFinite(delta)) return {}
+      const total = seam.axis === 'x' ? view.columns : view.area
+      if (total <= 0) return {}
+      const cells = splitAt(total, fractionOf(Math.round(start + delta), total), seam.min)
+      const fraction = fractionOf(cells, total)
+      await update($, git, s => ({
+        ...s,
+        split: { ...s.split, [seam.key]: seam.key === 'info' ? 1 - fraction : fraction },
+      }))
+      $.ui.invalidate('ui.render')
+
+      return {}
+    }
     const to = typeof data?.offset === 'number' ? data.offset : NaN
     if (!Number.isFinite(to)) return {}
     const parts = {
       'sb:branches': ['branchOffset', view.branchMax],
       'sb:graph': ['offset', view.graphMax],
-      'sb:changes': ['changeOffset', view.changeMax],
+      'sb:info': ['infoOffset', view.infoMax],
+      'sb:changes': ['changeOffset', view.filesMax],
+      'sb:dfiles': ['diffFileOffset', view.filesMax],
       'sb:details': ['detailOffset', view.detailMax],
     } as const
     const part = parts[e.element as keyof typeof parts]
@@ -560,33 +684,48 @@ export const register = (on: On): void => {
     const changes = await statusOf($, cwd)
     const counts = changeCounts(changes)
     const isClean = counts.added + counts.modified + counts.deleted === 0
-    const isChanges = state.tab === 'changes'
+    const tab = tabOf(state)
+    // The diff view replaces the panel body, whichever tab it was opened from.
+    const isDiff = state.diff !== undefined
+    const isChanges = !isDiff && tab === 'changelog'
+    // Change Log and the diff view both draw Files | Diff Preview.
+    const isFiles = isDiff || isChanges
     const changeMode = state.changeView ?? 'list'
     const isWide = columns >= WIDE
     // Each section is framed in the session color.
     const border = borderOf(await read($, sessionColor))
-    // One header row and one footer row; wide: the graph keeps a row for
-    // `more`; stacked: the graph and branches take the top ~55%, the details
-    // the rest.
+    // One header row and one footer row; the sections share the rest.
     const area = Math.max(4, bodyRows - 2)
-    const topRows = isWide ? area : Math.max(3, Math.floor(area * 0.55))
-    const detailRows = isWide ? area : Math.max(3, area - topRows)
+    // The three sizes the splitters will drive, each computed here from its
+    // default fraction. Fixed cell widths (not percentages) so labels,
+    // hit-testing and the drawn columns agree.
+    // Branches' width (Overview).
+    const split = state.split ?? {}
+    const sideCols = splitAt(columns, split.side ?? (isWide ? SPLIT.sideWide : SPLIT.sideNarrow), MIN_COLS)
+    // Commits' height; Info takes the rest of the right column (Overview).
+    const topRows = Math.max(3, splitAt(area, 1 - (split.info ?? SPLIT.info), MIN_ROWS))
+    // Files' width (Change Log).
+    const filesCols = splitAt(columns, split.files ?? SPLIT.files, MIN_COLS)
+
+    const infoRows = Math.max(3, area - topRows)
+    const rightCols = columns - sideCols
     // Each section is framed: 2 rows and 2 columns go to the border.
     const topInner = Math.max(3, topRows - 2)
-    const detailInner = Math.max(3, detailRows - 2)
-    graphRows = Math.max(2, topInner - 1)
-    // Fixed cell widths (not percentages) so labels, hit-testing and the
-    // drawn columns agree.
-    const sideCols = Math.floor(columns * (isWide ? 0.2 : 0.3))
-    const graphCols = isWide ? Math.floor(columns * 0.4) : columns - sideCols
-    const graphWidth = graphCols - 5
+    const infoInner = Math.max(3, infoRows - 2)
+    const fullInner = Math.max(3, area - 2)
+    // Graph: one section across the panel; Overview: Commits in the right column.
+    const isGraph = !isDiff && tab === 'graph'
+    graphRows = Math.max(2, (isGraph ? fullInner : topInner) - 1)
+    tabRows.graph = Math.max(2, fullInner - 1)
+    tabRows.overview = Math.max(2, topInner - 1)
+    const graphWidth = (isGraph ? columns : rightCols) - 5
     // the scrollbar takes one more column in each section
     const sideWidth = sideCols - 3
 
     const branches = await branchesOf($, cwd)
     const lines = isChanges ? [] : await graphOf($, cwd, state)
-    // Lanes take whatever the graph column leaves beyond ~20 columns of text.
-    const maxLanes = Math.max(1, Math.floor((graphWidth - 20) / 2))
+    // Lanes take what the row's other columns leave (Graph is wide, Overview compact).
+    const maxLanes = maxLanesFor(graphWidth, isGraph)
     const laid = layoutGraph(lines, maxLanes)
     const index = lines.findIndex(commit => commit.sha === state.selected)
     const selected = index >= 0 ? lines[index] : lines[0]
@@ -603,48 +742,60 @@ export const register = (on: On): void => {
         ? undefined
         : keyOf(selected)
     const remotes = new Set(branches.filter(branch => branch.isRemote).map(branch => branch.name))
-    changeRoom = Math.max(2, topInner)
-    const crows = isChanges ? rowsOf(state) : []
-    const leaves = crows.flatMap(row => (row.kind === 'leaf' ? [row.item] : []))
-    const chosen = leaves.find(change => change.path === state.change) ?? leaves[0]
-    const cwin = windowOf(crows, -1, changeRoom, state.changeOffset ?? 0)
+    changeRoom = Math.max(2, fullInner)
+    const diffShown = isDiff && state.diff !== undefined ? await diffOf($, cwd, state.diff) : undefined
+    // The Files list: the working tree (Change Log) or the open commit's files.
+    const frows = isFiles ? rowsOf(state) : []
+    const leaves = frows.flatMap(row => (row.kind === 'leaf' ? [row.item] : []))
+    const chosen = leaves.find(change => change.path === (isDiff ? state.diffFile : state.change)) ?? leaves[0]
+    const fileOffset = (isDiff ? state.diffFileOffset : state.changeOffset) ?? 0
+    const fileKey = isDiff ? 'dfile:' : 'change:'
+    const cwin = windowOf(frows, -1, changeRoom, fileOffset)
     const changeFocus =
       chosen !== undefined &&
       cwin.rows.some(row => row.kind === 'leaf' && row.item.path === chosen.path)
-        ? 'change:' + chosen.path
+        ? fileKey + chosen.path
         : undefined
-    const details = isChanges
-      ? chosen === undefined
+    const details = isDiff
+      ? chosen === undefined || diffShown === undefined
         ? undefined
-        : await changeDetailsOf($, root, chosen)
-      : selected === undefined
-        ? undefined
-        : await detailsOf($, cwd, selected.sha)
-    const headRows = Math.max(6, Math.floor(detailInner / 2))
-    const headAll =
-      details === undefined
+        : { head: changeHead(chosen), diff: fileDiff(diffShown.patch, chosen.path) }
+      : isChanges
+        ? chosen === undefined
+          ? undefined
+          : await changeDetailsOf($, root, chosen)
+        : selected === undefined || isGraph
+          ? undefined
+          : await detailsOf($, cwd, selected.sha)
+    const opened = lines.find(commit => commit.sha === state.diff)
+    // Info: every head line, windowed by `infoOffset`.
+    const infoAll =
+      details === undefined || isFiles || selected === undefined
         ? []
-        : isChanges || selected === undefined
-          ? details.head
-          : infoHead(details.head, selected)
-    const head = headAll.slice(0, headRows)
-    const diffRows = Math.max(1, detailInner - head.length)
-    const diffTotal = details === undefined ? 0 : diffLines(details.diff).length
-    const detailOffset = clamp(state.detailOffset ?? 0, diffTotal - diffRows)
-    const diff =
-      details === undefined ? '' : sliceDiff(details.diff, detailOffset, diffRows)
+        : infoHead(details.head, selected)
+    const infoMax = Math.max(0, infoAll.length - infoInner)
+    const infoOffset = clamp(state.infoOffset ?? 0, infoMax)
+    const infoShown = infoAll.slice(infoOffset, infoOffset + infoInner)
+    // Diff Preview: a few head lines, then the diff windowed by `detailOffset`.
+    const headRows = Math.max(6, Math.floor(fullInner / 2))
+    const previewHead = isFiles && details !== undefined ? details.head.slice(0, headRows) : []
+    const diffRows = Math.max(1, fullInner - previewHead.length)
+    const diffTotal = isFiles && details !== undefined ? diffLines(details.diff).length : 0
     const head0 = branches.find(branch => branch.isHead)
-    const branchRoom = Math.max(2, topInner - 1)
+    const branchRoom = Math.max(2, fullInner - 1)
     const tree = branchTree(branches, new Set(state.collapsed ?? []))
     const branchWin = windowOf(tree, -1, branchRoom, state.branchOffset ?? 0)
     const branchRows = branchWin.rows
-    view.isWide = isWide
+    view.columns = columns
+    view.area = area
     view.branchEnd = sideCols
-    view.graphEnd = sideCols + graphCols
-    view.topRows = topRows
+    view.filesEnd = filesCols
+    view.infoTop = topRows + 1 // the header row sits above Commits
     view.branchMax = Math.max(0, tree.length - branchRoom)
     view.graphMax = Math.max(0, lines.length - graphRows)
-    view.changeMax = Math.max(0, crows.length - changeRoom)
+    view.infoMax = infoMax
+    view.infoRows = infoInner
+    view.filesMax = Math.max(0, frows.length - changeRoom)
     view.detailMax = Math.max(0, diffTotal - diffRows)
     view.detailRows = diffRows
     const bar = (cells: string[]) => (
@@ -692,10 +843,9 @@ export const register = (on: On): void => {
     const select = (ref: string) =>
       update($, git, s => ({
         ...s,
-        tab: 'graph' as const,
         ref,
         offset: 0,
-        detailOffset: 0,
+        infoOffset: 0,
         selected: undefined,
         limit: PAGE,
       }))
@@ -710,12 +860,45 @@ export const register = (on: On): void => {
         }
       })
 
-    const showTab = (tab: 'graph' | 'changes') =>
+    // The offset that keeps the selected commit in view; 0 with no selection.
+    const offsetFor = (s: GitState, to: Tab): number => {
+      const lines = graphCache.get(s.ref + '\0' + s.limit) ?? []
+      const at = lines.findIndex(commit => commit.sha === s.selected)
+
+      return at < 0 ? 0 : windowOf(lines, at, to === 'graph' ? tabRows.graph : tabRows.overview, 0).offset
+    }
+
+    const showTab = (to: Tab) =>
       update($, git, s => ({
         ...s,
-        tab,
+        tab: to,
+        diff: undefined,
+        diffFile: undefined,
+        diffFileOffset: 0,
         detailOffset: 0,
-        ...(tab === 'graph' ? { offset: 0 } : { changeOffset: 0 }),
+        infoOffset: 0,
+        ...(to === 'changelog' ? { changeOffset: 0 } : { offset: offsetFor(s, to) }),
+      }))
+
+    // The commit's diff view; the row's commit becomes the selected one. `back`
+    // closes it, to the tab it was opened from (the tab is not changed).
+    const openDiff = (sha: string) =>
+      update($, git, s => ({
+        ...s,
+        selected: sha,
+        infoOffset: s.selected === sha ? s.infoOffset : 0,
+        diff: sha,
+        diffFile: undefined,
+        diffFileOffset: 0,
+        detailOffset: 0,
+      }))
+    const closeDiff = () =>
+      update($, git, s => ({
+        ...s,
+        diff: undefined,
+        diffFile: undefined,
+        diffFileOffset: 0,
+        detailOffset: 0,
       }))
 
     const toggleChange = (key: string) =>
@@ -728,10 +911,10 @@ export const register = (on: On): void => {
         }
       })
 
-    // The section's name sits on its top border; the middle section's name follows
-    // the active tab. A bordered Box clips its children, so the overlay sits after
-    // it in an unbordered wrapper of the same size, at top={0}. A Button has no
-    // text color, so black Text is drawn over it; the press still lands on the Button.
+    // The section's name sits on its top border. A bordered Box clips its
+    // children, so the overlay sits after it in an unbordered wrapper of the
+    // same size, at top={0}. A Button has no text color, so black Text is drawn
+    // over it; the press still lands on the Button.
     const titled = (key: string, name: string) => (
       <Box position="absolute" top={0} left={1} backgroundColor={border.borderColor}>
         <Button
@@ -746,8 +929,31 @@ export const register = (on: On): void => {
       </Box>
     )
 
+    // A Client on the seam, over the first section's last row or column (the
+    // frame's border), in an unbordered wrapper like the titles; surfaces
+    // without `Client` keep the plain border.
+    const splitter = (
+      key: keyof typeof SEAMS,
+      axis: 'x' | 'y',
+      left: number,
+      top: number,
+      length: number,
+      cells: number,
+    ) =>
+      Client === undefined ? null : (
+        <Box position="absolute" top={top} left={left}>
+          <Client
+            key={key}
+            module="../shared/splitter-client.tsx"
+            props={{ axis, length, cells, color: border.borderColor }}
+            width={axis === 'x' ? 1 : length}
+            height={axis === 'x' ? length : 1}
+          />
+        </Box>
+      )
+
     const branchColumn = (
-      <Box flexDirection="column" width={sideCols} flexShrink={0} height={topRows}>
+      <Box flexDirection="column" width={sideCols} flexShrink={0} height={area}>
       <Box {...border} flexDirection="row" height="100%">
         <Box flexDirection="column" flexGrow={1}>
         <Button
@@ -806,126 +1012,96 @@ export const register = (on: On): void => {
         {dragBar('sb:branches', tree.length, branchRoom, branchWin.offset, 1)}
       </Box>
       {titled('title:branches', 'Branches')}
+      {splitter('split:side', 'x', sideCols - 1, 1, area - 2, sideCols)}
       </Box>
     )
 
-    const graphColumn = (
-      <Box flexDirection="column" width={graphCols} flexShrink={0} height={topRows}>
-      <Box {...border} flexDirection="row" height="100%">
-        {isChanges ? (
-        <Box flexDirection="column" flexGrow={1}>
-          {crows.length === 0 && <Text dimColor>Working tree clean</Text>}
-          {cwin.rows.map(row => {
-            const rails = '│ '.repeat(row.depth)
-            if (row.kind === 'folder') {
-              return (
-                <Box key={'cline:' + row.key} flexDirection="row">
-                  <Text> </Text>
-                  {row.depth > 0 && <Text dimColor>{rails}</Text>}
-                  <Button
-                    key={'cdir:' + row.key}
-                    plain
-                    label={fit((row.isOpen ? '▾ ' : '▸ ') + row.name + '/', graphWidth - 1 - rails.length)}
-                    onPress={() => toggleChange(row.key)}
-                  />
-                </Box>
-              )
-            }
-            const change = row.item
-            const isSelected = change.path === chosen?.path
-            const glyph = changeGlyph(change)
-            const label = fitStart(row.name, Math.max(4, graphWidth - 3 - rails.length))
-            const slash = label.lastIndexOf('/')
+    // One commit row: lanes, short sha, refs, subject; `wide` adds the dim author
+    // and date columns.
+    const commitRow = (row: GraphRow, width: number, wide: boolean) => {
+      const { commit } = row
+      const isSelected = commit.sha === selected?.sha
+      const pick = () =>
+        update($, git, s => ({
+          ...s,
+          selected: commit.sha,
+          infoOffset: s.selected === commit.sha ? s.infoOffset : 0,
+        }))
+      const cols = graphColumns(width, laneCols, wide)
+      // refs that fit ~40% of the subject's room, the rest as `…`
+      const refs: string[] = []
+      let used = 0
+      for (const ref of commit.refs) {
+        if (used + ref.length + 1 > Math.floor(cols.subject * 0.4)) {
+          refs.push('…')
+          break
+        }
+        refs.push(ref)
+        used += ref.length + 1
+      }
+      const subjectCols = Math.max(1, cols.subject - used)
 
-            return (
-              <Box
-                key={'cline:' + change.path}
-                flexDirection="row"
-                backgroundColor={isSelected ? SELECTED : undefined}
-              >
-                <Text color={border.borderColor}>{isSelected ? '▌' : ' '}</Text>
-                {row.depth > 0 && <Text dimColor>{rails}</Text>}
-                <Text color={GLYPH_COLOR[glyph] ?? 'white'} dimColor={glyph === '?' ? true : undefined}>
-                  {glyph}
-                </Text>
-                <Text> </Text>
-                {slash >= 0 && <Text dimColor>{label.slice(0, slash + 1)}</Text>}
-                <Button
-                  key={'change:' + change.path}
-                  plain
-                  autoFocus={'change:' + change.path === changeFocus ? true : undefined}
-                  label={label.slice(slash + 1)}
-                  onPress={() =>
-                    update($, git, s => ({
-                      ...s,
-                      change: change.path,
-                      detailOffset: s.change === change.path ? s.detailOffset : 0,
-                    }))
-                  }
-                />
-              </Box>
-            )
-          })}
+      return (
+        <Box
+          key={'row:' + commit.sha}
+          flexDirection="row"
+          backgroundColor={isSelected ? SELECTED : undefined}
+        >
+          {cellRuns(row.cells, laneCols + 1).map((seg, i) => (
+            <Text key={'lane:' + i} color={LANE_COLORS[seg.color % PALETTE_SIZE]}>
+              {seg.text}
+            </Text>
+          ))}
+          <Button
+            key={keyOf(commit)}
+            plain
+            dimColor
+            autoFocus={keyOf(commit) === focusKey ? true : undefined}
+            label={(isSelected ? '>' : ' ') + commit.short}
+            onPress={pick}
+          />
+          <Text> </Text>
+          {refs.map((ref, i) => (
+            <Text key={'ref:' + i} color={refColor(ref, remotes)} dimColor={remotes.has(ref) ? true : undefined}>
+              {ref + ' '}
+            </Text>
+          ))}
+          <Button
+            key={'subject:' + commit.sha}
+            plain
+            label={fit(commit.subject, subjectCols).padEnd(subjectCols)}
+            onPress={pick}
+          />
+          {cols.author > 0 && (
+            <Text key={'author:' + commit.sha} dimColor>
+              {' ' + fit(commit.author, cols.author).padEnd(cols.author)}
+            </Text>
+          )}
+          {cols.date > 0 && (
+            <Text key={'date:' + commit.sha} dimColor>
+              {' ' + commit.date.padEnd(cols.date)}
+            </Text>
+          )}
+          <Box width={DIFF_COLS} flexShrink={0} justifyContent="flex-end">
+            <Button
+              key={'diff:' + commit.sha}
+              plain
+              hotkey={isSelected ? 'd' : undefined}
+              label=" ⧉"
+              onPress={() => openDiff(commit.sha)}
+            />
+          </Box>
         </Box>
-        ) : (
+      )
+    }
+
+    // The windowed commit list with `more` and its scrollbar, as drawn in Commits
+    // (compact) and Graph (wide).
+    const commitList = (width: number, wide: boolean) => (
+      <Box {...border} flexDirection="row" height="100%">
         <Box flexDirection="column" flexGrow={1}>
           {lines.length === 0 && <Text dimColor>(no commits)</Text>}
-          {win.rows.map(row => {
-            const { commit } = row
-            const isSelected = commit.sha === selected?.sha
-            const pick = () =>
-              update($, git, s => ({
-                ...s,
-                selected: commit.sha,
-                detailOffset: s.selected === commit.sha ? s.detailOffset : 0,
-              }))
-            // refs that fit ~40% of what the lanes leave, the rest as `…`
-            const room = graphWidth - laneCols - 9
-            const refs: string[] = []
-            let used = 0
-            for (const ref of commit.refs) {
-              if (used + ref.length + 1 > Math.floor(room * 0.4)) {
-                refs.push('…')
-                break
-              }
-              refs.push(ref)
-              used += ref.length + 1
-            }
-
-            return (
-              <Box
-                key={'row:' + commit.sha}
-                flexDirection="row"
-                backgroundColor={isSelected ? SELECTED : undefined}
-              >
-                {cellRuns(row.cells, laneCols + 1).map((seg, i) => (
-                  <Text key={'lane:' + i} color={LANE_COLORS[seg.color % PALETTE_SIZE]}>
-                    {seg.text}
-                  </Text>
-                ))}
-                <Button
-                  key={keyOf(commit)}
-                  plain
-                  dimColor
-                  autoFocus={keyOf(commit) === focusKey ? true : undefined}
-                  label={(isSelected ? '>' : ' ') + commit.short}
-                  onPress={pick}
-                />
-                <Text> </Text>
-                {refs.map((ref, i) => (
-                  <Text key={'ref:' + i} color={refColor(ref, remotes)} dimColor={remotes.has(ref) ? true : undefined}>
-                    {ref + ' '}
-                  </Text>
-                ))}
-                <Button
-                  key={'subject:' + commit.sha}
-                  plain
-                  label={fit(commit.subject, Math.max(4, room - used))}
-                  onPress={pick}
-                />
-              </Box>
-            )
-          })}
+          {win.rows.map(row => commitRow(row, width, wide))}
           {isMore && (
             <Button
               key="more"
@@ -935,85 +1111,192 @@ export const register = (on: On): void => {
             />
           )}
         </Box>
-        )}
-        {isChanges
-          ? dragBar('sb:changes', crows.length, changeRoom, cwin.offset)
-          : dragBar('sb:graph', lines.length, graphRows, win.offset)}
-      </Box>
-        {titled(isChanges ? 'title:changes' : 'title:commits', isChanges ? 'Changes' : 'Commits')}
-        {/* No `(g)` suffixes: the terminal already prefixes a plain Button with its hotkey. */}
-        <Box position="absolute" top={0} right={1} flexDirection="row" gap={1}>
-          <Button
-            key="tab:graph"
-            hotkey="g"
-            plain
-            dimColor={isChanges ? true : undefined}
-            label={(isChanges ? ' ' : '▌') + 'Graph'}
-            onPress={() => showTab('graph' as const)}
-          />
-          <Button
-            key="tab:changes"
-            hotkey="c"
-            plain
-            dimColor={isChanges ? undefined : true}
-            label={
-              (isChanges ? '▌' : ' ') +
-              'Changes' +
-              (changes.length > 0 ? ' ' + changes.length : '')
-            }
-            onPress={() => showTab('changes')}
-          />
-          {isChanges && (
-            <Button
-              key="view"
-              hotkey="v"
-              plain
-              label={`view: ${changeMode}`}
-              onPress={() =>
-                update($, git, s => ({
-                  ...s,
-                  changeView: changeMode === 'list' ? ('tree' as const) : ('list' as const),
-                  changeOffset: 0,
-                }))
-              }
-            />
-          )}
-        </Box>
+        {dragBar('sb:graph', lines.length, graphRows, win.offset)}
       </Box>
     )
 
-    const detailColumn = (
-      <Box flexDirection="column" flexGrow={1} height={detailRows}>
-      <Box {...border} flexDirection="row" height="100%" flexGrow={1}>
+    const commitsSection = (
+      <Box flexDirection="column" width={rightCols} flexShrink={0} height={topRows}>
+        {commitList(graphWidth, false)}
+        {titled('title:commits', 'Commits')}
+        {splitter('split:info', 'y', 1, topRows - 1, rightCols - 2, topRows)}
+      </Box>
+    )
+
+    const graphSection = (
+      <Box flexDirection="column" width={columns} flexShrink={0} height={area}>
+        {commitList(graphWidth, true)}
+        {titled('title:graph', 'Graph')}
+      </Box>
+    )
+
+    const infoSection = (
+      <Box flexDirection="column" width={rightCols} flexShrink={0} height={infoRows}>
+      <Box {...border} flexDirection="row" height="100%">
         <Box flexDirection="column" flexGrow={1}>
-        {details === undefined && (
-          <Text dimColor>{isChanges ? 'Select a change.' : 'Select a commit.'}</Text>
-        )}
-        {head.map((text, i) => (
-          <Text key={'head:' + i} bold={i === 0} wrap="truncate-end">
+        {details === undefined && <Text dimColor>Select a commit.</Text>}
+        {infoShown.map((text, i) => (
+          <Text key={'info:' + (infoOffset + i)} bold={infoOffset + i === 0} wrap="truncate-end">
             {text}
           </Text>
         ))}
-        {diff !== '' && (
-          <Code source={diff} format="diff" wrap="truncate-end" />
-        )}
-        {isChanges && details !== undefined && diff === '' && (
-          <Text dimColor>
-            {/^(Binary files|GIT binary patch)/m.test(details.diff)
-              ? 'Binary file.'
-              : 'No textual changes.'}
-          </Text>
-        )}
         </Box>
-        {dragBar('sb:details', diffTotal, diffRows, detailOffset, head.length)}
+        {dragBar('sb:info', infoAll.length, infoInner, infoOffset)}
       </Box>
       {titled('title:info', 'Info')}
       </Box>
     )
 
+    // Files | Diff Preview across the panel. `rows` is the list as drawn (a window
+    // of it from `fileOffset`), `selected` the path shown, `details` its head
+    // lines and diff, `previewOffset` the first diff line, `focus` the key
+    // autoFocus lands on, `title` the Files title. File rows are keyed
+    // `<keyPrefix><path>` and their scrollbar `barKey`: Change Log feeds it the
+    // working tree (`change:`, `sb:changes`), the diff view a commit's files
+    // (`dfile:`, `sb:dfiles`).
+    const filesAndPreview = (p: {
+      title: string
+      keyPrefix: string
+      barKey: string
+      rows: ChangeRow[]
+      fileOffset: number
+      selected: string | undefined
+      details: { head: string[]; diff: string } | undefined
+      previewOffset: number
+      focus: string | undefined
+      emptyText: string
+      noneText: string
+      onPick: (path: string) => void
+      onToggle: (key: string) => void
+    }) => {
+      const fwin = windowOf(p.rows, -1, changeRoom, p.fileOffset)
+      const previewCols = columns - filesCols
+      const filesWidth = filesCols - 5
+      const pHead = p.details === undefined ? [] : p.details.head.slice(0, headRows)
+      const pRows = Math.max(1, fullInner - pHead.length)
+      const pTotal = p.details === undefined ? 0 : diffLines(p.details.diff).length
+      const pOffset = clamp(p.previewOffset, pTotal - pRows)
+      const pDiff = p.details === undefined ? '' : sliceDiff(p.details.diff, pOffset, pRows)
+
+      return (
+        <Box flexDirection="row">
+          <Box flexDirection="column" width={filesCols} flexShrink={0} height={area}>
+          <Box {...border} flexDirection="row" height="100%">
+            <Box flexDirection="column" flexGrow={1}>
+              {p.rows.length === 0 && <Text dimColor>{p.emptyText}</Text>}
+              {fwin.rows.map(row => {
+                const rails = '│ '.repeat(row.depth)
+                if (row.kind === 'folder') {
+                  return (
+                    <Box key={'cline:' + row.key} flexDirection="row">
+                      <Text> </Text>
+                      {row.depth > 0 && <Text dimColor>{rails}</Text>}
+                      <Button
+                        key={'cdir:' + row.key}
+                        plain
+                        label={fit((row.isOpen ? '▾ ' : '▸ ') + row.name + '/', filesWidth - 1 - rails.length)}
+                        onPress={() => p.onToggle(row.key)}
+                      />
+                    </Box>
+                  )
+                }
+                const change = row.item
+                const isSelected = change.path === p.selected
+                const glyph = changeGlyph(change)
+                const label = fitStart(row.name, Math.max(4, filesWidth - 3 - rails.length))
+                const slash = label.lastIndexOf('/')
+
+                return (
+                  <Box
+                    key={'cline:' + change.path}
+                    flexDirection="row"
+                    backgroundColor={isSelected ? SELECTED : undefined}
+                  >
+                    <Text color={border.borderColor}>{isSelected ? '▌' : ' '}</Text>
+                    {row.depth > 0 && <Text dimColor>{rails}</Text>}
+                    <Text color={GLYPH_COLOR[glyph] ?? 'white'} dimColor={glyph === '?' ? true : undefined}>
+                      {glyph}
+                    </Text>
+                    <Text> </Text>
+                    {slash >= 0 && <Text dimColor>{label.slice(0, slash + 1)}</Text>}
+                    <Button
+                      key={p.keyPrefix + change.path}
+                      plain
+                      autoFocus={p.keyPrefix + change.path === p.focus ? true : undefined}
+                      label={label.slice(slash + 1)}
+                      onPress={() => p.onPick(change.path)}
+                    />
+                  </Box>
+                )
+              })}
+            </Box>
+            {dragBar(p.barKey, p.rows.length, changeRoom, fwin.offset)}
+          </Box>
+            {splitter('split:files', 'x', filesCols - 1, 1, area - 2, filesCols)}
+            {titled('title:files', fit(p.title, Math.max(5, filesCols - 16)))}
+            <Box position="absolute" top={0} right={1} flexDirection="row" gap={1}>
+              <Button
+                key="view"
+                hotkey="v"
+                plain
+                label={`view: ${changeMode}`}
+                onPress={() =>
+                  update($, git, s => ({
+                    ...s,
+                    changeView: changeMode === 'list' ? ('tree' as const) : ('list' as const),
+                    changeOffset: 0,
+                    diffFileOffset: 0,
+                  }))
+                }
+              />
+            </Box>
+          </Box>
+          <Box flexDirection="column" width={previewCols} flexShrink={0} height={area}>
+          <Box {...border} flexDirection="row" height="100%">
+            <Box flexDirection="column" flexGrow={1}>
+            {p.details === undefined && <Text dimColor>{p.noneText}</Text>}
+            {pHead.map((text, i) => (
+              <Text key={'head:' + i} bold={i === 0} wrap="truncate-end">
+                {text}
+              </Text>
+            ))}
+            {pDiff !== '' && <Code source={pDiff} format="diff" wrap="truncate-end" />}
+            {p.details !== undefined && pDiff === '' && (
+              <Text dimColor>
+                {/^(Binary files|GIT binary patch)/m.test(p.details.diff)
+                  ? 'Binary file.'
+                  : 'No textual changes.'}
+              </Text>
+            )}
+            </Box>
+            {dragBar('sb:details', pTotal, pRows, pOffset, pHead.length)}
+          </Box>
+          {titled('title:diff', 'Diff Preview')}
+          </Box>
+        </Box>
+      )
+    }
+
+    // Tab Buttons: the terminal prefixes a plain Button with its hotkey, so no
+    // `(o)` suffixes.
+    const tabButton = (key: Tab, hotkey: string, label: string) => (
+      <Button
+        key={'tab:' + key}
+        hotkey={hotkey}
+        plain
+        dimColor={tab === key ? undefined : true}
+        label={(tab === key ? '▌' : ' ') + label}
+        onPress={() => showTab(key)}
+      />
+    )
+
     return (
       <Box flexDirection="column" width="100%" minHeight={e.props.scroll.bodyRows} backgroundColor={BACKGROUND}>
         <Box flexDirection="row" gap={1}>
+          {tabButton('overview', 'o', 'Overview')}
+          {tabButton('graph', 'g', 'Graph')}
+          {tabButton('changelog', 'c', 'Change Log' + (changes.length > 0 ? ' ' + changes.length : ''))}
+          {isDiff && <Button key="back" hotkey="b" label="back (b)" onPress={closeDiff} />}
           <Button
             key="refresh"
             hotkey="r"
@@ -1036,19 +1319,57 @@ export const register = (on: On): void => {
             onPress={() => remote($, 'pull')}
           />
         </Box>
-        {isWide ? (
+        {isDiff ? (
+          filesAndPreview({
+            title: 'Files · ' + (opened === undefined ? (state.diff ?? '').slice(0, 7) : opened.short + ' ' + opened.subject),
+            keyPrefix: 'dfile:',
+            barKey: 'sb:dfiles',
+            rows: frows,
+            fileOffset,
+            selected: chosen?.path,
+            details,
+            previewOffset: state.detailOffset ?? 0,
+            focus: changeFocus,
+            emptyText: 'No files changed',
+            noneText: 'Select a file.',
+            onPick: path =>
+              update($, git, s => ({
+                ...s,
+                diffFile: path,
+                detailOffset: s.diffFile === path ? s.detailOffset : 0,
+              })),
+            onToggle: toggleChange,
+          })
+        ) : isChanges ? (
+          filesAndPreview({
+            title: 'Files',
+            keyPrefix: 'change:',
+            barKey: 'sb:changes',
+            rows: frows,
+            fileOffset,
+            selected: chosen?.path,
+            details,
+            previewOffset: state.detailOffset ?? 0,
+            focus: changeFocus,
+            emptyText: 'Working tree clean',
+            noneText: 'Select a change.',
+            onPick: path =>
+              update($, git, s => ({
+                ...s,
+                change: path,
+                detailOffset: s.change === path ? s.detailOffset : 0,
+              })),
+            onToggle: toggleChange,
+          })
+        ) : isGraph ? (
+          graphSection
+        ) : (
           <Box flexDirection="row">
             {branchColumn}
-            {graphColumn}
-            {detailColumn}
-          </Box>
-        ) : (
-          <Box flexDirection="column">
-            <Box flexDirection="row">
-              {branchColumn}
-              {graphColumn}
+            <Box flexDirection="column">
+              {commitsSection}
+              {infoSection}
             </Box>
-            {detailColumn}
           </Box>
         )}
         <Box flexDirection="row" justifyContent="space-between" gap={2}>

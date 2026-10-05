@@ -55,20 +55,27 @@ Use these names in code, comments, tests and chat.
 
 - **Panel**: one whole IDE view, Explorer or Git (engine term: pane, `$.ui.open`, `component: 'Pane'`).
 - **Main tabs**: the tab bar that switches between panels (Explorer, Git).
-- **Section**: a named, bordered area inside a panel, e.g. Git's Branches, Commits (Graph/Changes), Info. Its name sits on its top border.
-- **Panel tabs**: tabs on a section's top border that switch what that section shows (Git: `Graph` / `Changes`).
+- **Section**: a named, bordered area inside a panel, e.g. Git's Branches, Commits, Info, Graph, Files, Diff Preview. Its name sits on its top border.
+- **Panel tabs**: a panel's header tabs, switching its whole layout (Git: Overview / Graph / Change Log).
+- **Diff view**: Git's full-panel Files | Diff Preview of one commit, opened from a commit row's `⧉` Button.
 - Not "block": in `git.ts`, `block` means a diff file's header block.
 
 ## Features
 
 - `/ide-panels` is the only command: it opens both panes as tabs (Explorer, Git), explorer in front.
 - Explorer pane `ide-explorer` (`hooks/explorer-panel/`): sections `Files` (tree) and `Preview`; `files` and `unity` modes (Unity: `.meta` GUID references). Pure helpers in `tree.ts`, `unity.ts`.
-- Git pane `ide-git` (`hooks/git-panel/`): branches (grouped by `/`), commit graph (tab `Graph`; `git log --topo-order` with `%P`, one row per commit, colored lanes from `layoutGraph` in `git.ts`) or working-tree `Changes` (one list vs HEAD, `list` or `tree` view, diff in Info) and diff pane, plus `fetch` (`git fetch --all`) and `pull` (`git pull --ff-only`) buttons; nothing else writes to the repo. The current branch also shows in the status line. Pure helpers in `git.ts`.
-- Caches are module-level in each `index.tsx` (not `$.state`): explorer `listings`, `ignored`, `unityRoots`, GUID `indexes`, `footers` (branch + change counts per root); git `repoRoot`, `branchCache`, `statusCache`, `graphCache`, `showCache`, `changeCache` (diff per path), `hasHead`.
+- Git pane `ide-git` (`hooks/git-panel/`), panel tabs:
+  - Overview: Branches (grouped by `/`) | Commits over Info, two columns at every width. Info: sha, author, date, parents, refs, message, `--stat` (no diff); scrolls on its own.
+  - Graph: one full-width section `Graph` (`git log --topo-order` with `%P`, one row per commit: colored lanes from `layoutGraph`, sha, refs, subject, author, date).
+  - Change Log: working tree vs HEAD as Files (`list` or `tree` view) | Diff Preview; the tab shows the change count.
+  - Diff view: each commit row's `⧉` Button opens Files | Diff Preview for that commit (a merge against its first parent; `filesArgv`, `parseNameStatus`, `fileDiff` in `git.ts`); `back` or any tab closes it.
+  - Drag splitters (Branches | right, Commits / Info, Files | Diff Preview): a `Client` (`hooks/shared/splitter-client.tsx`, terminal and desktop only), fractions in `git.split`, pure math in `hooks/shared/split.ts`.
+  - `fetch` (`git fetch --all`) and `pull` (`git pull --ff-only`) buttons; nothing else writes to the repo. The current branch also shows in the status line. Pure helpers in `git.ts`.
+- Caches are module-level in each `index.tsx` (not `$.state`): explorer `listings`, `ignored`, `unityRoots`, GUID `indexes`, `footers` (branch + change counts per root); git `repoRoot`, `branchCache`, `statusCache`, `graphCache`, `showCache` (Info per sha), `diffCache` (files + patch per sha, diff view), `changeCache` (diff per path), `hasHead`.
 - Footer (both panes): `~/path (branch)` left, `+added ~modified -deleted` right (dim when clean; untracked count as added). Explorer: no counts outside a repo; its `footers` is cleared with the listings by every hook and `refresh`.
-- Cleared by: the `refresh` button (`r`) and each feature's `tool.call` hooks. Explorer: `Write`/`Edit`/`NotebookEdit` drop that file and its parent dir; `Bash` drops all listings (and the GUID index when the command matches `git|mv|rm|cp|unity`). Git: `Bash` clears all and re-reads the branch; `Write`/`Edit`/`NotebookEdit` drop the `git status` cache, `showCache` and `changeCache`. The hooks never deny or rewrite a call.
-- Hotkeys on header Buttons: `r` refresh (both), `m` mode (explorer), `a` all branches, `f` fetch, `p` pull, `g` graph tab, `c` changes tab, `v` list/tree view (changes) (git). The tab and view Buttons sit on the middle section's top border.
-- `$.state` atoms under `ide-panes`: `explorer` (`root`, `mode`, `expanded`, `selected`, `offset`, `previewOffset`) and `git` (`ref`, `selected`, `offset`, `limit`, `branchOffset`, `detailOffset`, `collapsed`, `tab`, `change`, `changeOffset`, `changeView`, `changeCollapsed`). `$.store` key `explorer.mode:<root>` holds the saved mode.
+- Cleared by: the `refresh` button (`r`) and each feature's `tool.call` hooks. Explorer: `Write`/`Edit`/`NotebookEdit` drop that file and its parent dir; `Bash` drops all listings (and the GUID index when the command matches `git|mv|rm|cp|unity`). Git: `Bash` clears all and re-reads the branch; `Write`/`Edit`/`NotebookEdit` drop the `git status` cache, `showCache` and `changeCache`; `diffCache` is cleared only with everything (`refresh`, `Bash`, fetch, pull). The hooks never deny or rewrite a call.
+- Hotkeys: `r` refresh (both), `m` mode (explorer); git: `o` Overview, `g` Graph, `c` Change Log, `f` fetch, `p` pull, `b` back (diff view only), `a` all branches, `d` diff (the selected commit row's `⧉`), `v` list/tree view (on Files' border).
+- `$.state` atoms under `ide-panes`: `explorer` (`root`, `mode`, `expanded`, `selected`, `offset`, `previewOffset`) and `git` (`ref`, `selected`, `offset`, `limit`, `branchOffset`, `detailOffset`, `infoOffset`, `collapsed`, `tab` (`overview`/`graph`/`changelog`; an old `changes` reads as `changelog`), `change`, `changeOffset`, `changeView`, `changeCollapsed`, `diff`, `diffFile`, `diffFileOffset`, `split`). `$.store` key `explorer.mode:<root>` holds the saved mode.
 - The explorer owns the plugin's only `session.start` hook and registers `/ide-panels`; git sets its status line on the first `prompt.submit` and after each `Bash` call.
 
 ## Validator constraints

@@ -253,8 +253,11 @@ export const statArgv = (sha: string): string[] => [
 
 export const patchArgv = (sha: string): string[] => [
   'git',
+  '-c',
+  'core.quotePath=false',
   'show',
   '--color=never',
+  '--diff-merges=first-parent',
   '--format=',
   '--patch',
   sha,
@@ -663,3 +666,80 @@ export const changeDiffArgv = (change: Change, hasHead = true): string[] => {
 // A path cut from the start to fit `width` columns.
 export const fitStart = (text: string, width: number): string =>
   text.length > width ? '…' + text.slice(text.length - Math.max(1, width - 1)) : text
+
+// Columns of a commit row: the lanes, the marked short sha and a space take
+// `laneCols + 1 + 9`, the diff button zone `DIFF_COLS`; a wide row adds an
+// author (dropped under 80 columns) and a date, each followed by a space, and
+// the subject takes the rest (at least 4). `width` is the text width of the row.
+export const DIFF_COLS = 5
+
+export const graphColumns = (
+  width: number,
+  laneCols: number,
+  wide = true,
+): { subject: number; author: number; date: number } => {
+  const date = wide ? 10 : 0
+  const author = wide && width >= 80 ? 16 : 0
+  const taken = laneCols + 10 + DIFF_COLS + (date > 0 ? date + 1 : 0) + (author > 0 ? author + 1 : 0)
+
+  return { subject: Math.max(4, width - taken), author, date }
+}
+
+// The most lanes a row of `width` columns can draw and still give the subject
+// its 4 columns. A row's lane cells are `2 * maxLanes`, plus 2 for the `…` cell
+// that `layoutGraph` adds when lanes collapse.
+export const maxLanesFor = (width: number, wide = true): number => {
+  const taken = 10 + DIFF_COLS + (wide ? 11 : 0) + (wide && width >= 80 ? 17 : 0)
+
+  return Math.max(1, Math.floor((width - taken - 4 - 2) / 2))
+}
+
+// The files one commit changed; a merge is listed against its first parent.
+export const filesArgv = (sha: string): string[] => [
+  'git',
+  '-c',
+  'core.quotePath=false',
+  'show',
+  '--name-status',
+  '-M',
+  '--diff-merges=first-parent',
+  '--format=',
+  sha,
+]
+
+// `--name-status` lines (`M\tpath`, `R100\told\tnew`) as `Change`s, so
+// `changeRows` and `changeGlyph` draw them: the status letter is `x`, a rename
+// or copy keeps its source in `from`.
+export const parseNameStatus = (stdout: string): Change[] => {
+  const changes: Change[] = []
+  for (const line of lines(stdout)) {
+    const [status = '', first = '', second] = line.split('\t')
+    const x = status[0] ?? ''
+    if (x === '' || first === '') continue
+    const change: Change = {
+      path: x === 'R' || x === 'C' ? (second ?? first) : first,
+      x,
+      y: ' ',
+      kind: x === 'A' || x === 'C' ? 'added' : x === 'D' ? 'deleted' : 'modified',
+    }
+    if ((x === 'R' || x === 'C') && second !== undefined) change.from = first
+    changes.push(change)
+  }
+
+  return changes
+}
+
+// The `diff --git` block of `path` in a multi-file patch: the one whose header
+// ends in `b/<path>` (the new path of a rename) or starts at `a/<path>`.
+export const fileDiff = (patch: string, path: string): string => {
+  const blocks = patch.split(/^(?=diff --git )/m)
+  for (const block of blocks) {
+    const header = block.slice(0, block.indexOf('\n') === -1 ? undefined : block.indexOf('\n'))
+    if (!header.startsWith('diff --git ')) continue
+    if (header.endsWith(' b/' + path) || header.startsWith('diff --git a/' + path + ' b/')) {
+      return block
+    }
+  }
+
+  return ''
+}

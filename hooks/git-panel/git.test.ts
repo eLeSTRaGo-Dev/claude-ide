@@ -1,12 +1,19 @@
 import { expect, test } from 'claude-code/testing'
 
-import { BRANCHES, LOG, PATCH } from './fixtures'
+import { BRANCHES, LOG, MERGE_NAME_STATUS, MERGE_PATCH, MULTI_PATCH, NAME_STATUS, PATCH } from './fixtures'
 import {
   branchTree,
   changeDiffArgv,
   changeGlyph,
   changeRows,
+  fileDiff,
+  filesArgv,
   fitStart,
+  parseNameStatus,
+  patchArgv,
+  DIFF_COLS,
+  graphColumns,
+  maxLanesFor,
   pathTree,
   remoteArgv,
   remoteSummary,
@@ -393,4 +400,75 @@ test('changeGlyph and changeDiffArgv', () => {
 test('fitStart cuts from the start', () => {
   expect(fitStart('src/ui/file.ts', 20)).toBe('src/ui/file.ts')
   expect(fitStart('src/ui/file.ts', 8)).toBe('…file.ts')
+})
+
+test('graphColumns: wide adds date and author, narrow drops author, subject takes the rest', () => {
+  const wide = graphColumns(150, 3)
+  expect(wide).toMatchObject({ author: 16, date: 10 })
+  expect(wide.subject).toBe(150 - 3 - 10 - 5 - 11 - 17)
+  expect(graphColumns(79, 3)).toMatchObject({ author: 0, date: 10 })
+  expect(graphColumns(60, 3, false)).toEqual({ subject: 60 - 3 - 10 - 5, author: 0, date: 0 })
+  expect(graphColumns(10, 5).subject).toBe(4)
+})
+
+test('filesArgv and patchArgv diff a merge against its first parent', () => {
+  expect(filesArgv('abc')).toEqual([
+    'git', '-c', 'core.quotePath=false', 'show', '--name-status', '-M', '--diff-merges=first-parent', '--format=', 'abc',
+  ])
+  expect(patchArgv('abc')).toContain('--diff-merges=first-parent')
+  expect(patchArgv('abc').slice(1, 3)).toEqual(['-c', 'core.quotePath=false'])
+})
+
+test('UTF-8 paths: parseNameStatus and fileDiff agree on the unquoted name', () => {
+  const status = 'A\tcafé.md\nR100\told.md\tnaïve/ü.md\n'
+  const patch =
+    'diff --git a/café.md b/café.md\nnew file mode 100644\n+one\n' +
+    'diff --git a/old.md b/naïve/ü.md\nsimilarity index 100%\n+two\n'
+  const paths = parseNameStatus(status).map(c => c.path)
+  expect(paths).toEqual(['café.md', 'naïve/ü.md'])
+  expect(fileDiff(patch, paths[0] ?? '')).toContain('+one')
+  expect(fileDiff(patch, paths[1] ?? '')).toContain('+two')
+})
+
+test('maxLanesFor: a row at the most lanes fits the width, wide and compact', () => {
+  for (const width of [100, 160]) {
+    for (const wide of [true, false]) {
+      const lanes = maxLanesFor(width, wide)
+      // lane cells plus the `…` cell pair
+      const laneCols = lanes * 2 + 2
+      const cols = graphColumns(width, laneCols, wide)
+      expect(laneCols + 10 + DIFF_COLS + (cols.date ? cols.date + 1 : 0) + (cols.author ? cols.author + 1 : 0) + cols.subject).toBeLessThanOrEqual(width)
+      expect(cols.subject).toBeGreaterThanOrEqual(4)
+    }
+  }
+})
+
+test('parseNameStatus: modify, add, delete, rename, path with spaces', () => {
+  const changes = parseNameStatus(NAME_STATUS)
+  expect(changes.map(c => [c.path, c.from, changeGlyph(c)])).toEqual([
+    ['CHANGELOG.md', undefined, 'M'],
+    ['plugin/package.json', undefined, 'M'],
+    ['docs/read me.md', undefined, 'A'],
+    ['old.txt', undefined, 'D'],
+    ['src/b.ts', 'src/a.ts', 'R'],
+  ])
+  expect(changeRows(changes, 'list', new Set()).length).toBe(5)
+})
+
+test('parseNameStatus: a merge lists its first-parent files', () => {
+  expect(parseNameStatus(MERGE_NAME_STATUS).map(c => c.path)).toEqual(['from-develop.txt'])
+  expect(parseNameStatus('')).toEqual([])
+})
+
+test('fileDiff: the block of one path', () => {
+  expect(fileDiff(MULTI_PATCH, 'CHANGELOG.md')).toContain('+changelog line')
+  expect(fileDiff(MULTI_PATCH, 'CHANGELOG.md')).not.toContain('package.json')
+  expect(fileDiff(MULTI_PATCH, 'plugin/package.json')).toContain('0.7.1')
+  expect(fileDiff(MULTI_PATCH, 'docs/read me.md')).toBe(
+    MULTI_PATCH.split('diff --git ').filter(b => b.startsWith('a/docs/read me.md')).map(b => 'diff --git ' + b)[0],
+  )
+  expect(fileDiff(MULTI_PATCH, 'old.txt')).toContain('-gone')
+  expect(fileDiff(MULTI_PATCH, 'src/b.ts')).toContain('rename to src/b.ts')
+    expect(fileDiff(PATCH, 'CHANGELOG.md')).toBe(PATCH)
+  expect(fileDiff(MERGE_PATCH, 'nope')).toBe('')
 })
