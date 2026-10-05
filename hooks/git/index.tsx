@@ -277,8 +277,29 @@ export const register = (on: On): void => {
     return {}
   })
 
+  // A scrollbar dragged: the window moves, the selection stays (as the wheel).
+  on('ui.message', { requestId: PANE }, async ($, e) => {
+    const data = e.data as { offset?: unknown } | null
+    const to = typeof data?.offset === 'number' ? data.offset : NaN
+    if (!Number.isFinite(to)) return {}
+    const parts = {
+      'sb:branches': ['branchOffset', view.branchMax],
+      'sb:graph': ['offset', view.graphMax],
+      'sb:details': ['detailOffset', view.detailMax],
+    } as const
+    const part = parts[e.element as keyof typeof parts]
+    if (part === undefined) return {}
+    const value = clamp(Math.round(to), part[1])
+    await update($, git, s => ({ ...s, [part[0]]: value }))
+    $.ui.invalidate('ui.render')
+
+    return {}
+  })
+
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Text, Button, Code } = $.ui.resolve(e)
+    const elements = $.ui.resolve(e)
+    const { Box, Text, Button, Code } = elements
+    const Client = 'Client' in elements ? elements.Client : undefined
     const state = await read($, git)
     const cwd = await $.session.cwd()
     const root = await rootOf($, cwd)
@@ -368,6 +389,32 @@ export const register = (on: On): void => {
       </Box>
     )
 
+    // Draggable on surfaces that draw a `Client`, the Text column elsewhere;
+    // `lead` blank rows sit above the bar (the section's header rows).
+    const dragBar = (
+      key: string,
+      total: number,
+      rows: number,
+      offset: number,
+      lead = 0,
+    ) =>
+      Client === undefined || total <= rows ? (
+        bar([...Array.from({ length: lead }, () => ' '), ...scrollbar(total, rows, offset, rows)])
+      ) : (
+        <Box flexDirection="column" width={1} flexShrink={0}>
+          {Array.from({ length: lead }, (_, i) => (
+            <Text key={'lead:' + i}> </Text>
+          ))}
+          <Client
+            key={key}
+            module="../shared/scrollbar-client.tsx"
+            props={{ total, visible: rows, offset, height: rows, color: border.borderColor }}
+            width={1}
+            height={rows}
+          />
+        </Box>
+      )
+
     const select = (ref: string) =>
       update($, git, s => ({
         ...s,
@@ -406,7 +453,7 @@ export const register = (on: On): void => {
           />
         ))}
         </Box>
-        {bar([' ', ...scrollbar(branches.length, branchRoom, branchWin.offset, branchRoom)])}
+        {dragBar('sb:branches', branches.length, branchRoom, branchWin.offset, 1)}
       </Box>
     )
 
@@ -447,7 +494,7 @@ export const register = (on: On): void => {
           />
         )}
         </Box>
-        {bar(scrollbar(lines.length, graphRows, win.offset, graphRows))}
+        {dragBar('sb:graph', lines.length, graphRows, win.offset)}
       </Box>
     )
 
@@ -464,10 +511,7 @@ export const register = (on: On): void => {
           <Code source={diff} format="diff" wrap="truncate-end" />
         )}
         </Box>
-        {bar([
-          ...head.map(() => ' '),
-          ...scrollbar(diffTotal, diffRows, detailOffset, diffRows),
-        ])}
+        {dragBar('sb:details', diffTotal, diffRows, detailOffset, head.length)}
       </Box>
     )
 

@@ -525,8 +525,29 @@ export const register = (on: On): void => {
     return {}
   })
 
+  // A scrollbar dragged: the window moves, the selection stays (as the wheel).
+  on('ui.message', { requestId: PANE }, async ($, e) => {
+    const data = e.data as { offset?: unknown } | null
+    const to = typeof data?.offset === 'number' ? data.offset : NaN
+    if (!Number.isFinite(to)) return {}
+    if (e.element === 'sb:tree') {
+      const offset = clamp(Math.round(to), view.treeMax)
+      await update($, explorer, s => ({ ...s, offset }))
+    } else if (e.element === 'sb:preview') {
+      const previewOffset = clamp(Math.round(to), view.previewMax)
+      await update($, explorer, s => ({ ...s, previewOffset }))
+    } else {
+      return {}
+    }
+    $.ui.invalidate('ui.render')
+
+    return {}
+  })
+
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Text, Button, Code } = $.ui.resolve(e)
+    const elements = $.ui.resolve(e)
+    const { Box, Text, Button, Code } = elements
+    const Client = 'Client' in elements ? elements.Client : undefined
     const state = await read($, explorer)
     const root = await rootOf($, state)
     const expanded = new Set(state.expanded)
@@ -589,6 +610,20 @@ export const register = (on: On): void => {
       </Box>
     )
 
+    // Draggable on surfaces that draw a `Client`, the Text column elsewhere.
+    const dragBar = (key: string, total: number, rows: number, offset: number) =>
+      Client === undefined || total <= rows ? (
+        bar(scrollbar(total, rows, offset, rows))
+      ) : (
+        <Client
+          key={key}
+          module="../shared/scrollbar-client.tsx"
+          props={{ total, visible: rows, offset, height: rows, color: border.borderColor }}
+          width={1}
+          height={rows}
+        />
+      )
+
     return (
       <Box flexDirection="column" width="100%" minHeight={e.props.scroll.bodyRows} backgroundColor={BACKGROUND}>
         <Box flexDirection="row" gap={1}>
@@ -642,7 +677,7 @@ export const register = (on: On): void => {
               />
             ))}
             </Box>
-            {bar(scrollbar(rows.length, treeRows, win.offset, treeRows))}
+            {dragBar('sb:tree', rows.length, treeRows, win.offset)}
           </Box>
           <Box flexDirection="row" flexGrow={1} height={sectionRows} {...border}>
             <Box flexDirection="column" flexGrow={1}>
@@ -680,7 +715,7 @@ export const register = (on: On): void => {
             )}
             {hidden > 0 && <Text dimColor>+{hidden} more</Text>}
             </Box>
-            {bar(scrollbar(previewTotal, previewRows, previewOffset, previewRows))}
+            {dragBar('sb:preview', previewTotal, previewRows, previewOffset)}
           </Box>
         </Box>
       </Box>

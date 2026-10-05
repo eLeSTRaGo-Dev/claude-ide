@@ -290,7 +290,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
         ...(pointer === undefined ? {} : { pointer }),
       } as never)
     const first = (await commits())[0]
-    expect(await ui.find({ type: 'Text', text: '┃' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: '┃', in: 'sb:graph' })).toBeDefined()
 
     // wide layout: columns 32-95 are the graph
     await scroll(6, { column: 60, row: 3 })

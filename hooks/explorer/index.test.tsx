@@ -527,7 +527,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
         .map(b => b.key ?? '')
         .filter(key => key.startsWith('row:'))
     const bars = async () =>
-      (await ui.findAll({ type: 'Text', text: /^[┃│ ]$/ })).map(t => t.text).join('')
+      (await ui.findAll({ type: 'Text', text: /^[┃│ ]$/, in: 'sb:preview' })).map(t => t.text).join('')
     await ui.press({ key: 'row:/many/g00.txt' })
     expect(await keys()).toContain('row:/many/g00.txt')
     expect(await bars()).toContain('┃')
@@ -558,5 +558,62 @@ for (const surface of ['terminal', 'desktop'] as const) {
     await scroll($, 'ide-explorer', 1)
     expect(await keys()).toContain('row:/many/g01.txt')
     expect((await code())?.props.startLine).toBe(1)
+  })
+}
+
+for (const surface of ['terminal', 'desktop'] as const) {
+  test(`${surface}: dragging a scrollbar moves its section, the selection stays`, async ($, on) => {
+    mock.store(on)
+    fake(on)
+    on('ui.focus', () => ({}))
+    const names = Array.from({ length: 30 }, (_, i) => `d${String(i).padStart(2, '0')}.txt`)
+    TREE['/drag'] = names.map(name => entry(name, 'file'))
+    for (const name of names) {
+      FILES['/drag/' + name] = Array.from({ length: 60 }, (_, i) => `line ${i + 1}`).join('\n') + '\n'
+    }
+    await $.session.start({ cwd: '/drag', surface, isInteractive: true })
+    const ui = await $.ui.mount({
+      plugin: PLUGIN,
+      surface,
+      component: 'Pane',
+      props: { ...PROPS, scroll: { offset: 0, bodyRows: 12 } },
+      requestId: 'ide-explorer',
+      viewport: VIEWPORT,
+    })
+    await ui.press({ key: 'row:/drag/d00.txt' })
+    const code = async () => await ui.find({ type: 'Code' })
+    const keys = async () =>
+      (await ui.findAll({ type: 'Button' }))
+        .map(b => b.key ?? '')
+        .filter(key => key.startsWith('row:'))
+    const thumbs = async (key: string) =>
+      (await ui.findAll({ type: 'Text', in: key })).map(t => t.text).join('')
+
+    await ui.resize({ columns: 1, rows: 9, in: 'sb:preview' })
+    await ui.resize({ columns: 1, rows: 9, in: 'sb:tree' })
+
+    // preview: the thumb starts on top; drag it down, release at the bottom
+    expect((await thumbs('sb:preview')).startsWith('┃')).toBe(true)
+    await ui.pointer({ type: 'down', x: 0, y: 0, button: 'left', in: 'sb:preview' })
+    expect((await code())?.props.startLine).toBe(1)
+    await ui.pointer({ type: 'move', x: 0, y: 4, button: 'left', in: 'sb:preview' })
+    expect((await code())?.props.startLine).toBe(27)
+    await ui.pointer({ type: 'up', x: 0, y: 8, button: 'left', in: 'sb:preview' })
+    expect((await code())?.props.startLine).toBe(52)
+    expect((await thumbs('sb:preview')).endsWith('┃')).toBe(true)
+
+    // a click on the track centres the thumb there
+    await ui.pointer({ type: 'down', x: 0, y: 0, button: 'left', in: 'sb:preview' })
+    await ui.pointer({ type: 'up', x: 0, y: 0, button: 'left', in: 'sb:preview' })
+    expect((await code())?.props.startLine).toBe(1)
+
+    // tree: the window moves, the selection and preview stay
+    await ui.pointer({ type: 'down', x: 0, y: 8, button: 'left', in: 'sb:tree' })
+    await ui.pointer({ type: 'up', x: 0, y: 8, button: 'left', in: 'sb:tree' })
+    const moved = await keys()
+    expect(moved).not.toContain('row:/drag/d00.txt')
+    expect(moved).toContain('row:/drag/d29.txt')
+    expect((await code())?.props.startLine).toBe(1)
+    expect((await code())?.text).toContain('line 1')
   })
 }
