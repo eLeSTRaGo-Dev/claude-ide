@@ -27,6 +27,8 @@ import type { GuidIndex, Ref } from './unity'
 
 type On = Parameters<Register>[0]
 
+// Black behind the whole pane, as the console default.
+const BACKGROUND = 'black'
 const PANE = 'ide-explorer'
 const MODES: readonly Mode[] = ['files', 'unity']
 
@@ -452,7 +454,7 @@ export const register = (on: On): void => {
     const focusKey = current?.path ?? rows[0]?.path
 
     return (
-      <Box flexDirection="column">
+      <Box flexDirection="column" flexGrow={1} backgroundColor={BACKGROUND}>
         <Box flexDirection="row" gap={1}>
           <Text bold>Explorer [{state.mode === 'unity' ? 'Unity' : 'Files'}]</Text>
           <Text dimColor wrap="truncate-start">

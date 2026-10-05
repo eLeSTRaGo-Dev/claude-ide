@@ -19,6 +19,8 @@ import type { Branch, GraphLine } from './git'
 
 type On = Parameters<Register>[0]
 
+// Black behind the whole pane, as the console default.
+const BACKGROUND = 'black'
 const PANE = 'ide-git'
 const PAGE = 200
 // Pane body columns from which the three-column layout is used.
@@ -195,7 +197,7 @@ export const register = (on: On): void => {
     const root = await rootOf($, cwd)
     if (root === null) {
       return (
-        <Box flexDirection="column">
+        <Box flexDirection="column" flexGrow={1} backgroundColor={BACKGROUND}>
           <Text bold>Git</Text>
           <Text dimColor>Not a git repository</Text>
           <Button key="refresh" hotkey="r" label="refresh (r)" onPress={() => {
@@ -334,7 +336,7 @@ export const register = (on: On): void => {
     )
 
     return (
-      <Box flexDirection="column">
+      <Box flexDirection="column" flexGrow={1} backgroundColor={BACKGROUND}>
         <Box flexDirection="row" gap={1}>
           <Text bold>Git</Text>
           <Text dimColor wrap="truncate-start">
