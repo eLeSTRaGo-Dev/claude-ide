@@ -6,8 +6,15 @@ export type ExplorerState = {
   offset: number
 }
 
+export type GitState = {
+  ref: string // 'all' or a branch name
+  selected?: string // commit sha
+  offset: number
+  limit: number
+}
+
 declare module 'claude-code' {
   interface PluginState {
-    'ide-panes': { explorer: ExplorerState }
+    'ide-panes': { explorer: ExplorerState; git: GitState }
   }
 }

@@ -102,17 +102,17 @@ export const flatten = (
   return rows
 }
 
-export type Window = { offset: number; rows: Row[] }
+export type Window<T = Row> = { offset: number; rows: T[] }
 
 // The slice of `height` rows that keeps `selectedIndex` visible with `margin`
 // rows of context beyond it. Starts from `offset` so scrolling is minimal.
-export const window = (
-  rows: readonly Row[],
+export const window = <T = Row>(
+  rows: readonly T[],
   selectedIndex: number,
   height: number,
   offset = 0,
   margin = 1,
-): Window => {
+): Window<T> => {
   const room = Math.max(1, Math.floor(height))
   const last = Math.max(0, rows.length - room)
   let start = Math.min(Math.max(0, offset), last)

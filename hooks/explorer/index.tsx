@@ -14,6 +14,7 @@ import {
   window as windowOf,
 } from './tree'
 import type { Entry, Mode, Row } from './tree'
+import { GIT_COMMAND } from '../git/git'
 import { classify, hasRefs, metaGuid, parseGrep, refsOf } from './unity'
 import type { GuidIndex, Ref } from './unity'
 
@@ -308,6 +309,8 @@ export const register = (on: On): void => {
       description: 'Open the project explorer',
       argumentHint: '[mode unity|files]',
     })
+    // the git view's command: one session.start hook per plugin
+    await $.command.register(GIT_COMMAND)
     const saved = await $.store.get(modeKey(e.cwd))
     await update($, explorer, s => {
       const isSame = s.root === '' || s.root === e.cwd
