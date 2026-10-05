@@ -83,6 +83,7 @@ const fake = (
   })
   on('env.get', () => ({ value: '/home/u' }))
   on('session.cwd', () => ({ value: CWD }))
+  on('session.root', () => ({ value: CWD }))
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('command.register', (_$, e) => ({ value: { command: e.name } }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
@@ -105,6 +106,23 @@ for (const surface of ['terminal', 'desktop'] as const) {
         requestId: 'ide-git',
         viewport: VIEWPORT,
       })
+
+    test(`${surface}/${columns}: header lines: panel tabs, then actions`, async ($, on) => {
+      mock.store(on)
+      fake(on, [])
+      await $.session.start(start(surface))
+      const ui = await mount($)
+
+      const boxes = await ui.findAll({ type: 'Box' })
+      const lines = boxes.map(box => box.key ?? '').filter(key => key.startsWith('header:'))
+      expect(lines).toEqual(['header:tabs', 'header:actions'])
+      const keysOf = (key: string) =>
+        ((boxes.find(box => box.key === key)?.children ?? []) as { props?: { key?: string }; key?: string }[])
+          .map(child => child.key ?? child.props?.key)
+          .filter(k => k !== undefined)
+      expect(keysOf('header:tabs')).toEqual(['tab:overview', 'tab:graph', 'tab:changelog'])
+      expect(keysOf('header:actions')).toEqual(['refresh', 'fetch', 'pull'])
+    })
 
     test(`${surface}/${columns}: branches listed, current marked`, async ($, on) => {
       mock.store(on)

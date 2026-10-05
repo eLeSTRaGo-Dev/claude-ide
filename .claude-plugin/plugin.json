@@ -2,5 +2,20 @@
   "name": "ide-panes",
   "version": "0.1.0",
   "description": "IDE panes: project explorer and git view",
-  "types": "./types/index.d.ts"
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "editorKeymap": {
+      "type": "string",
+      "title": "Editor keymap",
+      "description": "Key preset of the Explorer's editor",
+      "options": ["jetbrains", "vscode"],
+      "default": "jetbrains"
+    },
+    "editorKeys": {
+      "type": "string",
+      "title": "Editor key overrides",
+      "description": "JSON of action to chord, e.g. {\"duplicateLines\":\"ctrl+shift+d\",\"deleteLines\":[\"ctrl+y\"]}",
+      "default": ""
+    }
+  }
 }

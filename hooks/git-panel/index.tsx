@@ -367,7 +367,7 @@ const remote = async ($: EngineInterface, action: RemoteAction): Promise<void> =
   if (busy !== undefined) return
   busy = action
   $.ui.invalidate('ui.render')
-  const cwd = await $.session.cwd()
+  const cwd = await $.session.root()
   let text: string
   try {
     const ran = await $.process.run(remoteArgv(action), {
@@ -413,7 +413,7 @@ export const register = (on: On): void => {
   // The explorer owns the plugin's only session.start hook, so the status line
   // is first set on the first prompt (or Bash call) of a session.
   on('prompt.submit', async ($, e, next) => {
-    await showBranch($, await $.session.cwd())
+    await showBranch($, await $.session.root())
 
     return next(e)
   })
@@ -422,7 +422,7 @@ export const register = (on: On): void => {
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
     const ran = await next(e)
     clear()
-    await showBranch($, await $.session.cwd())
+    await showBranch($, await $.session.root())
     $.ui.invalidate('ui.render')
 
     return ran
@@ -659,7 +659,7 @@ export const register = (on: On): void => {
     const { Box, Text, Button, Code } = elements
     const Client = 'Client' in elements ? elements.Client : undefined
     const state = await read($, git)
-    const cwd = await $.session.cwd()
+    const cwd = await $.session.root()
     const before = threw
     const root = await rootOf($, cwd)
     if (root === null) {
@@ -694,8 +694,10 @@ export const register = (on: On): void => {
     const isWide = columns >= WIDE
     // Each section is framed in the session color.
     const border = borderOf(await read($, sessionColor))
-    // One header row and one footer row; the sections share the rest.
-    const area = Math.max(4, bodyRows - 2)
+    // Two header lines (panel tabs, actions; no interactive line yet: nothing
+    // asks) and one footer row; the sections share the rest.
+    const headerRows = 2
+    const area = Math.max(4, bodyRows - headerRows - 1)
     // The three sizes the splitters will drive, each computed here from its
     // default fraction. Fixed cell widths (not percentages) so labels,
     // hit-testing and the drawn columns agree.
@@ -790,7 +792,7 @@ export const register = (on: On): void => {
     view.area = area
     view.branchEnd = sideCols
     view.filesEnd = filesCols
-    view.infoTop = topRows + 1 // the header row sits above Commits
+    view.infoTop = topRows + headerRows // the header lines sit above Commits
     view.branchMax = Math.max(0, tree.length - branchRoom)
     view.graphMax = Math.max(0, lines.length - graphRows)
     view.infoMax = infoMax
@@ -1292,10 +1294,12 @@ export const register = (on: On): void => {
 
     return (
       <Box flexDirection="column" width="100%" minHeight={e.props.scroll.bodyRows} backgroundColor={BACKGROUND}>
-        <Box flexDirection="row" gap={1}>
+        <Box key="header:tabs" flexDirection="row" gap={1}>
           {tabButton('overview', 'o', 'Overview')}
           {tabButton('graph', 'g', 'Graph')}
           {tabButton('changelog', 'c', 'Change Log' + (changes.length > 0 ? ' ' + changes.length : ''))}
+        </Box>
+        <Box key="header:actions" flexDirection="row" gap={1}>
           {isDiff && <Button key="back" hotkey="b" label="back (b)" onPress={closeDiff} />}
           <Button
             key="refresh"

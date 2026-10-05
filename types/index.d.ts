@@ -6,6 +6,17 @@ export type ExplorerState = {
   cursor?: string // the row the arrows are on (the focus ring)
   offset: number
   previewOffset: number // first preview line shown
+  deleting?: string // the file or dir the delete bar asks about; cleared by its `delete` or `cancel`
+  edit?: {
+    path: string // the file open in the Edit section
+    baseMtime?: number // its mtime when loaded or last saved; absent for a new file
+    isNew?: boolean // the file does not exist yet: created on first save
+    hasDraft?: boolean // a draft file holds unsaved text for this path
+    version: number // bumped to reload the buffer; chunks and drafts of an older one are dropped
+    conflict?: 'disk' | 'changed' // `disk`: a save found the file changed; `changed`: Claude changed it under a dirty buffer
+    confirm?: 'select' | 'close' | 'mode' | 'pane' | 'new' // the unsaved-changes bar and what it was asked for
+    pending?: string // the path to select (`new`: the dir to name a file in) once the unsaved-changes bar is answered
+  }
 }
 
 export type GitState = {

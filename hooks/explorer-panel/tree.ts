@@ -58,6 +58,63 @@ export const parentOf = (path: string): string => {
   return cut <= 0 ? '/' : path.slice(0, cut)
 }
 
+// The file a `new` name makes under `base`: `a/b.ts` nests (its dirs are
+// created on save). Refuses an empty name, an absolute one, a `..` segment, a
+// trailing `/` (a dir, not a file) and anything that lands outside `root`.
+export const newFilePath = (
+  base: string,
+  name: string,
+  root: string,
+): { path: string } | { error: string } => {
+  const trimmed = name.trim()
+  if (trimmed === '') return { error: 'Name a file' }
+  if (trimmed.startsWith('/') || trimmed.startsWith('~')) {
+    return { error: 'Not an absolute path: name it relative to the dir' }
+  }
+  if (trimmed.endsWith('/')) return { error: 'Name a file, not a dir' }
+  const segments = trimmed.split('/').filter(segment => segment !== '' && segment !== '.')
+  if (segments.includes('..')) return { error: 'No `..` in a new file name' }
+  if (segments.length === 0) return { error: 'Name a file' }
+  const path = join(base, segments.join('/'))
+  const inside = root.endsWith('/') ? root : root + '/'
+
+  return path.startsWith(inside) ? { path } : { error: 'Outside the root: ' + path }
+}
+
+// The path `delete` may hand to `rm -rf`: absolute, strictly inside `root`
+// (never the root itself), with no empty, `.` or `..` segment.
+export const deleteTarget = (
+  path: string,
+  root: string,
+): { path: string } | { error: string } => {
+  if (path === '' || root === '') return { error: 'Nothing to delete' }
+  const inside = root.endsWith('/') ? root : root + '/'
+  if (path === root || path + '/' === inside) return { error: 'Not the root' }
+  if (!path.startsWith(inside)) return { error: 'Outside the root: ' + path }
+  const segments = path.slice(inside.length).split('/')
+  if (segments.some(segment => segment === '' || segment === '.' || segment === '..')) {
+    return { error: 'Not a plain path: ' + path }
+  }
+
+  return { path }
+}
+
+// The row to select once `path` and its subtree are gone from `rows`: its next
+// sibling, else its previous one, else its parent (undefined at the top level).
+export const afterDelete = (rows: readonly Row[], path: string): string | undefined => {
+  const at = rows.findIndex(row => row.path === path)
+  if (at < 0) return undefined
+  const { depth } = rows[at]!
+  for (let i = at + 1; i < rows.length && rows[i]!.depth >= depth; i++) {
+    if (rows[i]!.depth === depth) return rows[i]!.path
+  }
+  for (let i = at - 1; i >= 0 && rows[i]!.depth >= depth; i--) {
+    if (rows[i]!.depth === depth) return rows[i]!.path
+  }
+
+  return depth === 0 ? undefined : parentOf(path)
+}
+
 const byName = (a: Entry, b: Entry): number => {
   const left = a.name.toLowerCase()
   const right = b.name.toLowerCase()
