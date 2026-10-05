@@ -5,5 +5,5 @@ import { register as registerGit } from './git-panel'
 
 export const register: Register = (on, options) => {
   registerExplorer(on, options)
-  registerGit(on)
+  registerGit(on, options)
 }

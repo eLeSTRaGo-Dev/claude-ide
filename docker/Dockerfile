@@ -6,7 +6,7 @@ ARG USER=dev
 ARG HOME=/home/dev
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git ripgrep ca-certificates curl less procps \
+ && apt-get install -y --no-install-recommends git ripgrep ca-certificates curl less procps tmux \
  && rm -rf /var/lib/apt/lists/* \
  && npm install -g typescript \
  && (userdel -r node 2>/dev/null || true) && (groupdel node 2>/dev/null || true) \

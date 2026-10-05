@@ -1,10 +1,10 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, PluginOptions, Register } from 'claude-code'
+import type { EngineInterface, PluginOptions, Register, RenderChildren } from 'claude-code'
 
-import type { ExplorerState } from '../../types'
-import { TRANSFER_CHUNK, accept, draftFile, parseChunk, parseHView } from './edit'
+import type { ExplorerState, SettingsState, SettingsUi } from '../../types'
+import { TRANSFER_CHUNK, accept, draftFile, editorColors, parseChunk, parseHView } from './edit'
 import type { EditorProps, HView, Incoming } from './edit'
-import { KEYMAPS, chunks, mergeKeymap } from './editor'
+import { KEYMAPS, chunks } from './editor'
 import type { Action, Keymap } from './editor'
 import {
   MAX_PREVIEW_BYTES,
@@ -23,10 +23,14 @@ import {
 } from './tree'
 import type { Entry, Mode, Row } from './tree'
 import { GIT_PANE, changeCounts, shortDir, parseStatus, statusArgv } from '../git-panel/git'
-import { borderOf, lastAgentColor, parseColorAnswer } from '../shared/color'
+import { lastAgentColor, parseColorAnswer } from '../shared/color'
 import { H_THUMB, H_TRACK, scrollbar } from '../shared/scrollbar'
 import { sliceCols, widest } from '../shared/hscroll'
 import { dragTo, layoutOf, splitAt } from '../shared/split'
+import { DEFAULTS, SETTINGS_KEY, keysError, mergeKeys, resolveTheme, settingsOf } from '../shared/settings'
+import { SettingsButton, SettingsSheet } from '../shared/settings-sheet'
+import type { Theme } from '../shared/theme'
+import { Badge, Btn, Tabs, onDefaultFg } from '../shared/ui'
 import {
   classify,
   hasRefs,
@@ -39,12 +43,21 @@ import type { GuidIndex, Ref } from './unity'
 
 type On = Parameters<Register>[0]
 
-// Black behind the whole pane, as the console default.
-const BACKGROUND = 'black'
 // The `/color` of this session; the explorer's hooks keep it current.
 const sessionColor = atom<'ide-panes', 'sessionColor'>(
   { plugin: 'ide-panes', key: 'sessionColor' } as const,
   '',
+)
+// The Settings values (theme, keymap, panel defaults); $.store `settings` seeds it.
+const settings = atom<'ide-panes', 'settings'>(
+  { plugin: 'ide-panes', key: 'settings' } as const,
+  {} satisfies SettingsState,
+)
+// The Settings sheet while it is up (which pane draws it, the values to put
+// back on cancel, the keys field as typed); session only.
+const settingsUi = atom<'ide-panes', 'settingsUi'>(
+  { plugin: 'ide-panes', key: 'settingsUi' } as const,
+  {} satisfies SettingsUi,
 )
 const PANE = 'ide-explorer'
 const MODES: readonly Mode[] = ['files', 'unity']
@@ -108,9 +121,12 @@ const editing = {
   incoming: undefined as Incoming | undefined,
   hview: undefined as HView | undefined, // the client's horizontal view, for the bar
 }
-// The merged keymap (register's options) and what was wrong with the overrides.
+// The merged keymap (register's options, then the Settings keys) and what was wrong with the overrides.
 let keymap: Keymap = KEYMAPS.jetbrains
 let keymapErrors: string[] = []
+// register's options (userConfig): the keymap is merged again over each
+// drawing's Settings, so a change from either panel's sheet reaches the editor.
+let pluginOptions: PluginOptions | undefined
 // Columns of the widest line of the last previewed file, keyed by path, mtime
 // and line count: the horizontal bar measures every line, not just the shown
 // ones (its thumb must not jump on a vertical scroll), and a 4 MiB file is too
@@ -137,12 +153,18 @@ const widestCached = (key: string, lines: readonly string[]): number => {
 const isMode = (value: unknown): value is Mode =>
   MODES.includes(value as Mode)
 
+// The Settings theme, its accent taken from the `/color` session color while
+// one is set (and `accentFromSession` is on, the default); that accent frames
+// the sections too (`accentBorder`), as git's.
+const themeNow = async ($: EngineInterface): Promise<{ t: Theme; accentBorder: boolean }> => {
+  const now = await read($, settings)
+  const color = await read($, sessionColor)
+
+  return { t: resolveTheme(now, color), accentBorder: color !== '' && (now.accentFromSession ?? true) }
+}
+
 // The session's `/color` as the transcript last recorded it (`agent-color`
 // entries); nothing recorded leaves the current value.
-// Background of the selected row (the file in the preview); the cursor is
-// the engine's focus ring, drawn inverse on top.
-const SELECTED = 'ansi256(238)'
-
 const syncColor = async ($: EngineInterface): Promise<void> => {
   try {
     const id = await $.session.id()
@@ -157,6 +179,10 @@ const syncColor = async ($: EngineInterface): Promise<void> => {
   }
 }
 
+// Calls of gitOut that threw (a drawing superseded mid-call aborts its
+// `$.process.run`): such an answer says nothing, so it is not cached.
+let gitThrew = 0
+
 // Read-only git call in `cwd`; undefined on a non-zero exit or any failure.
 const gitOut = async (
   $: EngineInterface,
@@ -168,6 +194,8 @@ const gitOut = async (
 
     return ran.exitCode === 0 ? ran.stdout : undefined
   } catch {
+    gitThrew += 1
+
     return undefined
   }
 }
@@ -177,6 +205,7 @@ const gitOut = async (
 const footerOf = async ($: EngineInterface, root: string) => {
   let footer = footers.get(root)
   if (footer === undefined) {
+    const before = gitThrew
     let branch = (await gitOut($, root, ['git', 'rev-parse', '--abbrev-ref', 'HEAD']))?.trim()
     if (branch === 'HEAD') {
       branch = (await gitOut($, root, ['git', 'rev-parse', '--short', 'HEAD']))?.trim()
@@ -186,7 +215,8 @@ const footerOf = async ($: EngineInterface, root: string) => {
       branch: branch === '' ? undefined : branch,
       counts: changeCounts(parseStatus(status ?? '')),
     }
-    footers.set(root, footer)
+    // An aborted call (a superseded drawing) left it blank: the next asks again.
+    if (gitThrew === before) footers.set(root, footer)
   }
 
   return footer
@@ -589,6 +619,64 @@ const toast = async ($: EngineInterface, text: string): Promise<void> => {
   }
 }
 
+// The Settings sheet (shared/settings-sheet.tsx). Git keeps the same handlers
+// in its own file: the validator follows `$` only within one file.
+
+// The ⚙: opens the sheet here (from either pane's sheet it moves, keeping
+// what was changed); on the open sheet it is `done`.
+const toggleSettings = async ($: EngineInterface): Promise<void> => {
+  const ui = await read($, settingsUi)
+  if (ui.open === PANE) return settingsDone($)
+  const now = await read($, settings)
+  await update($, settingsUi, (u): SettingsUi => (u.open === undefined ? { open: PANE, before: now } : { ...u, open: PANE }))
+  // The sheet takes the keyboard, its ring on the theme in use (Enter there
+  // changes nothing; Tab walks on to the keys field): see focusOn.
+  focusOn($, 'settings:theme:' + (now.theme ?? DEFAULTS.theme))
+}
+
+// A change applies at once (both panels redraw); `done` saves it. A new page
+// size drops the commits git has paged to.
+const changeSettings = async ($: EngineInterface, patch: Partial<SettingsState>): Promise<void> => {
+  await update($, settings, s => ({ ...s, ...patch }))
+  if (patch.gitLimit !== undefined) {
+    const gitRef = { plugin: 'ide-panes', key: 'git' } as const
+    const held = await $.state.get(gitRef)
+    if (held.value !== undefined) await $.state.set(gitRef, { ...held.value, limit: undefined })
+  }
+}
+
+// The key overrides field: good text (empty is none) is applied; bad text is
+// kept in the field with its error, the settings keep the last good text.
+const settingsKeys = async ($: EngineInterface, text: string): Promise<void> => {
+  const error = keysError(text)
+  await update($, settingsUi, u => ({ ...u, keys: text, keysError: error }))
+  if (error === undefined) await update($, settings, s => ({ ...s, keys: text.trim() === '' ? undefined : text }))
+}
+
+// Both panels' section sizes back to their defaults, here and for later
+// sessions. `{}`, not undefined: git's draw would fall back to the layout it
+// read from the store once per load.
+const resetLayout = async ($: EngineInterface): Promise<void> => {
+  await $.store.delete(LAYOUT_KEY)
+  await $.store.delete('layout:git')
+  await update($, explorer, s => ({ ...s, split: {} }))
+  const gitRef = { plugin: 'ide-panes', key: 'git' } as const
+  const held = await $.state.get(gitRef)
+  if (held.value !== undefined) await $.state.set(gitRef, { ...held.value, split: {} })
+  await toast($, 'Layout reset')
+}
+
+const settingsDone = async ($: EngineInterface): Promise<void> => {
+  await $.store.set(SETTINGS_KEY, await read($, settings))
+  await update($, settingsUi, () => ({}))
+}
+
+const settingsCancel = async ($: EngineInterface): Promise<void> => {
+  const before = (await read($, settingsUi)).before
+  if (before !== undefined) await update($, settings, () => before)
+  await update($, settingsUi, () => ({}))
+}
+
 const startEdit = async ($: EngineInterface, path: string): Promise<void> => {
   const stat = await statOf($, path)
   resetEditing()
@@ -644,13 +732,14 @@ const loadEdit = async ($: EngineInterface, edit: Edit): Promise<boolean> => {
   return true
 }
 
-const editorProps = (edit: Edit, color: string): EditorProps => {
+const editorProps = (edit: Edit, t: Theme): EditorProps => {
   const isLoaded = editing.version === edit.version
 
   return {
     path: edit.path,
     language: languageOf(edit.path.slice(edit.path.lastIndexOf('/') + 1)) ?? '',
-    color,
+    color: t.accent,
+    colors: editorColors(t),
     keymap,
     rows: view.editRows,
     columns: view.editColumns,
@@ -1055,7 +1144,7 @@ const editorMessage = async (
   const after = (await read($, explorer)).edit
   if (after === undefined) return {}
 
-  return { props: editorProps(after, borderOf(await read($, sessionColor)).borderColor) }
+  return { props: editorProps(after, (await themeNow($)).t) }
 }
 
 // After Claude touched files: a clean buffer reloads, a dirty one gets the
@@ -1073,19 +1162,29 @@ const checkDisk = async ($: EngineInterface): Promise<void> => {
   }
 }
 
-const keymapOf = (options: PluginOptions | undefined) => {
-  const preset = options?.editorKeymap === 'vscode' ? KEYMAPS.vscode : KEYMAPS.jetbrains
-  const keys = options?.editorKeys
-
-  return mergeKeymap(preset, typeof keys === 'string' ? keys : undefined)
-}
-
 export const register = (on: On, options?: PluginOptions): void => {
-  const merged = keymapOf(options)
+  pluginOptions = options
+  const merged = mergeKeys(options, undefined)
   keymap = merged.keymap
   keymapErrors = merged.errors
 
   on('session.start', async ($, e, next) => {
+    // Settings from an earlier session; a reload keeps the session's own.
+    // (Kept here too: every get of one dispatch reads the same moment, so a
+    // read after the update would not see it.)
+    const held = await $.state.get({ plugin: 'ide-panes', key: 'settings' } as const)
+    let settingsNow: SettingsState = held.value ?? {}
+    if (held.version === 0) {
+      const stored = settingsOf(await $.store.get(SETTINGS_KEY))
+      if (stored !== undefined) {
+        await update($, settings, () => stored)
+        settingsNow = stored
+      }
+    }
+    // The keymap again, now over the Settings keys.
+    const withSettings = mergeKeys(options, settingsNow)
+    keymap = withSettings.keymap
+    keymapErrors = withSettings.errors
     // The plugin's one command (one session.start hook per plugin).
     await $.command.register({
       name: 'ide-panels',
@@ -1102,7 +1201,8 @@ export const register = (on: On, options?: PluginOptions): void => {
         ...s,
         root,
         split: s.split ?? layout,
-        mode: isMode(saved) ? saved : 'files',
+        // A root with no mode saved takes the Settings default.
+        mode: isMode(saved) ? saved : (settingsNow.explorerMode ?? 'files'),
         expanded: isSame ? s.expanded : [],
         selected: isSame ? s.selected : undefined,
         cursor: isSame ? s.cursor : undefined,
@@ -1330,6 +1430,17 @@ export const register = (on: On, options?: PluginOptions): void => {
     const { Box, Text, Button, Code } = elements
     const Client = 'Client' in elements ? elements.Client : undefined
     const state = await read($, explorer)
+    // The Settings theme (its accent from `/color` while one is set).
+    const { t, accentBorder } = await themeNow($)
+    // The Settings values and sheet; the editor keymap follows the values
+    // whichever panel's sheet changed them.
+    const settingsNow = await read($, settings)
+    const sheet = await read($, settingsUi)
+    keymap = mergeKeys(pluginOptions, settingsNow).keymap
+    // Selected rows and chrome fills: a Button label is the terminal's default
+    // foreground, so fills are darkened.
+    const sel = onDefaultFg(t.surfaceHover)
+    const surface = e.surface
     const root = await rootOf($, state)
     const expanded = new Set(state.expanded)
     await Promise.all([root, ...expanded].map(dir => ensureListed($, dir)))
@@ -1372,16 +1483,17 @@ export const register = (on: On, options?: PluginOptions): void => {
             : namingIn !== undefined
               ? 'naming'
               : undefined
-    // Header lines (panel tabs, actions, and the interactive line while it
-    // asks), the bordered sections (2 rows of frame each), then the footer row.
-    const headerRows = ask === undefined ? 2 : 3
+    // Header lines (the title row, its right end kept for the Settings ⚙;
+    // panel tabs; actions; the interactive line while it asks), the bordered
+    // sections (2 rows of frame each), then the footer row.
+    const headerRows = ask === undefined ? 3 : 4
     const sectionRows = Math.max(5, bodyRows - headerRows - 1)
     const footer = await footerOf($, root)
     const counts = footer.counts
     const isClean = counts.added + counts.modified + counts.deleted === 0
     const homeDir = await $.env.get('HOME')
-    // Each section is framed in the session color.
-    const border = borderOf(await read($, sessionColor))
+    // Each section is framed in the theme's border color, or the `/color` accent.
+    const border = { borderStyle: 'round', borderColor: accentBorder ? t.accent : t.border } as const
     // Rows inside a section's frame.
     const innerRows = sectionRows - 2
     treeRows = innerRows
@@ -1471,11 +1583,11 @@ export const register = (on: On, options?: PluginOptions): void => {
       <Box flexDirection="column" width={1} flexShrink={0}>
         {cells.map((cell, i) =>
           cell === '┃' ? (
-            <Text key={'bar:' + i} color={border.borderColor}>
+            <Text key={'bar:' + i} color={t.accent}>
               {cell}
             </Text>
           ) : (
-            <Text key={'bar:' + i} dimColor>
+            <Text key={'bar:' + i} color={t.muted}>
               {cell}
             </Text>
           ),
@@ -1491,7 +1603,7 @@ export const register = (on: On, options?: PluginOptions): void => {
         <Client
           key={key}
           module="../shared/scrollbar-client.tsx"
-          props={{ total, visible: rows, offset, height: rows, color: border.borderColor }}
+          props={{ total, visible: rows, offset, height: rows, color: t.accent }}
           width={1}
           height={rows}
         />
@@ -1512,11 +1624,11 @@ export const register = (on: On, options?: PluginOptions): void => {
             <Box flexDirection="row" height={1}>
               {scrollbar(total, visible, offset, width, { thumb: H_THUMB, track: H_TRACK }).map((cell, i) =>
                 cell === H_THUMB ? (
-                  <Text key={'hbar:' + i} color={border.borderColor}>
+                  <Text key={'hbar:' + i} color={t.accent}>
                     {cell}
                   </Text>
                 ) : (
-                  <Text key={'hbar:' + i} dimColor>
+                  <Text key={'hbar:' + i} color={t.muted}>
                     {cell}
                   </Text>
                 ),
@@ -1526,7 +1638,7 @@ export const register = (on: On, options?: PluginOptions): void => {
             <Client
               key={key}
               module="../shared/scrollbar-client.tsx"
-              props={{ axis: 'x', total, visible, offset, height: width, color: border.borderColor }}
+              props={{ axis: 'x', total, visible, offset, height: width, color: t.accent }}
               width={width}
               height={1}
             />
@@ -1536,54 +1648,96 @@ export const register = (on: On, options?: PluginOptions): void => {
     }
 
     // The section's name sits on its top border. A bordered Box clips its
-    // children, so the overlay sits after it in an unbordered wrapper of the
-    // same size, at top={0}. A Button has no text color, so black Text is drawn
-    // over it; the press still lands on the Button.
-    const titled = (key: string, name: string) => (
-      <Box position="absolute" top={0} left={1} backgroundColor={border.borderColor}>
-        <Button
-          key={key}
-          plain
-          label={' ' + name + ' '}
-          onPress={pressed => copyName($, name, pressed.surface)}
-        />
-        <Box position="absolute" top={0} left={0}>
-          <Text color="black">{' ' + name + ' '}</Text>
+    // children, so the title is an absolute Box after it, at top={0}, in an
+    // unbordered wrapper of the same size. The Button carries its own label
+    // (default foreground) on an accent-tinted fill: a Text over a Button would
+    // block the press, a blank Button under a Text would paint over it. `mark`
+    // (Edit's unsaved `●`) is a warning-colored Text on the border before it.
+    const titled = (key: string, name: string, mark?: string) => (
+      <Box position="absolute" top={0} left={1} flexDirection="row">
+        {mark !== undefined && <Text color={t.warning}>{mark}</Text>}
+        <Box key={key + ':chrome'} backgroundColor={onDefaultFg(t.accent)}>
+          <Button
+            key={key}
+            plain
+            label={' ' + name + ' '}
+            onPress={pressed => copyName($, name, pressed.surface)}
+          />
         </Box>
       </Box>
     )
 
-    // Panel tabs, drawn as git's: the terminal prefixes a plain Button with its
-    // hotkey, so no `(f)` suffixes. The active one does nothing (a mode switch
-    // would close a clean editor and reset the scroll).
-    const tabButton = (mode: Mode, hotkey: string, label: string) => (
-      <Button
-        key={'tab:' + mode}
-        hotkey={hotkey}
-        plain
-        dimColor={state.mode === mode ? undefined : true}
-        label={(state.mode === mode ? '▌' : ' ') + label}
-        onPress={() => (state.mode === mode ? undefined : setMode($, mode))}
-      />
+    // A small Button on a frame's top border, as the title: its own label on a
+    // tinted fill (accent for the main action, the selection fill otherwise).
+    const edgeButton = (key: string, label: string, isMain: boolean, onPress: () => void) => (
+      <Box key={key + ':chrome'} backgroundColor={isMain ? onDefaultFg(t.accent) : sel}>
+        <Button key={key} plain label={' ' + label + ' '} onPress={onPress} />
+      </Box>
     )
 
+    // The interactive line's question, a compact alert: a tone-colored strip
+    // and icon, the text cut at the end, its Buttons in the right corner.
+    const askLine = (color: string, icon: string, text: string, buttons: RenderChildren) => (
+      <Box key="header:ask" flexDirection="row" justifyContent="space-between" gap={1} backgroundColor={t.surface}>
+        <Box flexDirection="row" flexShrink={1}>
+          <Text color={color}>{'▌' + icon + ' '}</Text>
+          <Text color={color} wrap="truncate-end">
+            {text}
+          </Text>
+        </Box>
+        <Box flexDirection="row" gap={1} flexShrink={0}>
+          {buttons}
+        </Box>
+      </Box>
+    )
+
+    // While the sheet is up the panel's own Buttons do nothing: their hotkeys
+    // stay bound, so the key is taken here (a key no Button takes would land
+    // in the prompt and hand it the keyboard), and a press is dropped.
+    const asleep =
+      <A extends unknown[]>(act: (...args: A) => unknown) =>
+      (...args: A): void => {
+        if (sheet.open !== PANE) void act(...args)
+      }
+    // A one-row `Btn` of the theme.
+    const btn = (
+      key: string,
+      label: string,
+      variant: 'primary' | 'secondary' | 'outline' | 'ghost' | 'danger',
+      onPress: () => void,
+      hotkey?: string,
+    ) => Btn(elements, t, { key, label, variant, size: 'sm', hotkey, surface, onPress: asleep(onPress) })
+
     return (
-      <Box flexDirection="column" width="100%" minHeight={e.props.scroll.bodyRows} backgroundColor={BACKGROUND}>
+      <Box flexDirection="column" width="100%" minHeight={e.props.scroll.bodyRows} backgroundColor={t.bg}>
+        <Box key="header" flexDirection="row" justifyContent="space-between" alignItems="center">
+          <Text bold color={t.text}>
+            {' Explorer'}
+          </Text>
+          {SettingsButton(elements, t, { surface, isOpen: sheet.open === PANE, onPress: () => void toggleSettings($) })}
+        </Box>
+        {/* Panel tabs; the active one does nothing (a mode switch would close
+            a clean editor and reset the scroll). */}
         <Box key="header:tabs" flexDirection="row" gap={1}>
-          {tabButton('files', 'f', 'Files')}
-          {tabButton('unity', 'u', 'Unity')}
-          {isNotUnity && (
-            <Text dimColor>
-              not a Unity project
-            </Text>
-          )}
+          {Tabs(elements, t, {
+            style: 'pill',
+            surface,
+            tabs: [
+              { id: 'files', label: 'Files' },
+              { id: 'unity', label: 'Unity' },
+            ],
+            selected: state.mode,
+            hotkeys: { files: 'f', unity: 'u' },
+            onSelect: asleep((id: string) => (id === state.mode || !isMode(id) ? undefined : void setMode($, id))),
+          })}
+          {isNotUnity && <Text color={t.muted}>not a Unity project</Text>}
         </Box>
         <Box key="header:actions" flexDirection="row" gap={1}>
-          <Button
-            key="refresh"
-            hotkey="r"
-            label="refresh (r)"
-            onPress={() => {
+          {btn(
+            'refresh',
+            'refresh',
+            'ghost',
+            () => {
               listings.clear()
               footers.clear()
               ignored.clear()
@@ -1591,23 +1745,20 @@ export const register = (on: On, options?: PluginOptions): void => {
               deleteFacts = undefined
               indexes.clear()
               $.ui.invalidate('ui.render')
-            }}
-          />
-          {canEdit && edit === undefined && preview?.type === 'code' && (
-            <Button
-              key="edit"
-              hotkey="e"
-              label="edit (e)"
-              onPress={() => startEdit($, preview.path)}
-            />
+            },
+            'r',
           )}
-          {canNew && (
-            <Button
-              key="new"
-              hotkey="n"
-              label="new (n)"
-              onPress={() =>
-                openNaming(
+          {canEdit &&
+            edit === undefined &&
+            preview?.type === 'code' &&
+            btn('edit', 'edit', 'secondary', () => void startEdit($, preview.path), 'e')}
+          {canNew &&
+            btn(
+              'new',
+              'new',
+              'outline',
+              () =>
+                void openNaming(
                   $,
                   current !== undefined
                     ? current.kind === 'dir'
@@ -1616,117 +1767,96 @@ export const register = (on: On, options?: PluginOptions): void => {
                     : state.selected !== undefined
                       ? parentOf(state.selected)
                       : root,
-                )
-              }
-            />
-          )}
-          {current !== undefined && !isAsking && (
-            <Button
-              key="delete"
-              hotkey="d"
-              label="delete (d)"
-              onPress={() => askDelete($, current.path)}
-            />
-          )}
+                ),
+              'n',
+            )}
+          {current !== undefined && !isAsking && btn('delete', 'delete', 'danger', () => void askDelete($, current.path), 'd')}
         </Box>
         {/* The interactive line, only while something asks: the question or
             the name field on the left, its Buttons in the right corner. */}
-        {ask === 'conflict' && edit?.conflict !== undefined ? (
-          <Box key="header:ask" flexDirection="row" justifyContent="space-between" gap={1}>
-            <Box flexDirection="row" flexShrink={1}>
-              <Text color="yellow" wrap="truncate-end">
-                {(edit.conflict === 'disk' ? 'Changed on disk since loaded: ' : 'Changed on disk by Claude: ') +
-                  edit.path.slice(edit.path.lastIndexOf('/') + 1)}
-              </Text>
-            </Box>
-            <Box flexDirection="row" gap={1} flexShrink={0}>
-              <Button key="ask:overwrite" label="overwrite" onPress={() => sendCommand($, 'overwrite')} />
-              <Button key="ask:reload" label="reload" onPress={() => reloadEdit($)} />
-              <Button
-                key="ask:cancel"
-                label="cancel"
-                onPress={() => patchEdit($, edit.version, { conflict: undefined })}
-              />
-            </Box>
-          </Box>
-        ) : ask === 'unsaved' && edit !== undefined ? (
-          <Box key="header:ask" flexDirection="row" justifyContent="space-between" gap={1}>
-            <Box flexDirection="row" flexShrink={1}>
-              <Text color="yellow" wrap="truncate-end">
-                {'Unsaved changes in ' + edit.path.slice(edit.path.lastIndexOf('/') + 1)}
-              </Text>
-            </Box>
-            <Box flexDirection="row" gap={1} flexShrink={0}>
-              <Button key="ask:save" label="save" onPress={() => sendCommand($, 'save')} />
-              <Button key="ask:discard" label="discard" onPress={() => discard($)} />
-              <Button
-                key="ask:cancel"
-                label="cancel"
-                onPress={() => patchEdit($, edit.version, { confirm: undefined, pending: undefined })}
-              />
-            </Box>
-          </Box>
-        ) : ask === 'delete' ? (
-          <Box key="header:ask" flexDirection="row" justifyContent="space-between" gap={1}>
-            <Box flexDirection="row" flexShrink={1}>
-              <Text color="red" wrap="truncate-end">
-                {deleteText}
-              </Text>
-            </Box>
-            <Box flexDirection="row" gap={1} flexShrink={0}>
-              <Button key="delete:confirm" label="delete" onPress={() => confirmDelete($)} />
-              <Button key="delete:cancel" label="cancel" onPress={() => cancelDelete($)} />
-            </Box>
-          </Box>
-        ) : ask === 'naming' && namingIn !== undefined && Input !== undefined ? (
-          <Box key="header:ask" flexDirection="row" justifyContent="space-between" gap={1}>
-            <Box flexDirection="row" flexGrow={1} flexShrink={1}>
-              <Input
-                key="new-file"
-                label={'new file in ' + relativeDir(namingIn, root)}
-                submitLabel="create"
-                autoFocus
-                onSubmit={value => createNew($, namingIn, value)}
-              />
-            </Box>
-            <Box flexDirection="row" gap={1} flexShrink={0}>
-              <Button key="new:cancel" label="cancel" onPress={() => closeNaming($)} />
-            </Box>
-          </Box>
-        ) : undefined}
+        {ask === 'conflict' && edit?.conflict !== undefined
+          ? askLine(
+              t.warning,
+              '⚠',
+              (edit.conflict === 'disk' ? 'Changed on disk since loaded: ' : 'Changed on disk by Claude: ') +
+                edit.path.slice(edit.path.lastIndexOf('/') + 1),
+              [
+                btn('ask:overwrite', 'overwrite', 'danger', () => sendCommand($, 'overwrite')),
+                btn('ask:reload', 'reload', 'primary', () => void reloadEdit($)),
+                btn('ask:cancel', 'cancel', 'ghost', () => void patchEdit($, edit.version, { conflict: undefined })),
+              ],
+            )
+          : ask === 'unsaved' && edit !== undefined
+            ? askLine(t.warning, '⚠', 'Unsaved changes in ' + edit.path.slice(edit.path.lastIndexOf('/') + 1), [
+                btn('ask:save', 'save', 'primary', () => sendCommand($, 'save')),
+                btn('ask:discard', 'discard', 'danger', () => void discard($)),
+                btn(
+                  'ask:cancel',
+                  'cancel',
+                  'ghost',
+                  () => void patchEdit($, edit.version, { confirm: undefined, pending: undefined }),
+                ),
+              ])
+            : ask === 'delete'
+              ? askLine(t.danger, '✕', deleteText, [
+                  btn('delete:confirm', 'delete', 'danger', () => void confirmDelete($)),
+                  btn('delete:cancel', 'cancel', 'ghost', () => void cancelDelete($)),
+                ])
+              : ask === 'naming' && namingIn !== undefined && Input !== undefined ? (
+                  <Box key="header:ask" flexDirection="row" justifyContent="space-between" gap={1} backgroundColor={t.surface}>
+                    <Box flexDirection="row" flexGrow={1} flexShrink={1}>
+                      <Text color={t.accent}>{'▌'}</Text>
+                      <Input
+                        key="new-file"
+                        label={'new file in ' + relativeDir(namingIn, root)}
+                        submitLabel="create"
+                        autoFocus
+                        onSubmit={value => createNew($, namingIn, value)}
+                      />
+                    </Box>
+                    <Box flexDirection="row" gap={1} flexShrink={0}>
+                      {btn('new:cancel', 'cancel', 'ghost', () => void closeNaming($))}
+                    </Box>
+                  </Box>
+                ) : undefined}
         <Box flexDirection="row">
           <Box flexDirection="column" width={treeCols} flexShrink={0} height={sectionRows}>
           <Box {...border} flexDirection="row" height="100%">
             <Box flexDirection="column" flexGrow={1}>
-            {rows.length === 0 && <Text dimColor>(empty)</Text>}
-            {win.rows.map(row => (
-              // Selection mark, a dim rail per depth level, then the row.
-              <Box
-                key={'line:' + row.path}
-                flexDirection="row"
-                backgroundColor={row.path === state.selected ? SELECTED : undefined}
-              >
-                <Text color={border.borderColor}>
-                  {row.path === state.selected ? '▌' : ' '}
-                </Text>
-                {row.depth > 0 && <Text dimColor>{'│ '.repeat(row.depth)}</Text>}
-                <Button
-                  key={'row:' + row.path}
-                  plain
-                  dimColor={ignored.has(row.path)}
-                  autoFocus={row.path === focusKey ? true : undefined}
-                  label={fitLabel(
-                    row.kind === 'dir'
-                      ? (row.isExpanded ? '▾ ' : '▸ ') + row.name + '/'
-                      : '  ' + row.name,
-                    // the room left: frame, vertical bar, mark, rails; no
-                    // horizontal scroll in list sections, so a long name is cut
-                    Math.max(3, treeCols - 2 - 1 - 1 - 2 * row.depth),
-                  )}
-                  onPress={() => press($, row)}
-                />
-              </Box>
-            ))}
+            {rows.length === 0 && <Text color={t.muted}>(empty)</Text>}
+            {win.rows.map(row => {
+              // Selection mark, a rail per depth level, the dir arrow (a Text
+              // beside the Button: a Button has no color), then the name.
+              const isSelected = row.path === state.selected
+              const isIgnored = ignored.has(row.path)
+
+              return (
+                <Box
+                  key={'line:' + row.path}
+                  flexDirection="row"
+                  backgroundColor={isSelected ? sel : undefined}
+                >
+                  <Text color={t.accent}>{isSelected ? '▌' : ' '}</Text>
+                  {row.depth > 0 && <Text color={t.border}>{'│ '.repeat(row.depth)}</Text>}
+                  <Text color={isIgnored ? t.muted : t.accent}>
+                    {row.kind === 'dir' ? (row.isExpanded ? '▾ ' : '▸ ') : '  '}
+                  </Text>
+                  <Button
+                    key={'row:' + row.path}
+                    plain
+                    dimColor={isIgnored}
+                    autoFocus={row.path === focusKey ? true : undefined}
+                    label={fitLabel(
+                      row.kind === 'dir' ? row.name + '/' : row.name,
+                      // the room left: frame, vertical bar, mark, rails, arrow;
+                      // no horizontal scroll in list sections, so a long name is cut
+                      Math.max(3, treeCols - 2 - 1 - 1 - 2 * row.depth - 2),
+                    )}
+                    onPress={() => press($, row)}
+                  />
+                </Box>
+              )
+            })}
             </Box>
             {dragBar('sb:tree', rows.length, treeRows, win.offset)}
           </Box>
@@ -1738,7 +1868,7 @@ export const register = (on: On, options?: PluginOptions): void => {
               <Client
                 key="editor"
                 module="./editor-client.tsx"
-                props={editorProps(edit, border.borderColor)}
+                props={editorProps(edit, t)}
                 height={innerRows}
                 flexGrow={1}
               />
@@ -1747,30 +1877,27 @@ export const register = (on: On, options?: PluginOptions): void => {
                 vertical bar here, so the bar spans all the inner columns. */}
             {editing.hview !== undefined &&
               editing.version === edit.version &&
-              hbar('hb:edit', editTotal(editing.hview),editing.hview.width, editing.hview.left, view.editColumns)}
-            {titled('title:edit',(isEditDirty(edit) ? '● ' : '') + 'Edit')}
+              hbar('hb:edit', editTotal(editing.hview), editing.hview.width, editing.hview.left, view.editColumns)}
+            {titled('title:edit', 'Edit', isEditDirty(edit) ? '●' : undefined)}
             {/* Line actions for terminals that do not report their chords. */}
             <Box position="absolute" top={0} right={1} flexDirection="row" gap={1}>
-              <Button key="edit:save" plain label=" save " onPress={() => sendCommand($, 'save')} />
-              <Button key="edit:close" plain label=" close " onPress={() => closeEdit($)} />
-              {EDIT_COMMANDS.map(([label, command]) => (
-                <Button
-                  key={'edit:' + command}
-                  plain
-                  label={' ' + label + ' '}
-                  onPress={() => sendCommand($, command)}
-                />
-              ))}
+              {edgeButton('edit:save', 'save', true, () => sendCommand($, 'save'))}
+              {edgeButton('edit:close', 'close', false, () => void closeEdit($))}
+              {EDIT_COMMANDS.map(([label, command]) => edgeButton('edit:' + command, label, false, () => sendCommand($, command)))}
             </Box>
             </Box>
           ) : (
           <Box flexDirection="column" flexGrow={1} height={sectionRows}>
           <Box {...border} flexDirection="row" height="100%" flexGrow={1}>
             <Box flexDirection="column" flexGrow={1}>
-            {preview === undefined && <Text dimColor>Select a file.</Text>}
+            {preview === undefined && <Text color={t.muted}>Select a file.</Text>}
             {preview?.type === 'text' &&
               // ' ' for a line scrolled past its end: an empty Text takes no row
-              preview.lines.map(line => <Text wrap="truncate-end">{sliceCols(line, previewLeft) || ' '}</Text>)}
+              preview.lines.map(line => (
+                <Text color={t.text} wrap="truncate-end">
+                  {sliceCols(line, previewLeft) || ' '}
+                </Text>
+              ))}
             {preview?.type === 'code' && (
               <Code
                 source={clip(
@@ -1786,7 +1913,11 @@ export const register = (on: On, options?: PluginOptions): void => {
                 wrap="truncate-end"
               />
             )}
-            {refs.length > 0 && <Text bold>References ({refs.length})</Text>}
+            {refs.length > 0 && (
+              <Text bold color={t.accent}>
+                References ({refs.length})
+              </Text>
+            )}
             {refs.slice(0, shown).map(ref =>
               ref.kind === 'resolved' ? (
                 <Button
@@ -1796,12 +1927,12 @@ export const register = (on: On, options?: PluginOptions): void => {
                   onPress={() => jump($, ref.path)}
                 />
               ) : (
-                <Text dimColor wrap="truncate-end">
+                <Text color={t.muted} wrap="truncate-end">
                   {ref.guid} {ref.kind === 'builtin' ? 'Unity built-in' : 'package or missing'}
                 </Text>
               ),
             )}
-            {hidden > 0 && <Text dimColor>+{hidden} more</Text>}
+            {hidden > 0 && <Text color={t.muted}>+{hidden} more</Text>}
             </Box>
             {dragBar('sb:preview', previewTotal, previewRows, previewOffset)}
           </Box>
@@ -1812,24 +1943,36 @@ export const register = (on: On, options?: PluginOptions): void => {
           {splitter('split:tree', 'x', treeCols - 1, 1, sectionRows - 2, treeCols)}
         </Box>
         <Box flexDirection="row" justifyContent="space-between" gap={2}>
-          <Box flexShrink={1}>
-            <Text key="footer:dir" wrap="truncate-start">
-              <Text dimColor>{shortDir(root, homeDir)}</Text>
-              {footer.branch !== undefined && <Text color="cyan">{` (${footer.branch})`}</Text>}
+          <Box flexShrink={1} flexDirection="row" gap={1}>
+            <Text key="footer:dir" wrap="truncate-start" color={t.muted}>
+              {' ' + shortDir(root, homeDir)}
             </Text>
+            {footer.branch !== undefined && Badge(elements, t, { key: 'footer:branch', label: footer.branch, variant: 'outline' })}
           </Box>
           {footer.branch !== undefined && (
-            <Box flexShrink={0} paddingRight={1}>
-              <Text key="footer:counts" dimColor={isClean}>
-                <Text color={isClean ? undefined : 'green'}>{`+${counts.added}`}</Text>
-                <Text> </Text>
-                <Text color={isClean ? undefined : 'yellow'}>{`~${counts.modified}`}</Text>
-                <Text> </Text>
-                <Text color={isClean ? undefined : 'red'}>{`-${counts.deleted}`}</Text>
-              </Text>
+            <Box key="footer:counts" flexShrink={0} paddingRight={1} flexDirection="row" gap={1}>
+              {Badge(elements, t, { label: `+${counts.added}`, variant: isClean ? 'secondary' : 'success' })}
+              {Badge(elements, t, { label: `~${counts.modified}`, variant: isClean ? 'secondary' : 'outline' })}
+              {Badge(elements, t, { label: `-${counts.deleted}`, variant: isClean ? 'secondary' : 'destructive' })}
             </Box>
           )}
         </Box>
+        {/* The Settings sheet, last: drawn over the panel below the title row. */}
+        {sheet.open === PANE &&
+          SettingsSheet(elements, t, {
+            surface,
+            cols: e.props.bodyColumns,
+            rows: bodyRows,
+            settings: settingsNow,
+            keymap: settingsNow.keymap ?? (pluginOptions?.editorKeymap === 'vscode' ? 'vscode' : 'jetbrains'),
+            keys: sheet.keys ?? settingsNow.keys ?? '',
+            keysError: sheet.keysError,
+            onChange: patch => void changeSettings($, patch),
+            onKeys: text => void settingsKeys($, text),
+            onResetLayout: () => void resetLayout($),
+            onDone: () => void settingsDone($),
+            onCancel: () => void settingsCancel($),
+          })}
       </Box>
     )
   })

@@ -1,6 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
-import { DRAFT_DIR, accept, draftFile, hashPath, parseChunk, parseHView } from './edit'
+import { DRAFT_DIR, accept, draftFile, editorColors, hashPath, mixHex, parseChunk, parseHView } from './edit'
+import { THEMES } from '../shared/theme'
 import type { ChunkMsg } from './edit'
 
 const msg = (over: Partial<ChunkMsg> = {}): ChunkMsg => ({
@@ -78,4 +79,22 @@ test('parseHView takes three non-negative integers, nothing else', () => {
   expect(parseHView({ left: 1.5, widest: 300, width: 58 })).toBeUndefined()
   expect(parseHView({ left: 1, widest: '300', width: 58 })).toBeUndefined()
   expect(parseHView({ left: 1, widest: 300 })).toBeUndefined()
+})
+
+test('mixHex: the ends, halfway, and a non-hex color left alone', () => {
+  expect(mixHex('#000000', '#ffffff', 0)).toBe('#000000')
+  expect(mixHex('#000000', '#ffffff', 1)).toBe('#ffffff')
+  expect(mixHex('#000000', '#ffffff', 0.5)).toBe('#808080')
+  expect(mixHex('red', '#ffffff', 0.5)).toBe('red')
+})
+
+test('editorColors: theme text and muted gutter, inverted caret, a sunk accent selection', () => {
+  const t = THEMES.claude
+  const c = editorColors(t)
+  expect(c.text).toBe(t.text)
+  expect(c.gutter).toBe(t.muted)
+  expect(c.caret).toBe(t.text)
+  expect(c.caretText).toBe(t.bg)
+  expect(c.selection).toBe(mixHex(t.accent, t.bg, 0.65))
+  expect(c.selection).not.toBe(t.accent)
 })

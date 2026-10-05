@@ -1,12 +1,15 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, PluginOptions, Register } from 'claude-code'
 
-import type { GitState } from '../../types'
+import type { GitState, SettingsState, SettingsUi } from '../../types'
 import { window as windowOf } from '../explorer-panel/tree'
-import { borderOf } from '../shared/color'
 import { sliceCols, sliceDiffCols, widest } from '../shared/hscroll'
 import { H_THUMB, H_TRACK, scrollbar } from '../shared/scrollbar'
+import { DEFAULTS, SETTINGS_KEY, keysError, resolveTheme, withGitDefaults } from '../shared/settings'
+import { SettingsButton, SettingsSheet } from '../shared/settings-sheet'
 import { dragTo, layoutOf, splitAt } from '../shared/split'
+import { Badge, Btn, Tabs, onDefaultFg } from '../shared/ui'
+import { glyphColor, lanePalette } from './git-theme'
 import {
   GIT_PANE,
   branchTree,
@@ -32,7 +35,6 @@ import {
   diffLines,
   infoHead,
   containsArgv,
-  LANE_COLORS,
   layoutGraph,
   logArgv,
   parseContains,
@@ -52,32 +54,23 @@ import type { Branch, BranchRow, Change, ChangeRow, Commit, Contains, GraphRow, 
 
 type On = Parameters<Register>[0]
 
-// Black behind the whole pane, as the console default.
-const BACKGROUND = 'black'
 // The `/color` of this session; set by the explorer's hooks.
 const sessionColor = atom<'ide-panes', 'sessionColor'>(
   { plugin: 'ide-panes', key: 'sessionColor' } as const,
   '',
 )
+// The Settings values; the explorer's session.start seeds them.
+const settings = atom<'ide-panes', 'settings'>(
+  { plugin: 'ide-panes', key: 'settings' } as const,
+  {} satisfies SettingsState,
+)
+// The Settings sheet while it is up; session only.
+const settingsUi = atom<'ide-panes', 'settingsUi'>(
+  { plugin: 'ide-panes', key: 'settingsUi' } as const,
+  {} satisfies SettingsUi,
+)
 const PANE = GIT_PANE
-// Background of the selected branch, as the explorer's selected row.
-const SELECTED = 'ansi256(238)'
 
-// Status letter colors in the changes list.
-const GLYPH_COLOR: Record<string, string> = {
-  A: 'green',
-  M: 'yellow',
-  D: 'red',
-  R: 'blue',
-  C: 'blue',
-  '?': 'green',
-}
-
-// Ref badges: tags yellow, remote branches dim red, the rest green.
-const refColor = (ref: string, remotes: ReadonlySet<string>): string =>
-  ref.startsWith('tag: ') ? 'yellow' : remotes.has(ref) ? 'red' : 'green'
-
-const PAGE = 200
 // Each side of a splitter keeps at least this many columns / rows.
 const MIN_COLS = 12
 const MIN_ROWS = 4
@@ -103,8 +96,86 @@ const tabOf = (s: GitState): Tab => {
 
 const git = atom<'ide-panes', 'git'>(
   { plugin: 'ide-panes', key: 'git' } as const,
-  { ref: 'all', offset: 0, limit: PAGE, branchOffset: 0, detailOffset: 0 } satisfies GitState,
+  { ref: 'all', offset: 0, branchOffset: 0, detailOffset: 0 } satisfies GitState,
 )
+
+// The git state as drawn: the Settings defaults where it has none (the tab,
+// the change view, `limit` until paged).
+const gitNow = async ($: EngineInterface) => withGitDefaults(await read($, git), await read($, settings))
+
+// register's options (userConfig): the keymap preset the sheet shows while
+// the Settings have none.
+let pluginOptions: PluginOptions | undefined
+
+// The Settings sheet (shared/settings-sheet.tsx): the explorer keeps the same
+// handlers in its own file, as the validator follows `$` only within one file.
+
+// The ⚙: opens the sheet here (from the other pane's sheet it moves, keeping
+// what was changed); on the open sheet it is `done`.
+const toggleSettings = async ($: EngineInterface): Promise<void> => {
+  const ui = await read($, settingsUi)
+  if (ui.open === PANE) return settingsDone($)
+  const now = await read($, settings)
+  await update($, settingsUi, (u): SettingsUi => (u.open === undefined ? { open: PANE, before: now } : { ...u, open: PANE }))
+  // The sheet takes the keyboard, its ring on the theme in use (Enter there
+  // changes nothing; Tab walks on to the keys field).
+  sheetFocus($, 'settings:theme:' + (now.theme ?? DEFAULTS.theme))
+}
+
+// As the explorer's focusOn: a press's own drawing is not there yet, so the
+// focus waits for it; a click leaves the keyboard with the prompt, so the pane
+// asks for it first (granted only over an empty composer); a deny retries.
+const sheetFocus = ($: EngineInterface, key: string, tries = 4): void => {
+  $.clock.after(50, async () => {
+    try {
+      const pane = (await $.ui.panes()).find(p => p.id === PANE)
+      if (pane !== undefined && !pane.isFocused) await $.ui.open({ id: PANE, title: 'Git', focus: true })
+      const moved = await $.ui.focus({ requestId: PANE, key })
+      if (moved.deny !== undefined && tries > 1) sheetFocus($, key, tries - 1)
+    } catch {
+      // the person clicks into it
+    }
+  })
+}
+
+// A change applies at once (both panels redraw); `done` saves it. A new page
+// size drops the commits paged to.
+const changeSettings = async ($: EngineInterface, patch: Partial<SettingsState>): Promise<void> => {
+  await update($, settings, s => ({ ...s, ...patch }))
+  if (patch.gitLimit !== undefined) await update($, git, s => ({ ...s, limit: undefined }))
+}
+
+// The key overrides field: good text (empty is none) is applied; bad text is
+// kept in the field with its error, the settings keep the last good text.
+const settingsKeys = async ($: EngineInterface, text: string): Promise<void> => {
+  const error = keysError(text)
+  await update($, settingsUi, u => ({ ...u, keys: text, keysError: error }))
+  if (error === undefined) await update($, settings, s => ({ ...s, keys: text.trim() === '' ? undefined : text }))
+}
+
+// Both panels' section sizes back to their defaults, here and for later
+// sessions; `{}` keeps the draw off the layout read from the store.
+const resetLayout = async ($: EngineInterface): Promise<void> => {
+  await $.store.delete(LAYOUT_KEY)
+  await $.store.delete('layout:explorer')
+  storedLayout = undefined
+  await update($, git, s => ({ ...s, split: {} }))
+  const explorerRef = { plugin: 'ide-panes', key: 'explorer' } as const
+  const held = await $.state.get(explorerRef)
+  if (held.value !== undefined) await $.state.set(explorerRef, { ...held.value, split: {} })
+  await $.ui.toast('Layout reset')
+}
+
+const settingsDone = async ($: EngineInterface): Promise<void> => {
+  await $.store.set(SETTINGS_KEY, await read($, settings))
+  await update($, settingsUi, () => ({}))
+}
+
+const settingsCancel = async ($: EngineInterface): Promise<void> => {
+  const before = (await read($, settingsUi)).before
+  if (before !== undefined) await update($, settings, () => before)
+  await update($, settingsUi, () => ({}))
+}
 
 // Git output is cached here, not in $.state; `refresh` and Bash tool calls
 // clear it.
@@ -274,7 +345,7 @@ const statusOf = async (
 const graphOf = async (
   $: EngineInterface,
   cwd: string,
-  state: GitState,
+  state: GitState & { limit: number },
 ): Promise<Commit[]> => {
   const key = state.ref + '\0' + state.limit
   let lines = graphCache.get(key)
@@ -464,7 +535,8 @@ const copyName = async (
 
 const keyOf = (commit: Commit): string => 'commit:' + commit.sha
 
-export const register = (on: On): void => {
+export const register = (on: On, options?: PluginOptions): void => {
+  pluginOptions = options
   // The explorer owns the plugin's only session.start hook, so the status line
   // is first set on the first prompt (or Bash call) of a session.
   on('prompt.submit', async ($, e, next) => {
@@ -508,7 +580,7 @@ export const register = (on: On): void => {
     const element = e.element
     if (element !== undefined && element.startsWith('commit:')) {
       const sha = element.slice('commit:'.length)
-      const state = await read($, git)
+      const state = await gitNow($)
       const lines = graphCache.get(state.ref + '\0' + state.limit) ?? []
       const win = windowOf(
         lines,
@@ -529,7 +601,7 @@ export const register = (on: On): void => {
 
     if (element !== undefined && element.startsWith('change:')) {
       const path = element.slice('change:'.length)
-      const state = await read($, git)
+      const state = await gitNow($)
       const rows = rowsOf(state)
       const win = windowOf(
         rows,
@@ -550,7 +622,7 @@ export const register = (on: On): void => {
 
     if (element !== undefined && element.startsWith('dfile:')) {
       const path = element.slice('dfile:'.length)
-      const state = await read($, git)
+      const state = await gitNow($)
       const rows = rowsOf(state)
       const win = windowOf(
         rows,
@@ -576,7 +648,7 @@ export const register = (on: On): void => {
   // commit selection, a page key scrolls the details. The engine's own window
   // is never used, so the hook always answers `{}` without `next`.
   on('ui.scroll', { requestId: PANE }, async ($, e) => {
-    const state = await read($, git)
+    const state = await gitNow($)
     // The diff view replaces whichever tab it was opened from.
     const isDiff = state.diff !== undefined
     const isChanges = !isDiff && tabOf(state) === 'changelog'
@@ -762,7 +834,49 @@ export const register = (on: On): void => {
     // The hash Client (dots and hashes, and so the hover card and the hash
     // press) where a Client is drawn; elsewhere the hash is a Button.
     const hasDots = Client !== undefined && (e.surface === 'terminal' || e.surface === 'desktop')
-    const state = await read($, git)
+    const state = await gitNow($)
+    // The Settings theme, its accent taken from the `/color` session color
+    // while one is set (and `accentFromSession` is on, the default).
+    const settingsNow = await read($, settings)
+    // The commits a `more` adds, and the Settings sheet while it is up.
+    const page = settingsNow.gitLimit ?? DEFAULTS.gitLimit
+    const sheet = await read($, settingsUi)
+    // While the sheet is up the panel's own hotkeyed Buttons do nothing: the
+    // hotkeys stay bound, so the key is taken here (a key no Button takes
+    // would land in the prompt and hand it the keyboard), and a press is dropped.
+    const asleep =
+      <A extends unknown[]>(act: (...args: A) => unknown) =>
+      (...args: A): void => {
+        if (sheet.open !== PANE) void act(...args)
+      }
+    const color = await read($, sessionColor)
+    const t = resolveTheme(settingsNow, color)
+    // That `/color` accent frames the sections too, as it did before themes.
+    const accentBorder = color !== '' && (settingsNow.accentFromSession ?? true)
+    // Selected rows: a Button label is the terminal's default foreground, so fills are darkened.
+    const sel = onDefaultFg(t.surfaceHover)
+    const lanes = lanePalette(t)
+    const surface = e.surface
+    // The Settings ⚙ (the title row's right end, under the pane's close mark)
+    // and its sheet, drawn last over the panel below the title row.
+    const settingsButton = SettingsButton(elements, t, { surface, isOpen: sheet.open === PANE, onPress: () => void toggleSettings($) })
+    const settingsSheet =
+      sheet.open === PANE
+        ? SettingsSheet(elements, t, {
+            surface,
+            cols: e.props.bodyColumns,
+            rows: e.props.scroll.bodyRows,
+            settings: settingsNow,
+            keymap: settingsNow.keymap ?? (pluginOptions?.editorKeymap === 'vscode' ? 'vscode' : 'jetbrains'),
+            keys: sheet.keys ?? settingsNow.keys ?? '',
+            keysError: sheet.keysError,
+            onChange: patch => void changeSettings($, patch),
+            onKeys: text => void settingsKeys($, text),
+            onResetLayout: () => void resetLayout($),
+            onDone: () => void settingsDone($),
+            onCancel: () => void settingsCancel($),
+          })
+        : undefined
     if (state.split === undefined && !layoutLoaded) await loadLayout($)
     const cwd = await $.session.root()
     const before = threw
@@ -773,12 +887,25 @@ export const register = (on: On): void => {
       if (threw !== before) $.clock.after(1000, () => $.ui.invalidate('ui.render'))
 
       return (
-        <Box flexDirection="column" width="100%" minHeight={e.props.scroll.bodyRows} backgroundColor={BACKGROUND}>
-          <Text dimColor>Not a git repository</Text>
-          <Button key="refresh" hotkey="r" label="refresh (r)" onPress={() => {
-            clear()
-            $.ui.invalidate('ui.render')
-          }} />
+        <Box flexDirection="column" width="100%" minHeight={e.props.scroll.bodyRows} backgroundColor={t.bg}>
+          <Box key="header" flexDirection="row" justifyContent="space-between" alignItems="center">
+            <Text bold color={t.text}>{" Git"}</Text>
+            {settingsButton}
+          </Box>
+          <Text color={t.muted}>Not a git repository</Text>
+          {Btn(elements, t, {
+            key: 'refresh',
+            label: 'refresh',
+            hotkey: 'r',
+            variant: 'ghost',
+            size: 'sm',
+            surface,
+            onPress: asleep(() => {
+              clear()
+              $.ui.invalidate('ui.render')
+            }),
+          })}
+          {settingsSheet}
         </Box>
       )
     }
@@ -797,11 +924,12 @@ export const register = (on: On): void => {
     const isFiles = isDiff || isChanges
     const changeMode = state.changeView ?? 'list'
     const isWide = columns >= WIDE
-    // Each section is framed in the session color.
-    const border = borderOf(await read($, sessionColor))
-    // Two header lines (panel tabs, actions; no interactive line yet: nothing
-    // asks) and one footer row; the sections share the rest.
-    const headerRows = 2
+    // Each section is framed in the theme's border color, or the `/color` accent.
+    const border = { borderStyle: 'round', borderColor: accentBorder ? t.accent : t.border } as const
+    // Three header lines (title row, its right end kept for the Settings ⚙;
+    // panel tabs; actions; no interactive line yet: nothing asks) and one
+    // footer row; the sections share the rest.
+    const headerRows = 3
     const area = Math.max(4, bodyRows - headerRows - 1)
     // The three sizes the splitters will drive, each computed here from its
     // default fraction. Fixed cell widths (not percentages) so labels,
@@ -948,11 +1076,11 @@ export const register = (on: On): void => {
       <Box flexDirection="column" width={1} flexShrink={0}>
         {cells.map((cell, i) =>
           cell === '┃' ? (
-            <Text key={'bar:' + i} color={border.borderColor}>
+            <Text key={'bar:' + i} color={t.accent}>
               {cell}
             </Text>
           ) : (
-            <Text key={'bar:' + i} dimColor>
+            <Text key={'bar:' + i} color={t.muted}>
               {cell}
             </Text>
           ),
@@ -979,7 +1107,7 @@ export const register = (on: On): void => {
           <Client
             key={key}
             module="../shared/scrollbar-client.tsx"
-            props={{ total, visible: rows, offset, height: rows, color: border.borderColor }}
+            props={{ total, visible: rows, offset, height: rows, color: t.accent }}
             width={1}
             height={rows}
           />
@@ -1004,11 +1132,11 @@ export const register = (on: On): void => {
           {Client === undefined ? (
             scrollbar(total, visible, offset, width, { thumb: H_THUMB, track: H_TRACK }).map((cell, i) =>
               cell === H_THUMB ? (
-                <Text key={'hbar:' + i} color={border.borderColor}>
+                <Text key={'hbar:' + i} color={t.accent}>
                   {cell}
                 </Text>
               ) : (
-                <Text key={'hbar:' + i} dimColor>
+                <Text key={'hbar:' + i} color={t.muted}>
                   {cell}
                 </Text>
               ),
@@ -1017,7 +1145,7 @@ export const register = (on: On): void => {
             <Client
               key={key}
               module="../shared/scrollbar-client.tsx"
-              props={{ axis: 'x', total, visible, offset, height: width, color: border.borderColor }}
+              props={{ axis: 'x', total, visible, offset, height: width, color: t.accent }}
               width={width}
               height={1}
             />
@@ -1033,7 +1161,7 @@ export const register = (on: On): void => {
         infoOffset: 0,
         infoLeft: 0,
         selected: undefined,
-        limit: PAGE,
+        limit: undefined, // the page size again
       }))
 
     const toggle = (key: string) =>
@@ -1048,7 +1176,7 @@ export const register = (on: On): void => {
 
     // The offset that keeps the selected commit in view; 0 with no selection.
     const offsetFor = (s: GitState, to: Tab): number => {
-      const lines = graphCache.get(s.ref + '\0' + s.limit) ?? []
+      const lines = graphCache.get(s.ref + '\0' + state.limit) ?? []
       const at = lines.findIndex(commit => commit.sha === s.selected)
 
       return at < 0 ? 0 : windowOf(lines, at, to === 'graph' ? tabRows.graph : tabRows.overview, 0).offset
@@ -1103,20 +1231,18 @@ export const register = (on: On): void => {
       })
 
     // The section's name sits on its top border. A bordered Box clips its
-    // children, so the overlay sits after it in an unbordered wrapper of the
-    // same size, at top={0}. A Button has no text color, so black Text is drawn
-    // over it; the press still lands on the Button.
+    // children, so the title is an absolute Box after it, at top={0}, in an
+    // unbordered wrapper of the same size. The Button carries its own label
+    // (default foreground) on an accent-tinted fill: a Text over a Button would
+    // block the press, a blank Button under a Text would paint over it.
     const titled = (key: string, name: string) => (
-      <Box position="absolute" top={0} left={1} backgroundColor={border.borderColor}>
+      <Box key={key + ':chrome'} position="absolute" top={0} left={1} backgroundColor={onDefaultFg(t.accent)}>
         <Button
           key={key}
           plain
           label={' ' + name + ' '}
           onPress={press => copyName($, name, press.surface)}
         />
-        <Box position="absolute" top={0} left={0}>
-          <Text color="black">{' ' + name + ' '}</Text>
-        </Box>
       </Box>
     )
 
@@ -1158,33 +1284,25 @@ export const register = (on: On): void => {
       <Box flexDirection="column" width={sideCols} flexShrink={0} height={area}>
       <Box {...border} flexDirection="row" height="100%">
         <Box flexDirection="column" flexGrow={1}>
-        <Button
-          key="all"
-          hotkey="a"
-          plain
-          label={(state.ref === 'all' ? '▌' : ' ') + 'all'}
-          onPress={() => select('all')}
-        />
+        <Box flexDirection="row" backgroundColor={state.ref === 'all' ? sel : undefined}>
+          <Text color={t.accent}>{state.ref === 'all' ? '▌' : ' '}</Text>
+          <Button key="all" hotkey="a" plain label="all" onPress={asleep(() => select('all'))} />
+        </Box>
         {branchRows.map((row: BranchRow) => {
           // Rails per depth as in the explorer; a folder opens or closes.
           const rails = '│ '.repeat(row.depth)
           const room = Math.max(4, sideWidth - 1 - rails.length)
           if (row.kind === 'folder' && row.isGroup === true) {
             // A category row: `▾ Local (N)` / `▸ Remote (N)`, the whole label a
-            // Button that opens or closes the group. A Button has no `bold`, so
-            // bold Text is drawn over it, as on the section titles; the press
-            // still lands on the Button.
-            const label = fit((row.isOpen ? '▾ ' : '▸ ') + row.name + ' (' + String(row.count ?? 0) + ')', room)
+            // Button that opens or closes the group; the arrow is an accent Text
+            // beside it (a Button has no color, and a Text over it blocks the press).
+            const label = fit(row.name + ' (' + String(row.count ?? 0) + ')', room - 2)
 
             return (
               <Box key={'bline:' + row.key} flexDirection="row">
                 <Text> </Text>
-                <Box>
-                  <Button key={'bdir:' + row.key} plain label={label} onPress={() => toggle(row.key)} />
-                  <Box position="absolute" top={0} left={0}>
-                    <Text bold>{label}</Text>
-                  </Box>
-                </Box>
+                <Text bold color={t.accent}>{row.isOpen ? '▾ ' : '▸ '}</Text>
+                <Button key={'bdir:' + row.key} plain label={label} onPress={() => toggle(row.key)} />
               </Box>
             )
           }
@@ -1192,7 +1310,7 @@ export const register = (on: On): void => {
             return (
               <Box key={'bline:' + row.key} flexDirection="row">
                 <Text> </Text>
-                {row.depth > 0 && <Text dimColor>{rails}</Text>}
+                {row.depth > 0 && <Text color={t.muted}>{rails}</Text>}
                 <Button
                   key={'bdir:' + row.key}
                   plain
@@ -1210,10 +1328,10 @@ export const register = (on: On): void => {
             <Box
               key={'bline:' + branch.name}
               flexDirection="row"
-              backgroundColor={isSelected ? SELECTED : undefined}
+              backgroundColor={isSelected ? sel : undefined}
             >
-              <Text color={border.borderColor}>{isSelected ? '▌' : ' '}</Text>
-              {row.depth > 0 && <Text dimColor>{rails}</Text>}
+              <Text color={t.accent}>{isSelected ? '▌' : ' '}</Text>
+              {row.depth > 0 && <Text color={t.muted}>{rails}</Text>}
               <Button
                 key={'branch:' + branch.name}
                 plain
@@ -1236,10 +1354,13 @@ export const register = (on: On): void => {
       </Box>
     )
 
+    // Ref badges: HEAD accent, local branches green, remote branches grey, tags outlined.
+    const refVariant = (ref: string): 'default' | 'success' | 'secondary' | 'outline' =>
+      ref.startsWith('HEAD') ? 'default' : ref.startsWith('tag: ') ? 'outline' : remotes.has(ref) ? 'secondary' : 'success'
     // A Commits row's dot: the commit's lane color, `○` for a merge.
     const dotOf = (row: GraphRow) => ({
       glyph: row.commit.parents.length > 1 ? '○' : '●',
-      color: LANE_COLORS[row.color % PALETTE_SIZE] ?? 'white',
+      color: lanes[row.color % PALETTE_SIZE] ?? t.text,
     })
     // The short shas' columns (git may lengthen one to keep it unique).
     const shortCols = win.rows.reduce((max, row) => Math.max(max, row.commit.short.length), 7)
@@ -1249,7 +1370,7 @@ export const register = (on: On): void => {
     // A Graph row's lanes, padded to the widest lanes in view plus a space.
     const lanesOf = (row: GraphRow) =>
       cellRuns(row.cells, laneCols + 1).map((seg, i) => (
-        <Text key={'lane:' + i} color={LANE_COLORS[seg.color % PALETTE_SIZE]}>
+        <Text key={'lane:' + i} color={lanes[seg.color % PALETTE_SIZE]}>
           {seg.text}
         </Text>
       ))
@@ -1275,12 +1396,14 @@ export const register = (on: On): void => {
       const refs: string[] = []
       let used = 0
       for (const ref of commit.refs) {
-        if (used + ref.length + 1 > Math.floor(cols.subject * 0.4)) {
+        // a badge is the ref and a cap on each side, then a space
+        if (used + ref.length + 3 > Math.floor(cols.subject * 0.4)) {
           refs.push('…')
+          used += 2
           break
         }
         refs.push(ref)
-        used += ref.length + 1
+        used += ref.length + 3
       }
       const subjectCols = Math.max(1, cols.subject - used)
       const autoFocus = keyOf(commit) === focusKey ? true : undefined
@@ -1289,7 +1412,7 @@ export const register = (on: On): void => {
         <Box
           key={'row:' + commit.sha}
           flexDirection="row"
-          backgroundColor={isSelected ? SELECTED : undefined}
+          backgroundColor={isSelected ? sel : undefined}
         >
           {!hasDots &&
             (wide ? (
@@ -1310,11 +1433,18 @@ export const register = (on: On): void => {
             />
           )}
           {!hasDots && <Text> </Text>}
-          {refs.map((ref, i) => (
-            <Text key={'ref:' + i} color={refColor(ref, remotes)} dimColor={remotes.has(ref) ? true : undefined}>
-              {ref + ' '}
-            </Text>
-          ))}
+          {refs.map((ref, i) =>
+            ref === '…' ? (
+              <Text key={'ref:' + i} color={t.muted}>
+                {'… '}
+              </Text>
+            ) : (
+              <Box key={'ref:' + i} flexDirection="row">
+                {Badge(elements, t, { label: ref, variant: refVariant(ref) })}
+                <Text> </Text>
+              </Box>
+            ),
+          )}
           <Button
             key={hasDots ? keyOf(commit) : 'subject:' + commit.sha}
             plain
@@ -1323,22 +1453,24 @@ export const register = (on: On): void => {
             onPress={pick}
           />
           {cols.author > 0 && (
-            <Text key={'author:' + commit.sha} dimColor>
+            <Text key={'author:' + commit.sha} color={t.muted}>
               {' ' + fit(commit.author, cols.author).padEnd(cols.author)}
             </Text>
           )}
           {cols.date > 0 && (
-            <Text key={'date:' + commit.sha} dimColor>
+            <Text key={'date:' + commit.sha} color={t.muted}>
               {' ' + commit.date.padEnd(cols.date)}
             </Text>
           )}
+          {/* `d: ⧉` (4 cells) on the selected row, `⧉` on others, right-aligned in
+              DIFF_COLS: one cell always stays between the date and it. */}
           <Box width={DIFF_COLS} flexShrink={0} justifyContent="flex-end">
             <Button
               key={'diff:' + commit.sha}
               plain
               hotkey={isSelected ? 'd' : undefined}
-              label=" ⧉"
-              onPress={() => openDiff(commit.sha)}
+              label="⧉"
+              onPress={asleep(() => openDiff(commit.sha))}
             />
           </Box>
         </Box>
@@ -1353,7 +1485,7 @@ export const register = (on: On): void => {
     const commitList = (width: number, wide: boolean) => (
       <Box {...border} flexDirection="row" height="100%">
         <Box flexDirection="column" flexGrow={1}>
-          {lines.length === 0 && <Text dimColor>(no commits)</Text>}
+          {lines.length === 0 && <Text color={t.muted}>(no commits)</Text>}
           {hasDots && Client !== undefined && win.rows.length > 0 ? (
             <Box flexDirection="row">
               {wide && (
@@ -1362,7 +1494,7 @@ export const register = (on: On): void => {
                     <Box
                       key={'lanes:' + row.commit.sha}
                       flexDirection="row"
-                      backgroundColor={row.commit.sha === selected?.sha ? SELECTED : undefined}
+                      backgroundColor={row.commit.sha === selected?.sha ? sel : undefined}
                     >
                       {lanesOf(row)}
                     </Box>
@@ -1378,7 +1510,7 @@ export const register = (on: On): void => {
                     mark: row.commit.sha === selected?.sha ? '>' : ' ',
                     short: row.commit.short.padEnd(shortCols),
                   })),
-                  background: SELECTED,
+                  background: sel,
                   delayMs: HOVER_MS,
                 }}
                 width={(wide ? 0 : DOT_COLS) + 1 + shortCols + 1}
@@ -1395,8 +1527,8 @@ export const register = (on: On): void => {
             <Button
               key="more"
               plain
-              label={`more (+${PAGE})`}
-              onPress={() => update($, git, s => ({ ...s, limit: s.limit + PAGE }))}
+              label={`more (+${page})`}
+              onPress={() => update($, git, s => ({ ...s, limit: state.limit + page }))}
             />
           )}
         </Box>
@@ -1455,13 +1587,13 @@ export const register = (on: On): void => {
           width={width}
           flexDirection="column"
           borderStyle="round"
-          borderColor={border.borderColor}
-          backgroundColor={BACKGROUND}
+          borderColor={t.borderStrong}
+          backgroundColor={t.surface}
           paddingX={1}
         >
-          <Text bold>{fit(title, room)}</Text>
+          <Text bold color={t.accent}>{fit(title, room)}</Text>
           {items.map((item, i) => (
-            <Text key={'card:' + i} dimColor={item.isDim === true ? true : undefined} bold={item.isBold === true ? true : undefined}>
+            <Text key={'card:' + i} color={item.isDim === true ? t.muted : t.text} bold={item.isBold === true ? true : undefined}>
               {fit(item.text, room)}
             </Text>
           ))}
@@ -1491,9 +1623,9 @@ export const register = (on: On): void => {
       <Box flexDirection="column" width={width} flexShrink={0} height={rows}>
       <Box {...border} flexDirection="row" height="100%">
         <Box flexDirection="column" flexGrow={1}>
-        {details === undefined && <Text dimColor>Select a commit.</Text>}
+        {details === undefined && <Text color={t.muted}>Select a commit.</Text>}
         {infoShown.map((text, i) => (
-          <Text key={'info:' + (infoOffset + i)} bold={infoOffset + i === 0} wrap="truncate-end">
+          <Text key={'info:' + (infoOffset + i)} bold={infoOffset + i === 0} color={infoOffset + i === 0 ? t.accent : t.text} wrap="truncate-end">
             {sliceCols(text, infoLeft) || ' '}
           </Text>
         ))}
@@ -1539,14 +1671,14 @@ export const register = (on: On): void => {
           <Box flexDirection="column" width={filesCols} flexShrink={0} height={area}>
           <Box {...border} flexDirection="row" height="100%">
             <Box flexDirection="column" flexGrow={1}>
-              {p.rows.length === 0 && <Text dimColor>{p.emptyText}</Text>}
+              {p.rows.length === 0 && <Text color={t.muted}>{p.emptyText}</Text>}
               {fwin.rows.map(row => {
                 const rails = '│ '.repeat(row.depth)
                 if (row.kind === 'folder') {
                   return (
                     <Box key={'cline:' + row.key} flexDirection="row">
                       <Text> </Text>
-                      {row.depth > 0 && <Text dimColor>{rails}</Text>}
+                      {row.depth > 0 && <Text color={t.muted}>{rails}</Text>}
                       <Button
                         key={'cdir:' + row.key}
                         plain
@@ -1566,15 +1698,15 @@ export const register = (on: On): void => {
                   <Box
                     key={'cline:' + change.path}
                     flexDirection="row"
-                    backgroundColor={isSelected ? SELECTED : undefined}
+                    backgroundColor={isSelected ? sel : undefined}
                   >
-                    <Text color={border.borderColor}>{isSelected ? '▌' : ' '}</Text>
-                    {row.depth > 0 && <Text dimColor>{rails}</Text>}
-                    <Text color={GLYPH_COLOR[glyph] ?? 'white'} dimColor={glyph === '?' ? true : undefined}>
+                    <Text color={t.accent}>{isSelected ? '▌' : ' '}</Text>
+                    {row.depth > 0 && <Text color={t.muted}>{rails}</Text>}
+                    <Text bold color={glyphColor(t, glyph)}>
                       {glyph}
                     </Text>
                     <Text> </Text>
-                    {slash >= 0 && <Text dimColor>{label.slice(0, slash + 1)}</Text>}
+                    {slash >= 0 && <Text color={t.muted}>{label.slice(0, slash + 1)}</Text>}
                     <Button
                       key={p.keyPrefix + change.path}
                       plain
@@ -1588,36 +1720,38 @@ export const register = (on: On): void => {
             </Box>
             {dragBar(p.barKey, p.rows.length, changeRoom, fwin.offset)}
           </Box>
-            {titled('title:files', fit(p.title, Math.max(5, filesCols - 16)))}
+            {/* The name chip (name + 2 cells from column 1), a border cell, then
+                `v: view: list` (13 cells, right 1). */}
+            {titled('title:files', fit(p.title, Math.max(5, filesCols - 18)))}
             <Box position="absolute" top={0} right={1} flexDirection="row" gap={1}>
               <Button
                 key="view"
                 hotkey="v"
                 plain
                 label={`view: ${changeMode}`}
-                onPress={() =>
+                onPress={asleep(() =>
                   update($, git, s => ({
                     ...s,
                     changeView: changeMode === 'list' ? ('tree' as const) : ('list' as const),
                     changeOffset: 0,
                     diffFileOffset: 0,
-                  }))
-                }
+                  })),
+                )}
               />
             </Box>
           </Box>
           <Box flexDirection="column" width={previewCols} flexShrink={0} height={area}>
           <Box {...border} flexDirection="row" height="100%">
             <Box flexDirection="column" flexGrow={1}>
-            {p.details === undefined && <Text dimColor>{p.noneText}</Text>}
+            {p.details === undefined && <Text color={t.muted}>{p.noneText}</Text>}
             {pHead.map((text, i) => (
-              <Text key={'head:' + i} bold={i === 0} wrap="truncate-end">
+              <Text key={'head:' + i} bold={i === 0} color={i === 0 ? t.accent : t.text} wrap="truncate-end">
                 {sliceCols(text, detailLeft) || ' '}
               </Text>
             ))}
             {pDiff !== '' && <Code source={sliceDiffCols(pDiff, detailLeft)} format="diff" wrap="truncate-end" />}
             {p.details !== undefined && pDiff === '' && (
-              <Text dimColor>
+              <Text color={t.muted}>
                 {/^(Binary files|GIT binary patch)/m.test(p.details.diff)
                   ? 'Binary file.'
                   : 'No textual changes.'}
@@ -1634,49 +1768,56 @@ export const register = (on: On): void => {
       )
     }
 
-    // Tab Buttons: the terminal prefixes a plain Button with its hotkey, so no
-    // `(o)` suffixes.
-    const tabButton = (key: Tab, hotkey: string, label: string) => (
-      <Button
-        key={'tab:' + key}
-        hotkey={hotkey}
-        plain
-        dimColor={tab === key ? undefined : true}
-        label={(tab === key ? '▌' : ' ') + label}
-        onPress={() => showTab(key)}
-      />
-    )
+    const TAB_LABEL = { overview: 'Overview', graph: 'Graph', changelog: 'Change Log' + (changes.length > 0 ? ' ' + changes.length : '') } as const
 
     return (
-      <Box flexDirection="column" width="100%" minHeight={e.props.scroll.bodyRows} backgroundColor={BACKGROUND}>
+      <Box flexDirection="column" width="100%" minHeight={e.props.scroll.bodyRows} backgroundColor={t.bg}>
+        <Box key="header" flexDirection="row" justifyContent="space-between" alignItems="center">
+          <Text bold color={t.text}>{' Git'}</Text>
+          {settingsButton}
+        </Box>
         <Box key="header:tabs" flexDirection="row" gap={1}>
-          {tabButton('overview', 'o', 'Overview')}
-          {tabButton('graph', 'g', 'Graph')}
-          {tabButton('changelog', 'c', 'Change Log' + (changes.length > 0 ? ' ' + changes.length : ''))}
+          {Tabs(elements, t, {
+            style: 'pill',
+            surface,
+            tabs: (['overview', 'graph', 'changelog'] as const).map(id => ({ id, label: TAB_LABEL[id] })),
+            selected: tab,
+            hotkeys: { overview: 'o', graph: 'g', changelog: 'c' },
+            onSelect: asleep((id: string) => showTab(id as Tab)),
+          })}
         </Box>
         <Box key="header:actions" flexDirection="row" gap={1}>
-          {isDiff && <Button key="back" hotkey="b" label="back (b)" onPress={closeDiff} />}
-          <Button
-            key="refresh"
-            hotkey="r"
-            label="refresh (r)"
-            onPress={() => {
+          {isDiff && Btn(elements, t, { key: 'back', label: 'back', hotkey: 'b', variant: 'secondary', size: 'sm', surface, onPress: asleep(closeDiff) })}
+          {Btn(elements, t, {
+            key: 'refresh',
+            label: 'refresh',
+            hotkey: 'r',
+            variant: 'ghost',
+            size: 'sm',
+            surface,
+            onPress: asleep(() => {
               clear()
               $.ui.invalidate('ui.render')
-            }}
-          />
-          <Button
-            key="fetch"
-            hotkey="f"
-            label={busy === 'fetch' ? 'fetching…' : 'fetch (f)'}
-            onPress={() => remote($, 'fetch')}
-          />
-          <Button
-            key="pull"
-            hotkey="p"
-            label={busy === 'pull' ? 'pulling…' : 'pull (p)'}
-            onPress={() => remote($, 'pull')}
-          />
+            }),
+          })}
+          {Btn(elements, t, {
+            key: 'fetch',
+            label: busy === 'fetch' ? 'fetching…' : 'fetch',
+            hotkey: 'f',
+            variant: 'outline',
+            size: 'sm',
+            surface,
+            onPress: asleep(() => remote($, 'fetch')),
+          })}
+          {Btn(elements, t, {
+            key: 'pull',
+            label: busy === 'pull' ? 'pulling…' : 'pull',
+            hotkey: 'p',
+            variant: 'primary',
+            size: 'sm',
+            surface,
+            onPress: asleep(() => remote($, 'pull')),
+          })}
         </Box>
         {isDiff ? (
           filesAndPreview({
@@ -1753,22 +1894,17 @@ export const register = (on: On): void => {
           </Box>
         )}
         <Box flexDirection="row" justifyContent="space-between" gap={2}>
-          <Box flexShrink={1}>
-            <Text key="footer:dir" wrap="truncate-start">
-              <Text dimColor>{shortDir(root, home)}</Text>
-              <Text color="cyan">{` (${head0?.name ?? 'detached'})`}</Text>
-            </Text>
+          <Box flexShrink={1} flexDirection="row" gap={1}>
+            <Text key="footer:dir" wrap="truncate-start" color={t.muted}>{' ' + shortDir(root, home)}</Text>
+            {Badge(elements, t, { key: 'footer:branch', label: head0?.name ?? 'detached', variant: 'outline' })}
           </Box>
-          <Box flexShrink={0} paddingRight={1}>
-            <Text key="footer:counts" dimColor={isClean}>
-              <Text color={isClean ? undefined : 'green'}>{`+${counts.added}`}</Text>
-              <Text> </Text>
-              <Text color={isClean ? undefined : 'yellow'}>{`~${counts.modified}`}</Text>
-              <Text> </Text>
-              <Text color={isClean ? undefined : 'red'}>{`-${counts.deleted}`}</Text>
-            </Text>
+          <Box key="footer:counts" flexShrink={0} paddingRight={1} flexDirection="row" gap={1}>
+            {Badge(elements, t, { label: `+${counts.added}`, variant: isClean ? 'secondary' : 'success' })}
+            {Badge(elements, t, { label: `~${counts.modified}`, variant: isClean ? 'secondary' : 'outline' })}
+            {Badge(elements, t, { label: `-${counts.deleted}`, variant: isClean ? 'secondary' : 'destructive' })}
           </Box>
         </Box>
+        {settingsSheet}
       </Box>
     )
   })

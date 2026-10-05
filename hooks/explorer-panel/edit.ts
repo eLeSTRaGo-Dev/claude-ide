@@ -1,5 +1,6 @@
 import { assemble } from './editor'
 import type { Keymap } from './editor'
+import type { Theme } from '../shared/theme'
 
 // Pure helpers of the Edit section's hook side: draft file names and the
 // assembly of chunked messages from the editor client.
@@ -23,11 +24,51 @@ export const DRAFT_DIR = '.claude/ide-panes/drafts'
 export const draftFile = (home: string, path: string): string =>
   `${home.replace(/\/$/, '')}/${DRAFT_DIR}/${hashPath(path)}.txt`
 
+// The editor's colors, from the Settings theme (index.tsx `editorColors`).
+export type EditorColors = {
+  text: string
+  gutter: string // line numbers
+  caret: string // the caret cell's background
+  caretText: string // the caret cell's text
+  selection: string // a selected run's background
+}
+
+// `a` moved toward `b` by `amount` (0..1), both '#rrggbb'; `a` when either is not.
+export const mixHex = (a: string, b: string, amount: number): string => {
+  const ma = /^#([0-9a-f]{6})$/i.exec(a)
+  const mb = /^#([0-9a-f]{6})$/i.exec(b)
+  if (ma === null || mb === null) return a
+  const na = parseInt(ma[1] as string, 16)
+  const nb = parseInt(mb[1] as string, 16)
+  const k = Math.min(1, Math.max(0, amount))
+  const c = (shift: number) => {
+    const x = (na >> shift) & 255
+    const y = (nb >> shift) & 255
+
+    return Math.round(x + (y - x) * k).toString(16).padStart(2, '0')
+  }
+
+  return '#' + c(16) + c(8) + c(0)
+}
+
+// The editor's colors in a theme: text and a muted gutter, the caret as the
+// text inverted, a selection of the accent sunk 65% into the background.
+export const editorColors = (t: Theme): EditorColors => ({
+  text: t.text,
+  gutter: t.muted,
+  caret: t.text,
+  caretText: t.bg,
+  selection: mixHex(t.accent, t.bg, 0.65),
+})
+
 // Props of the editor client (editor-client.tsx), built by the hook.
 export type EditorProps = {
   path: string
   language: string // '' when none (no comment prefix)
   color: string
+  // Theme colors of the drawing; absent: the terminal's own (default text,
+  // dim gutter, inverse caret, ansi256(24) selection).
+  colors?: EditorColors
   keymap: Keymap
   rows: number // the region's rows and columns as the hook laid them out
   columns: number

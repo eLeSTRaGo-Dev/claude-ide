@@ -102,18 +102,6 @@ export type GraphRow = { commit: Commit; lane: number; color: number; cells: Gra
 
 export const PALETTE_SIZE = 8
 
-// Lane-run colors, one per palette index, readable on black.
-export const LANE_COLORS: readonly string[] = [
-  'ansi256(75)',
-  'ansi256(114)',
-  'ansi256(176)',
-  'ansi256(215)',
-  'ansi256(80)',
-  'ansi256(203)',
-  'ansi256(185)',
-  'ansi256(147)',
-]
-
 // Lanes from parent hashes, one row per commit (`commits` newest first, parents
 // after their children, as `--topo-order`). A lane expects the sha of the next
 // commit it will meet. A commit takes the first lane expecting it (else a free

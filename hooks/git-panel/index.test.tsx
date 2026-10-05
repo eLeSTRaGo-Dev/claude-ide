@@ -3,10 +3,16 @@ import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 import { sliceCols } from '../shared/hscroll'
-import { LANE_COLORS, PALETTE_SIZE, layoutGraph, parseLog } from './git'
+import { PALETTE_SIZE, layoutGraph, parseLog } from './git'
+import { lanePalette } from './git-theme'
+import { THEMES } from '../shared/theme'
+import { sessionHex } from '../shared/color'
+import { onDefaultFg } from '../shared/ui'
 import { BRANCHES, LOG, MERGE_NAME_STATUS, MERGE_PATCH, MULTI_PATCH, NAME_STATUS, STAT } from './fixtures'
 
 const CWD = '/repo'
+const LANES = lanePalette(THEMES.claude)
+const SEL = onDefaultFg(THEMES.claude.surfaceHover)
 const PLUGIN = 'ide-panes'
 const VIEWPORT = { columns: 120, rows: 30 }
 const props = (bodyColumns: number) =>
@@ -146,8 +152,59 @@ for (const surface of ['terminal', 'desktop'] as const) {
         ((boxes.find(box => box.key === key)?.children ?? []) as { props?: { key?: string }; key?: string }[])
           .map(child => child.key ?? child.props?.key)
           .filter(k => k !== undefined)
-      expect(keysOf('header:tabs')).toEqual(['tab:overview', 'tab:graph', 'tab:changelog'])
-      expect(keysOf('header:actions')).toEqual(['refresh', 'fetch', 'pull'])
+      const bare = (keys: (string | undefined)[]) => keys.map(k => (k ?? '').replace(/:chrome$/, ''))
+      expect(bare(keysOf('header:actions'))).toEqual(['refresh', 'fetch', 'pull'])
+      const tabKeys = (await ui.findAll({ type: 'Button' })).map(b => b.key ?? '').filter(k => k.startsWith('tab:'))
+      expect(tabKeys).toEqual(['tab:overview', 'tab:graph', 'tab:changelog'])
+      // the title row sits above the tabs; the theme lives in Settings, not here
+      expect(boxes.find(box => box.key === 'header')).toBeDefined()
+      expect(await ui.find({ key: 'theme' })).toBeUndefined()
+    })
+
+    test(`${surface}/${columns}: the Settings theme restyles the panel (dots, selection, frames)`, async ($, on) => {
+      const store = new Map<string, unknown>([['settings', { theme: 'dark' }]])
+      on('store.get', (_$, e) => ({ value: store.get(e.key) }))
+      on('store.set', (_$, e) => {
+        store.set(e.key, e.value)
+
+        return { value: undefined }
+      })
+      fake(on, [])
+      await $.session.start(start(surface))
+      const ui = await mount($)
+
+      const first = layoutGraph(parseLog(LOG))[0]?.color ?? 0
+      expect((await hashRows(ui, 'dots'))?.[0]?.color).toBe(lanePalette(THEMES.dark)[first])
+      expect(lanePalette(THEMES.dark)[first]).not.toBe(LANES[first])
+      const sel = onDefaultFg(THEMES.dark.surfaceHover)
+      expect((await ui.find({ key: 'row:' + parseLog(LOG)[0]?.sha }))?.props.backgroundColor).toBe(sel)
+      const frames = (await ui.findAll({ type: 'Box' })).filter(box => box.props.borderStyle === 'round')
+      expect(frames.length).toBeGreaterThan(0)
+      for (const box of frames.filter(b => b.props.paddingX === undefined)) {
+        expect(box.props.borderColor).toBe(THEMES.dark.border)
+      }
+    })
+
+    test(`${surface}/${columns}: /color tints the frames and the accent`, async ($, on) => {
+      mock.store(on)
+      fake(on, [])
+      on('command.run', { command: 'color' }, () => ({ text: 'Session color set to: green' }))
+      await $.session.start(start(surface))
+      await $.command.run({
+        command: 'color',
+        args: 'green',
+        origin: { kind: 'composer' },
+        presentation: { isFullscreen: true, columns: 120 },
+      })
+      const ui = await mount($)
+
+      const green = sessionHex('green')
+      const frames = (await ui.findAll({ type: 'Box' })).filter(box => box.props.borderStyle === 'round')
+      expect(frames.length).toBeGreaterThan(0)
+      for (const box of frames.filter(b => b.props.paddingX === undefined)) {
+        expect(box.props.borderColor).toBe(green)
+      }
+      expect((await ui.find({ key: 'title:commits:chrome' }))?.props.backgroundColor).toBe(onDefaultFg(green))
     })
 
     test(`${surface}/${columns}: branches listed, current marked`, async ($, on) => {
@@ -173,8 +230,9 @@ for (const surface of ['terminal', 'desktop'] as const) {
       expect((await ui.find({ key: 'title:branches' }))?.props.label).toBe(' Branches ')
       expect((await ui.find({ key: 'title:commits' }))?.props.label).toBe(' Commits ')
       expect((await ui.find({ key: 'title:info' }))?.props.label).toBe(' Info ')
-      expect(await ui.find({ type: 'Text', text: '/repo (develop)' })).toBeDefined()
-      expect(await ui.find({ type: 'Text', text: '+1 ~1 -1' })).toBeDefined()
+      expect(await ui.find({ type: 'Text', text: /\/repo/ })).toBeDefined()
+      expect(await ui.find({ type: 'Text', text: 'develop' })).toBeDefined()
+      for (const count of ['+1', '~1', '-1']) expect(await ui.find({ type: 'Text', text: count })).toBeDefined()
       // the full path is not in the header any more
       expect(await ui.find({ type: 'Text', text: '/home/u' })).toBeUndefined()
     })
@@ -253,7 +311,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
       expect(dots).toEqual(
         laid.map((r, i) => ({
           glyph: r.commit.parents.length > 1 ? '○' : '●',
-          color: LANE_COLORS[r.color % PALETTE_SIZE],
+          color: LANES[r.color % PALETTE_SIZE],
           mark: i === 0 ? '>' : ' ',
           short: r.commit.short,
         })),
@@ -298,9 +356,9 @@ for (const surface of ['terminal', 'desktop'] as const) {
       // the selected row reads as one: its lanes, hash and rest are painted
       const first = (await ui.findAll({ type: 'Box' })).find(box => box.key?.startsWith('lanes:'))
       const firstSha = first?.key?.slice('lanes:'.length) ?? ''
-      expect(first?.props.backgroundColor).toBe('ansi256(238)')
-      expect((await ui.find({ key: 'row:' + firstSha }))?.props.backgroundColor).toBe('ansi256(238)')
-      expect((await ui.find({ key: 'shas' }))?.props.props).toMatchObject({ background: 'ansi256(238)' })
+      expect(first?.props.backgroundColor).toBe(SEL)
+      expect((await ui.find({ key: 'row:' + firstSha }))?.props.backgroundColor).toBe(SEL)
+      expect((await ui.find({ key: 'shas' }))?.props.props).toMatchObject({ background: SEL })
       expect(await markOf(ui, firstSha)).toBe('>')
     })
 
@@ -474,7 +532,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
       viewport: VIEWPORT,
     })
     const statuses = () => calls.filter(a => a[1] === 'status').length
-    expect(await ui.find({ type: 'Text', text: '+0 ~0 -0' })).toBeDefined()
+    for (const count of ['+0', '~0', '-0']) expect(await ui.find({ type: 'Text', text: count })).toBeDefined()
     expect(statuses()).toBe(1)
     expect(calls.find(a => a[1] === 'status')).toEqual([
       'git',
@@ -665,6 +723,12 @@ for (const surface of ['terminal', 'desktop'] as const) {
         .map(b => b.key ?? '')
         .filter(key => key.startsWith(prefix))
 
+    // The selected tab: the pill's filled chrome Box on terminal, the primary Button elsewhere.
+    const isOn = async (ui: Awaited<ReturnType<typeof open>>, key: string) =>
+      surface === 'terminal'
+        ? (await ui.find({ key: key + ':chrome' }))?.props.backgroundColor !== undefined
+        : (await ui.find({ key }))?.props.variant === 'primary'
+
     test(`${surface}/${columns}: tabs switch the panel between Overview, Graph and Change Log`, async ($, on) => {
       const ui = await open($, on)
 
@@ -672,7 +736,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
       expect((await ui.find({ key: 'tab:graph' }))?.props.hotkey).toBe('g')
       expect((await ui.find({ key: 'tab:changelog' }))?.props.hotkey).toBe('c')
       expect((await ui.find({ key: 'tab:changelog' }))?.props.label).toContain('Change Log 3')
-      expect((await ui.find({ key: 'tab:overview' }))?.props.label).toMatch(/^▌/)
+      expect(await isOn(ui, 'tab:overview')).toBe(true)
       // Overview: Branches, Commits, Info; no Files
       expect((await ui.find({ key: 'title:branches' }))?.props.label).toBe(' Branches ')
       expect((await ui.find({ key: 'title:commits' }))?.props.label).toBe(' Commits ')
@@ -681,7 +745,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
       expect(await ui.find({ key: 'change:b.txt' })).toBeUndefined()
 
       await ui.press({ key: 'tab:changelog' })
-      expect((await ui.find({ key: 'tab:changelog' }))?.props.label).toMatch(/^▌/)
+      expect(await isOn(ui, 'tab:changelog')).toBe(true)
       expect((await ui.find({ key: 'title:files' }))?.props.label).toBe(' Files ')
       expect((await ui.find({ key: 'title:diff' }))?.props.label).toBe(' Diff Preview ')
       expect(await ui.find({ key: 'title:branches' })).toBeUndefined()
@@ -728,7 +792,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
       })
 
       expect((await ui.find({ key: 'title:files' }))?.props.label).toBe(' Files ')
-      expect((await ui.find({ key: 'tab:changelog' }))?.props.label).toMatch(/^▌/)
+      expect(await isOn(ui, 'tab:changelog')).toBe(true)
     })
 
     test(`${surface}/${columns}: a change shows its diff; untracked uses --no-index`, async ($, on) => {
@@ -1110,7 +1174,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
   test(`${surface}: dragging the Commits/Info seam moves the Info boundary`, async ($, on) => {
     const ui = await open($, on, 160, 30)
     const before = (await cellsOf(ui, 'split:info')) ?? 0
-    expect(before).toBe(Math.floor(28 * 0.6))
+    expect(before).toBe(Math.floor(26 * 0.6))
 
     await ui.pointer({ type: 'down', button: 'left', x: 3, y: 0, in: 'split:info' })
     await ui.pointer({ type: 'move', button: 'left', x: 3, y: 4, in: 'split:info' })
@@ -1179,7 +1243,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect(await ui.find({ key: 'title:info' })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /^908022ab43fb/ })).toBeDefined()
     // area 27: Graph takes 65%, Info the rest
-    expect(await cellsOf(ui, 'split:graph')).toBe(Math.floor(27 * 0.65))
+    expect(await cellsOf(ui, 'split:graph')).toBe(Math.floor(26 * 0.65))
     expect(await ui.find({ key: 'split:info' })).toBeUndefined()
   })
 
@@ -1197,7 +1261,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect(await cellsOf(ui, 'split:graph')).toBe(before - 4)
     // stored as Info's share, as `info` is
     const saved = store.get('layout:git') as { graph?: number; info?: number }
-    expect(Math.round((1 - (saved.graph ?? 0)) * 27)).toBe(before - 4)
+    expect(Math.round((1 - (saved.graph ?? 0)) * 26)).toBe(before - 4)
     expect(saved.info).toBeUndefined()
     expect(await ui.find({ key: 'title:info' })).toBeDefined()
 
@@ -1465,7 +1529,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect((await ui.find({ type: 'Text', text: /^Local$/ }))?.props.bold).toBe(true)
     expect((await ui.find({ type: 'Text', text: /^Remote$/ }))?.props.bold).toBe(true)
     const remote = await ui.find({ type: 'Text', text: '  origin/main' })
-    expect(remote?.props.dimColor).toBe(true)
+    expect(remote?.props.color).toBe(THEMES.claude.muted)
   })
 
   test(`${surface}: a local-only card has no Remote heading`, async ($, on) => {
@@ -1522,15 +1586,16 @@ for (const surface of ['terminal', 'desktop'] as const) {
 
   test(`${surface}: Branches groups rows under Local and Remote; pressing Remote hides its rows`, async ($, on) => {
     const ui = await open($, on)
-    expect((await ui.find({ type: 'Text', text: '▾ Local (2)' }))?.props.bold).toBe(true)
-    expect((await ui.find({ key: 'bdir:l:' }))?.props.label).toBe('▾ Local (2)')
-    expect(await ui.find({ type: 'Text', text: '▾ Remote (6)' })).toBeDefined()
+    expect((await ui.find({ type: 'Text', text: '▾ ' }))?.props.bold).toBe(true)
+    expect((await ui.find({ key: 'bdir:l:' }))?.props.label).toBe('Local (2)')
+    expect(await ui.find({ key: 'bdir:r:' })).toBeDefined()
     expect(await ui.find({ key: 'branch:origin/main' })).toBeDefined()
     expect(await ui.find({ key: 'branch:develop' })).toBeDefined()
     await ui.press({ key: 'bdir:r:' })
     expect(await ui.find({ key: 'branch:origin/main' })).toBeUndefined()
     expect(await ui.find({ key: 'bdir:r:origin' })).toBeUndefined()
-    expect((await ui.find({ key: 'bdir:r:' }))?.props.label).toBe('▸ Remote (6)')
+    expect((await ui.find({ key: 'bdir:r:' }))?.props.label).toBe('Remote (6)')
+    expect(await ui.find({ type: 'Text', text: '▸ ' })).toBeDefined()
     expect(await ui.find({ key: 'branch:develop' })).toBeDefined()
   })
 
@@ -1595,7 +1660,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect(await ui.find({ type: 'Text', text: /^parents 06615e2/ })).toBeDefined()
     expect((await ui.find({ key: 'commit:' + HEAD_SHA }))?.props.label).not.toMatch(/^[ >][0-9a-f]{7}$/)
     // the selected row's background spans the Client and the rest of the row
-    expect((await ui.find({ key: 'row:' + HEAD_SHA }))?.props.backgroundColor).toBe('ansi256(238)')
+    expect((await ui.find({ key: 'row:' + HEAD_SHA }))?.props.backgroundColor).toBe(SEL)
   })
 
   test(`${surface}: resting on a Graph hash shows the card inside Graph; leaving drops it`, async ($, on) => {
@@ -1633,8 +1698,8 @@ for (const surface of ['terminal', 'desktop'] as const) {
     await ui.pointer({ type: 'down', x: 2, y: 2, button: 'left', in: 'shas' })
     await ui.pointer({ type: 'up', x: 2, y: 2, button: 'left', in: 'shas' })
     expect(await markOf(ui, HEAD_SHA)).toBe('>')
-    expect((await ui.find({ key: 'lanes:' + HEAD_SHA }))?.props.backgroundColor).toBe('ansi256(238)')
-    expect((await ui.find({ key: 'row:' + HEAD_SHA }))?.props.backgroundColor).toBe('ansi256(238)')
+    expect((await ui.find({ key: 'lanes:' + HEAD_SHA }))?.props.backgroundColor).toBe(SEL)
+    expect((await ui.find({ key: 'row:' + HEAD_SHA }))?.props.backgroundColor).toBe(SEL)
     // a right click is no press
     await ui.pointer({ type: 'down', x: 2, y: 3, button: 'right', in: 'shas' })
     await ui.pointer({ type: 'up', x: 2, y: 3, button: 'right', in: 'shas' })
@@ -1667,3 +1732,107 @@ test('vscode: Commits rows draw plain dots, no Client and no card', async ($, on
   expect(await ui.find({ key: 'shas' })).toBeUndefined()
   expect(await ui.find({ key: 'subject:908022ab43fb9bc599342842219a42dfd653f899' })).toBeDefined()
 })
+
+// ------------------------------------------------------------ Settings
+
+for (const surface of ['terminal', 'desktop'] as const) {
+  const open = async ($: Engine, on: On, entries: [string, unknown][] = [], calls: string[][] = [], log = LOG) => {
+    const store = new Map<string, unknown>(entries)
+    memoryStore(on, store)
+    on('store.delete', (_$, e) => {
+      store.delete(e.key)
+
+      return { value: undefined }
+    })
+    fake(on, calls, true, log)
+    on('ui.focus', () => ({}))
+    await $.session.start(start(surface))
+    const ui = await $.ui.mount({ plugin: PLUGIN, surface, component: 'Pane', props: props(120), requestId: 'ide-git', viewport: VIEWPORT })
+
+    return { ui, store }
+  }
+  const isOn = async (ui: Awaited<ReturnType<typeof open>>['ui'], key: string) =>
+    surface === 'terminal'
+      ? (await ui.find({ key: key + ':chrome' }))?.props.backgroundColor !== undefined
+      : (await ui.find({ key }))?.props.variant === 'primary'
+  const many = Array.from({ length: 120 }, (_, i) =>
+    `* \x1f${String(i).padStart(40, '0')}\x1f${String(i).padStart(7, '0')}\x1f\x1fa\x1f2026-01-01\x1fc${i}`,
+  ).join('\n')
+
+  test(`${surface}: git's ⚙ (hotkey s) opens Settings on the title row; a default tab applies while none is chosen`, async ($, on) => {
+    const { ui, store } = await open($, on)
+    expect((await ui.find({ key: 'settings' }))?.props.hotkey).toBe('s')
+    await ui.press({ key: 'settings' })
+    expect(await ui.find({ key: 'settings:sheet' })).toBeDefined()
+    // the title row and its ⚙ stay above the sheet
+    expect((await ui.find({ key: 'settings:sheet' }))?.props.top).toBe(1)
+
+    await ui.press({ key: 'settings:tab:graph' })
+    expect(await isOn(ui, 'tab:graph')).toBe(true)
+    // the ⚙ again is done
+    await ui.press({ key: 'settings' })
+    expect(await ui.find({ key: 'settings:sheet' })).toBeUndefined()
+    expect(store.get('settings')).toEqual({ gitTab: 'graph' })
+
+    // a chosen tab wins over the default
+    await ui.press({ key: 'tab:overview' })
+    expect(await isOn(ui, 'tab:overview')).toBe(true)
+  })
+
+  test(`${surface}: while git's sheet is up its Buttons sleep: hotkeys stay bound, a press does nothing`, async ($, on) => {
+    const calls: string[][] = []
+    const { ui } = await open($, on, [], calls)
+    expect(await isOn(ui, 'tab:overview')).toBe(true)
+
+    await ui.press({ key: 'settings' })
+    expect((await ui.find({ key: 'tab:graph' }))?.props.hotkey).toBe('g')
+    expect((await ui.find({ key: 'fetch' }))?.props.hotkey).toBe('f')
+    await ui.press({ key: 'tab:graph' })
+    await ui.press({ key: 'fetch' })
+    await ui.press({ key: 'pull' })
+    expect(await isOn(ui, 'tab:overview')).toBe(true)
+    expect(calls.some(a => a[1] === 'fetch' || a[1] === 'pull')).toBe(false)
+
+    await ui.press({ key: 'settings:cancel' })
+    await ui.press({ key: 'tab:graph' })
+    expect(await isOn(ui, 'tab:graph')).toBe(true)
+  })
+
+  test(`${surface}: the Settings page size, tab and change view are the defaults`, async ($, on) => {
+    const calls: string[][] = []
+    const { ui } = await open($, on, [['settings', { gitTab: 'changelog', changeView: 'tree', gitLimit: 50 }]], calls, many)
+    expect(await isOn(ui, 'tab:changelog')).toBe(true)
+    expect((await ui.find({ key: 'view' }))?.props.label).toBe('view: tree')
+
+    await ui.press({ key: 'tab:overview' })
+    expect(calls.some(a => a[1] === 'log' && a[a.indexOf('-n') + 1] === '50')).toBe(true)
+    expect((await ui.find({ key: 'more' }))?.props.label).toBe('more (+50)')
+    await ui.press({ key: 'more' })
+    expect(calls.some(a => a[1] === 'log' && a[a.indexOf('-n') + 1] === '100')).toBe(true)
+
+    // a new page size starts over at one page of it
+    await ui.press({ key: 'settings' })
+    await ui.press({ key: 'settings:limit:100' })
+    expect((await ui.find({ key: 'more' }))?.props.label).toBe('more (+100)')
+    await ui.press({ key: 'settings:cancel' })
+    expect((await ui.find({ key: 'more' }))?.props.label).toBe('more (+50)')
+  })
+
+  test(`${surface}: reset layout from git clears both stored layouts and the splits`, async ($, on) => {
+    const { ui, store } = await open($, on, [
+      ['layout:git', { side: 0.5 }],
+      ['layout:explorer', { tree: 0.6 }],
+    ])
+    const cells = async () => ((await ui.find({ key: 'split:side' }))?.props.props as { cells?: number } | undefined)?.cells
+    expect(await cells()).toBe(60)
+
+    await ui.press({ key: 'settings' })
+    await ui.press({ key: 'settings:reset' })
+    expect(store.has('layout:git')).toBe(false)
+    expect(store.has('layout:explorer')).toBe(false)
+    // 30% of 120 (narrow default)
+    expect(await cells()).not.toBe(60)
+    await ui.press({ key: 'settings:done' })
+    expect(await ui.find({ key: 'settings:sheet' })).toBeUndefined()
+  })
+}

@@ -455,6 +455,7 @@ const Editor: ClientModule<EditorProps, State> = (props, surface) => {
   syncView(surface, cells, width)
   const top = Math.min(cells.top, Math.max(0, buffer.lines.length - 1))
   const shown = buffer.lines.slice(top, top + rows)
+  const colors = cells.props.colors
 
   return (
     <Box flexDirection="column">
@@ -477,18 +478,28 @@ const Editor: ClientModule<EditorProps, State> = (props, surface) => {
 
         return (
           <Text key={'line:' + line} wrap="truncate-end">
-            <Text dimColor>{String(line + 1).padStart(gutter - 1) + ' '}</Text>
+            {colors === undefined ? (
+              <Text dimColor>{String(line + 1).padStart(gutter - 1) + ' '}</Text>
+            ) : (
+              <Text color={colors.gutter}>{String(line + 1).padStart(gutter - 1) + ' '}</Text>
+            )}
             {runs.map((run, k) =>
               run.style === 2 ? (
-                <Text key={'run:' + k} inverse>
-                  {run.text}
-                </Text>
+                colors === undefined ? (
+                  <Text key={'run:' + k} inverse>
+                    {run.text}
+                  </Text>
+                ) : (
+                  <Text key={'run:' + k} color={colors.caretText} backgroundColor={colors.caret}>
+                    {run.text}
+                  </Text>
+                )
               ) : run.style === 1 ? (
-                <Text key={'run:' + k} backgroundColor="ansi256(24)">
+                <Text key={'run:' + k} color={colors?.text} backgroundColor={colors?.selection ?? 'ansi256(24)'}>
                   {run.text}
                 </Text>
               ) : (
-                <Text key={'run:' + k}>{run.text}</Text>
+                <Text key={'run:' + k} color={colors?.text}>{run.text}</Text>
               ),
             )}
           </Text>

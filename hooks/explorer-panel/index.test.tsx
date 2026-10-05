@@ -1,8 +1,12 @@
 import { expect, mock, test } from 'claude-code/testing'
-import type { Engine } from 'claude-code/testing'
+import type { Engine, Mounted } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 import { draftFile } from './edit'
+import { KEYMAPS } from './editor'
+import { sessionHex } from '../shared/color'
+import { THEMES } from '../shared/theme'
+import { onDefaultFg } from '../shared/ui'
 
 const CWD = '/proj'
 const PLUGIN = 'ide-panes'
@@ -207,6 +211,24 @@ const fake = (
 
 const PRESENTATION = { isFullscreen: true, columns: 120 }
 
+type Pane = Mounted<'terminal' | 'desktop', 'Pane'>
+
+// The Edit title as read: the unsaved `●` (a Text on the border before the
+// title Button) and the Button's label, e.g. ' ● Edit '.
+const titleOf = async (ui: Pane): Promise<string> => {
+  const label = String((await ui.find({ key: 'title:edit' }))?.props.label)
+  const mark = await ui.find({ type: 'Text', text: '●' })
+
+  return (mark === undefined ? '' : ' ●') + label
+}
+
+// Whether a panel tab is the active one: its pill's accent fill on the
+// terminal, the primary variant of the native Button elsewhere (default theme).
+const isActiveTab = async (ui: Pane, surface: 'terminal' | 'desktop', mode: 'files' | 'unity'): Promise<boolean> =>
+  surface === 'terminal'
+    ? (await ui.find({ key: 'tab:' + mode + ':chrome' }))?.props.backgroundColor === onDefaultFg(THEMES.claude.accent)
+    : (await ui.find({ key: 'tab:' + mode }))?.props.variant === 'primary'
+
 const start = (surface: 'terminal' | 'desktop') => ({
   cwd: CWD,
   surface,
@@ -256,11 +278,13 @@ for (const surface of ['terminal', 'desktop'] as const) {
 
     await ui.press({ key: 'row:/proj/src' })
     expect(await ui.find({ key: 'row:/proj/src/main.ts' })).toBeUndefined()
-    expect(String((await ui.find({ key: 'row:/proj/src' }))?.props.label)).toMatch(/^▸/)
+    expect((await ui.find({ key: 'row:/proj/src' }))?.props.label).toBe('src/')
+    expect(await ui.find({ type: 'Text', text: '▸ ' })).toBeDefined()
 
     await ui.press({ key: 'row:/proj/src' })
     expect(await ui.find({ key: 'row:/proj/src/main.ts' })).toBeDefined()
-    expect(String((await ui.find({ key: 'row:/proj/src' }))?.props.label)).toMatch(/^▾/)
+    expect(await ui.find({ type: 'Text', text: '▾ ' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: '▸ ' })).toBeUndefined()
 
     await ui.press({ key: 'row:/proj/src' })
     expect(await ui.find({ key: 'row:/proj/src/main.ts' })).toBeUndefined()
@@ -279,8 +303,9 @@ for (const surface of ['terminal', 'desktop'] as const) {
       viewport: VIEWPORT,
     })
 
-    expect(await ui.find({ type: 'Text', text: CWD + ' (main)' })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: '+1 ~2 -1' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: ' ' + CWD })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'main' })).toBeDefined()
+    for (const count of ['+1', '~2', '-1']) expect(await ui.find({ type: 'Text', text: count })).toBeDefined()
   })
 
   test(`${surface}: sections are titled, pressing a title copies its name`, async ($, on) => {
@@ -397,15 +422,15 @@ for (const surface of ['terminal', 'desktop'] as const) {
       viewport: VIEWPORT,
     })
 
-    expect((await ui.find({ key: 'tab:files' }))?.props.label).toBe('▌Files')
+    expect(await isActiveTab(ui, surface, 'files')).toBe(true)
     expect((await ui.find({ key: 'tab:files' }))?.props.hotkey).toBe('f')
     expect((await ui.find({ key: 'tab:unity' }))?.props.hotkey).toBe('u')
     await ui.press({ key: 'tab:unity' })
     expect(store.get('explorer.mode:' + CWD)).toBe('unity')
-    expect((await ui.find({ key: 'tab:unity' }))?.props.label).toBe('▌Unity')
+    expect(await isActiveTab(ui, surface, 'unity')).toBe(true)
 
     await $.session.start(start(surface))
-    expect((await ui.find({ key: 'tab:unity' }))?.props.label).toBe('▌Unity')
+    expect(await isActiveTab(ui, surface, 'unity')).toBe(true)
   })
 
   test(`${surface}: unity mode hints when the root is not a Unity project`, async ($, on) => {
@@ -435,14 +460,14 @@ for (const surface of ['terminal', 'desktop'] as const) {
       viewport: VIEWPORT,
     })
 
-    expect((await ui.find({ key: 'tab:unity' }))?.props.label).toBe('▌Unity')
+    expect(await isActiveTab(ui, surface, 'unity')).toBe(true)
     expect(
       await ui.find({ type: 'Text', text: /not a Unity project/ }),
     ).toBeDefined()
 
     root = '/game'
     await $.session.start({ ...start(surface), cwd: '/game' })
-    expect((await ui.find({ key: 'tab:unity' }))?.props.label).toBe('▌Unity')
+    expect(await isActiveTab(ui, surface, 'unity')).toBe(true)
     expect(
       await ui.find({ type: 'Text', text: /not a Unity project/ }),
     ).toBeUndefined()
@@ -559,7 +584,7 @@ test('focus moving past the window edge scrolls the tree', async ($, on) => {
     plugin: PLUGIN,
     surface: 'terminal',
     component: 'Pane',
-    props: { ...PROPS, scroll: { offset: 0, bodyRows: 9 } },
+    props: { ...PROPS, scroll: { offset: 0, bodyRows: 10 } },
     requestId: 'ide-explorer',
     viewport: VIEWPORT,
   })
@@ -705,13 +730,13 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect((await ui.find({ key: 'tab:files' }))?.props.hotkey).toBe('f')
     expect((await ui.find({ key: 'tab:unity' }))?.props.hotkey).toBe('u')
     expect((await ui.find({ key: 'refresh' }))?.props.hotkey).toBe('r')
-    expect((await ui.find({ key: 'tab:files' }))?.props.dimColor).toBeUndefined()
-    expect((await ui.find({ key: 'tab:unity' }))?.props.dimColor).toBe(true)
+    expect(await isActiveTab(ui, surface, 'files')).toBe(true)
+    expect(await isActiveTab(ui, surface, 'unity')).toBe(false)
     await ui.press({ key: 'tab:unity' })
     expect(await ui.find({ type: 'Text', text: /not a Unity project/ })).toBeDefined()
-    expect((await ui.find({ key: 'tab:unity' }))?.props.dimColor).toBeUndefined()
+    expect(await isActiveTab(ui, surface, 'unity')).toBe(true)
     await ui.press({ key: 'tab:files' })
-    expect((await ui.find({ key: 'tab:files' }))?.props.label).toBe('▌Files')
+    expect(await isActiveTab(ui, surface, 'files')).toBe(true)
     expect(await ui.find({ type: 'Text', text: /not a Unity project/ })).toBeUndefined()
   })
 }
@@ -803,7 +828,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
       plugin: PLUGIN,
       surface,
       component: 'Pane',
-      props: { ...PROPS, scroll: { offset: 0, bodyRows: 14 } },
+      props: { ...PROPS, scroll: { offset: 0, bodyRows: 15 } },
       requestId: 'ide-explorer',
       viewport: VIEWPORT,
     })
@@ -929,13 +954,13 @@ for (const surface of ['terminal', 'desktop'] as const) {
       .filter(b => (b.key ?? '').startsWith('row:'))
       .map(b => String(b.props.label))
     expect(labels.length > 0).toBe(true)
-    // 12 columns: frame 2, vertical bar 1, mark 1, so 8 for '  h00.txt'
+    // 12 columns: frame 2, vertical bar 1, mark 1, file glyph 2, so 6 for 'h00.txt'
     for (const label of labels) {
-      expect(label.length).toBe(8)
+      expect(label.length).toBe(6)
       expect(label.endsWith('…')).toBe(true)
       expect(label.includes('\n')).toBe(false)
     }
-    expect(labels[0]).toBe('  h00.t…')
+    expect(labels[0]).toBe('h00.t…')
   })
 
   test(`${surface}: a Files seam drag writes layout:explorer on release only`, async ($, on) => {
@@ -1004,7 +1029,7 @@ const editing = async (
       .filter(t => t.props.wrap === 'truncate-end')
       .map(t => t.text)
       .join('\n')
-  const title = async () => (await ui.find({ key: 'title:edit' }))?.props.label
+  const title = async () => titleOf(ui)
 
   return { ui, settle, text, title }
 }
@@ -1334,7 +1359,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     await settle()
     expect(await ui.find({ key: 'new-file' })).toBeUndefined()
     expect(await ui.find({ key: 'editor' })).toBeDefined()
-    expect((await ui.find({ key: 'title:edit' }))?.props.label).toBe(' ● Edit ')
+    expect(await titleOf(ui)).toBe(' ● Edit ')
     expect(FILES[`/nf1-${surface}/src/a/b.ts`]).toBeUndefined()
     expect(TREE[`/nf1-${surface}/src/a`]).toBeUndefined()
 
@@ -1342,7 +1367,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     await ui.key({ key: 's', ctrl: true, in: 'editor' })
     await settle()
     expect(FILES[`/nf1-${surface}/src/a/b.ts`]).toBe('y')
-    expect((await ui.find({ key: 'title:edit' }))?.props.label).toBe(' Edit ')
+    expect(await titleOf(ui)).toBe(' Edit ')
     expect(await ui.find({ key: `row:/nf1-${surface}/src/a` })).toBeDefined()
     expect(await ui.find({ key: `row:/nf1-${surface}/src/a/b.ts` })).toBeDefined()
   })
@@ -1390,32 +1415,35 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect(FILES[`/nf4-${surface}/a.ts`]).toBe('one\n')
   })
 
-  test(`${surface}: header lines: tabs, actions, then the interactive line only while it asks`, async ($, on) => {
+  test(`${surface}: header lines: title, tabs, actions, then the interactive line only while it asks`, async ($, on) => {
     const { ui, settle } = await editing($, on, surface, `/hl-${surface}`, { 'a.ts': 'one\n' })
     const lines = async () =>
       (await ui.findAll({ type: 'Box' }))
         .map(box => box.key ?? '')
-        .filter(key => key.startsWith('header:'))
-    const ask = async () => keysIn((await ui.findAll({ type: 'Box' })).find(box => box.key === 'header:ask'))
-    expect(await lines()).toEqual(['header:tabs', 'header:actions'])
+        .filter(key => key === 'header' || key.startsWith('header:'))
+    // the controls' keys, without the terminal's chrome Boxes around them
+    const controls = (node: unknown) => keysIn(node).filter(key => !key.endsWith(':chrome'))
+    const ask = async () => controls((await ui.findAll({ type: 'Box' })).find(box => box.key === 'header:ask'))
+    expect(await lines()).toEqual(['header', 'header:tabs', 'header:actions'])
+    expect(await ui.find({ type: 'Text', text: ' Explorer' })).toBeDefined()
     const header = await ui.findAll({ type: 'Box' })
-    expect(keysIn(header.find(box => box.key === 'header:tabs'))).toEqual(['tab:files', 'tab:unity'])
-    expect(keysIn(header.find(box => box.key === 'header:actions'))).toEqual(
+    expect(controls(header.find(box => box.key === 'header:tabs'))).toEqual(['tab:files', 'tab:unity'])
+    expect(controls(header.find(box => box.key === 'header:actions'))).toEqual(
       expect.arrayContaining(['refresh', 'new', 'delete']),
     )
 
     // the name field and its cancel
     await ui.press({ key: 'new' })
-    expect(await lines()).toEqual(['header:tabs', 'header:actions', 'header:ask'])
+    expect(await lines()).toEqual(['header', 'header:tabs', 'header:actions', 'header:ask'])
     expect(await ask()).toEqual(['new-file', 'new:cancel'])
     await ui.press({ key: 'new:cancel' })
-    expect(await lines()).toEqual(['header:tabs', 'header:actions'])
+    expect(await lines()).toEqual(['header', 'header:tabs', 'header:actions'])
 
     // the delete bar
     await ui.press({ key: 'delete' })
     expect(await ask()).toEqual(['delete:confirm', 'delete:cancel'])
     await ui.press({ key: 'delete:cancel' })
-    expect(await lines()).toEqual(['header:tabs', 'header:actions'])
+    expect(await lines()).toEqual(['header', 'header:tabs', 'header:actions'])
 
     // the unsaved-changes bar wins over the name field
     await ui.key({ key: 'x', in: 'editor' })
@@ -1423,7 +1451,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     await ui.press({ key: 'new' })
     expect(await ask()).toEqual(['ask:save', 'ask:discard', 'ask:cancel'])
     await ui.press({ key: 'ask:cancel' })
-    expect(await lines()).toEqual(['header:tabs', 'header:actions'])
+    expect(await lines()).toEqual(['header', 'header:tabs', 'header:actions'])
   })
 }
 
@@ -1710,5 +1738,257 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect(after).not.toContain('1 entries')
     expect(after.length).toBe(count)
     expect(after.filter(t => t === ' ').length).toBe(2)
+  })
+}
+
+// ------------------------------------------------------------------ Theme
+
+for (const surface of ['terminal', 'desktop'] as const) {
+  const frames = async (ui: Pane) =>
+    (await ui.findAll({ type: 'Box' })).filter(box => box.props.borderStyle === 'round')
+
+  test(`${surface}: the Settings theme paints the page, frames, selection and editor`, async ($, on) => {
+    memoryStore(on, new Map<string, unknown>([['settings', { theme: 'nord' }]]))
+    fake(on)
+    await $.session.start(start(surface))
+    const ui = await $.ui.mount({
+      plugin: PLUGIN,
+      surface,
+      component: 'Pane',
+      props: PROPS,
+      requestId: 'ide-explorer',
+      viewport: VIEWPORT,
+    })
+    const t = THEMES.nord
+
+    expect((await ui.findAll({ type: 'Box' })).some(box => box.props.backgroundColor === t.bg)).toBe(true)
+    const framed = await frames(ui)
+    expect(framed.length).toBe(2)
+    for (const box of framed) expect(box.props.borderColor).toBe(t.border)
+    expect((await ui.find({ key: 'title:files:chrome' }))?.props.backgroundColor).toBe(onDefaultFg(t.accent))
+
+    await ui.press({ key: 'row:/proj/notes.txt' })
+    expect((await ui.find({ key: 'line:/proj/notes.txt' }))?.props.backgroundColor).toBe(onDefaultFg(t.surfaceHover))
+    expect((await ui.find({ key: 'line:/proj/out.log' }))?.props.backgroundColor).toBeUndefined()
+
+    // the editor client gets the theme's colors
+    await ui.press({ key: 'row:/proj/src' })
+    await ui.press({ key: 'row:/proj/src' })
+    await ui.press({ key: 'row:/proj/src/main.ts' })
+    await ui.press({ key: 'edit' })
+    const props = (await ui.find({ key: 'editor' }))?.props.props as { color: string; colors?: { text: string; gutter: string } }
+    expect(props.color).toBe(t.accent)
+    expect(props.colors?.text).toBe(t.text)
+    expect(props.colors?.gutter).toBe(t.muted)
+  })
+
+  test(`${surface}: /color tints the frames and the accent`, async ($, on) => {
+    mock.store(on)
+    fake(on)
+    on('command.run', { command: 'color' }, () => ({ text: 'Session color set to: green' }))
+    await $.session.start(start(surface))
+    await $.command.run({
+      command: 'color',
+      args: 'green',
+      origin: { kind: 'composer' },
+      presentation: PRESENTATION,
+    })
+    const ui = await $.ui.mount({
+      plugin: PLUGIN,
+      surface,
+      component: 'Pane',
+      props: PROPS,
+      requestId: 'ide-explorer',
+      viewport: VIEWPORT,
+    })
+
+    const green = sessionHex('green')
+    const framed = await frames(ui)
+    expect(framed.length).toBe(2)
+    for (const box of framed) expect(box.props.borderColor).toBe(green)
+    expect((await ui.find({ key: 'title:preview:chrome' }))?.props.backgroundColor).toBe(onDefaultFg(green))
+  })
+
+  test(`${surface}: the interactive line is a tinted alert, its Buttons keep their keys`, async ($, on) => {
+    mock.store(on)
+    fake(on)
+    await $.session.start(start(surface))
+    const ui = await $.ui.mount({
+      plugin: PLUGIN,
+      surface,
+      component: 'Pane',
+      props: PROPS,
+      requestId: 'ide-explorer',
+      viewport: VIEWPORT,
+    })
+    const t = THEMES.claude
+
+    await ui.press({ key: 'row:/proj/notes.txt' })
+    expect((await ui.find({ key: 'delete' }))?.props.hotkey).toBe('d')
+    await ui.press({ key: 'delete' })
+    expect((await ui.find({ key: 'header:ask' }))?.props.backgroundColor).toBe(t.surface)
+    expect((await ui.find({ type: 'Text', text: /^Delete / }))?.props.color).toBe(t.danger)
+    if (surface === 'terminal') {
+      expect((await ui.find({ key: 'delete:confirm:chrome' }))?.props.backgroundColor).toBe(onDefaultFg(t.danger))
+    }
+    await ui.press({ key: 'delete:cancel' })
+    expect(await ui.find({ key: 'header:ask' })).toBeUndefined()
+  })
+}
+
+// ------------------------------------------------------------ Settings
+
+// A store in memory that also deletes, and what it holds.
+const settingsStore = (on: On, entries: [string, unknown][] = []) => {
+  const store = new Map<string, unknown>(entries)
+  memoryStore(on, store)
+  on('store.delete', (_$, e) => {
+    store.delete(e.key)
+
+    return { value: undefined }
+  })
+
+  return store
+}
+
+for (const surface of ['terminal', 'desktop'] as const) {
+  const mountPane = ($: Engine, requestId: 'ide-explorer' | 'ide-git') =>
+    $.ui.mount({ plugin: PLUGIN, surface, component: 'Pane', props: PROPS, requestId, viewport: VIEWPORT })
+
+  test(`${surface}: the ⚙ (hotkey s) opens Settings; a theme applies to both panels at once, cancel puts it back`, async ($, on) => {
+    const store = settingsStore(on)
+    fake(on)
+    await $.session.start(start(surface))
+    const ui = await mountPane($, 'ide-explorer')
+    const git = await mountPane($, 'ide-git')
+    const paints = async (pane: Pane, bg: string) => (await pane.findAll({ type: 'Box' })).some(box => box.props.backgroundColor === bg)
+
+    expect((await ui.find({ key: 'settings' }))?.props.hotkey).toBe('s')
+    expect(await ui.find({ key: 'settings:sheet' })).toBeUndefined()
+    await ui.press({ key: 'settings' })
+    expect(await ui.find({ key: 'settings:sheet' })).toBeDefined()
+    // only the pane whose ⚙ was pressed draws the sheet
+    expect(await git.find({ key: 'settings:sheet' })).toBeUndefined()
+    // no blank labels: every sheet Button has one
+    for (const b of await ui.findAll({ type: 'Button' })) {
+      if ((b.key ?? '').startsWith('settings:')) expect(String(b.props.label).trim().length > 0).toBe(true)
+    }
+
+    await ui.press({ key: 'settings:theme:nord' })
+    expect(await paints(ui, THEMES.nord.bg)).toBe(true)
+    expect(await paints(git, THEMES.nord.bg)).toBe(true)
+    // live, not saved yet
+    expect(store.get('settings')).toBeUndefined()
+
+    await ui.press({ key: 'settings:cancel' })
+    expect(await ui.find({ key: 'settings:sheet' })).toBeUndefined()
+    expect(await paints(ui, THEMES.claude.bg)).toBe(true)
+    expect(await paints(git, THEMES.claude.bg)).toBe(true)
+    expect(store.get('settings')).toBeUndefined()
+
+    // done saves; the next session starts with it
+    await ui.press({ key: 'settings' })
+    await ui.press({ key: 'settings:theme:dracula' })
+    await ui.press({ key: 'settings:accent' })
+    await ui.press({ key: 'settings:done' })
+    expect(store.get('settings')).toEqual({ theme: 'dracula', accentFromSession: false })
+    expect(await ui.find({ key: 'settings:sheet' })).toBeUndefined()
+    expect(await paints(git, THEMES.dracula.bg)).toBe(true)
+  })
+
+  test(`${surface}: while the sheet is up the panel's Buttons sleep: their hotkeys stay bound, a press does nothing`, async ($, on) => {
+    settingsStore(on)
+    fake(on)
+    await $.session.start(start(surface))
+    const ui = await mountPane($, 'ide-explorer')
+    expect(await isActiveTab(ui, surface, 'files')).toBe(true)
+
+    await ui.press({ key: 'settings' })
+    // still bound (so the key stays with the pane, not the prompt)
+    expect((await ui.find({ key: 'tab:unity' }))?.props.hotkey).toBe('u')
+    expect((await ui.find({ key: 'refresh' }))?.props.hotkey).toBe('r')
+    await ui.press({ key: 'tab:unity' })
+    await ui.press({ key: 'new' })
+    expect(await isActiveTab(ui, surface, 'files')).toBe(true)
+    expect(await ui.find({ key: 'new-file' })).toBeUndefined()
+    expect(await ui.find({ key: 'settings:sheet' })).toBeDefined()
+
+    // `s` closes it, and the Buttons wake
+    await ui.press({ key: 'settings' })
+    expect(await ui.find({ key: 'settings:sheet' })).toBeUndefined()
+    await ui.press({ key: 'tab:unity' })
+    expect(await isActiveTab(ui, surface, 'unity')).toBe(true)
+  })
+
+  test(`${surface}: bad key overrides show the error and save nothing; good ones are saved`, async ($, on) => {
+    const store = settingsStore(on)
+    fake(on)
+    await $.session.start(start(surface))
+    const ui = await mountPane($, 'ide-explorer')
+    await ui.press({ key: 'settings' })
+
+    await ui.input({ key: 'settings:keys', text: '{"duplicateLines": ', kind: 'change' })
+    expect(await ui.find({ type: 'Text', text: /^✕ invalid JSON/ })).toBeDefined()
+    await ui.input({ key: 'settings:keys', text: '{"nope":"ctrl+k"}', kind: 'change' })
+    expect(await ui.find({ type: 'Text', text: /unknown action "nope"/ })).toBeDefined()
+    await ui.press({ key: 'settings:done' })
+    expect(store.get('settings')).toEqual({})
+
+    await ui.press({ key: 'settings' })
+    const good = '{"duplicateLines":"ctrl+shift+d"}'
+    await ui.input({ key: 'settings:keys', text: good, kind: 'change' })
+    expect(await ui.find({ type: 'Text', text: /^✕ / })).toBeUndefined()
+    await ui.press({ key: 'settings:done' })
+    expect(store.get('settings')).toEqual({ keys: good })
+  })
+
+  test(`${surface}: reset layout clears the stored layouts and both panels' splits`, async ($, on) => {
+    const store = settingsStore(on, [
+      ['layout:explorer', { tree: 0.6 }],
+      ['layout:git', { side: 0.5 }],
+    ])
+    fake(on)
+    await $.session.start(start(surface))
+    const ui = await mountPane($, 'ide-explorer')
+    const cells = async () => ((await ui.find({ key: 'split:tree' }))?.props.props as { cells?: number } | undefined)?.cells
+    // 60% of 118 body columns, rounded down
+    expect(await cells()).toBe(70)
+
+    await ui.press({ key: 'settings' })
+    await ui.press({ key: 'settings:reset' })
+    expect(store.has('layout:explorer')).toBe(false)
+    expect(store.has('layout:git')).toBe(false)
+    // the default 35%
+    expect(await cells()).toBe(41)
+  })
+
+  test(`${surface}: Settings opens over a dirty editor, which keeps its text; the keymap follows live`, async ($, on) => {
+    const { ui, settle } = await editing($, on, surface, '/ed9', { 'a.ts': 'one\n' })
+    const keymapOf = async () => ((await ui.find({ key: 'editor' }))?.props.props as { keymap: unknown }).keymap
+    await ui.key({ key: 'x', in: 'editor' })
+    await settle()
+    expect(await keymapOf()).toEqual(KEYMAPS.jetbrains)
+
+    await ui.press({ key: 'settings' })
+    // no unsaved-changes bar: the sheet selects nothing
+    expect(await ui.find({ key: 'ask:save' })).toBeUndefined()
+    expect(await ui.find({ key: 'settings:sheet' })).toBeDefined()
+    expect(await ui.find({ key: 'editor' })).toBeDefined()
+    await ui.press({ key: 'settings:keymap:vscode' })
+    expect(await keymapOf()).toEqual(KEYMAPS.vscode)
+
+    await ui.press({ key: 'settings:cancel' })
+    expect(await keymapOf()).toEqual(KEYMAPS.jetbrains)
+    expect(await titleOf(ui)).toContain('●')
+    // closed: no sheet Button is left to take a key
+    expect((await ui.findAll({ type: 'Button' })).some(b => (b.key ?? '').startsWith('settings:'))).toBe(false)
+  })
+
+  test(`${surface}: the default mode applies to a root with no mode saved`, async ($, on) => {
+    settingsStore(on, [['settings', { explorerMode: 'unity' }]])
+    fake(on)
+    await $.session.start(start(surface))
+    const ui = await mountPane($, 'ide-explorer')
+    expect(await isActiveTab(ui, surface, 'unity')).toBe(true)
   })
 }
