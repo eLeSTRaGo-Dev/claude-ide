@@ -571,7 +571,6 @@ const startEdit = async ($: EngineInterface, path: string): Promise<void> => {
       isNew: stat === undefined ? true : undefined,
     },
   }))
-  focusOn($, 'editor')
 }
 
 // Reads the text of `edit.version`: the draft when it is newer than the file
