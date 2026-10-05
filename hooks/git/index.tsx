@@ -223,12 +223,6 @@ export const register = (on: On): void => {
     return ran
   })
 
-  on('command.run', { command: 'git' }, async $ => {
-    await $.ui.open({ id: PANE, title: 'Git', focus: true })
-
-    return { text: 'Git view opened.' }
-  })
-
   on('ui.focus', { requestId: PANE }, async ($, e, next) => {
     const element = e.element
     if (element !== undefined && element.startsWith('commit:')) {

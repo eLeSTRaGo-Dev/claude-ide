@@ -10,8 +10,6 @@ claude --plugin-dir <path-to-this-repo>
 
 ## Commands
 
-- `/explorer [mode unity|files]`: project tree and file preview
-- `/git`: branches, commit graph and diffs; current branch in the status line
-- `/ide-panels`: opens both panes as tabs, explorer in front
+- `/ide-panels`: opens the Explorer (project tree and file preview; `m` switches files/Unity mode) and Git (branches, commit graph, diffs, fetch/pull) panes as tabs, explorer in front. The current branch shows in the status line.
 
 Pane keys: `r` refresh, `m` mode (explorer), `a` all branches (git).

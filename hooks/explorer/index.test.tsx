@@ -422,43 +422,13 @@ test('focus moves the cursor, Enter moves the selection', async ($, on) => {
   expect(await code()).toContain('bravo')
 })
 
-test('command opens the pane and sets the mode', async ($, on) => {
-  const store = new Map<string, unknown>()
-  on('store.get', (_$, e) => ({ value: store.get(e.key) }))
-  on('store.set', (_$, e) => {
-    store.set(e.key, e.value)
-
-    return { value: undefined }
-  })
-  const opened: unknown[] = []
-  fake(on, [], opened)
-  await $.session.start(start('terminal'))
-  const ran = await $.command.run({
-    command: 'explorer',
-    args: 'mode unity',
-    origin: { kind: 'composer' },
-    presentation: PRESENTATION,
-  })
-
-  expect(ran.text).toContain('unity')
-  expect(store.get('explorer.mode:' + CWD)).toBe('unity')
-  expect(opened).toEqual([{ id: 'ide-explorer', focus: true }])
-  const bad = await $.command.run({
-    command: 'explorer',
-    args: 'mode nope',
-    origin: { kind: 'composer' },
-    presentation: PRESENTATION,
-  })
-  expect(bad.text).toContain('Usage')
-})
-
-test('session.start registers /explorer, /git and /ide-panels', async ($, on) => {
+test('session.start registers /ide-panels only', async ($, on) => {
   mock.store(on)
   const names: string[] = []
   fake(on, [], [], names)
   await $.session.start(start('terminal'))
 
-  expect(names.sort()).toEqual(['explorer', 'git', 'ide-panels'])
+  expect(names).toEqual(['ide-panels'])
 })
 
 test('/ide-panels opens explorer and git, explorer focused in front', async ($, on) => {

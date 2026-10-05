@@ -1,10 +1,5 @@
-// The git view's pane id, which `/ide-panels` opens too.
+// The git view's pane id, which `/ide-panels` opens.
 export const GIT_PANE = 'ide-git'
-
-export const GIT_COMMAND = {
-  name: 'git',
-  description: 'Open the git view',
-} as const
 
 export type Branch = {
   name: string

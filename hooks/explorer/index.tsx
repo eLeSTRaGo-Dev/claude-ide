@@ -14,7 +14,7 @@ import {
   window as windowOf,
 } from './tree'
 import type { Entry, Mode, Row } from './tree'
-import { GIT_COMMAND, GIT_PANE } from '../git/git'
+import { GIT_PANE } from '../git/git'
 import { borderOf, lastAgentColor, parseColorAnswer } from '../shared/color'
 import { scrollbar } from '../shared/scrollbar'
 import {
@@ -361,13 +361,7 @@ const dropFile = (file: string): void => {
 
 export const register = (on: On): void => {
   on('session.start', async ($, e, next) => {
-    await $.command.register({
-      name: 'explorer',
-      description: 'Open the project explorer',
-      argumentHint: '[mode unity|files]',
-    })
-    // the git view's command: one session.start hook per plugin
-    await $.command.register(GIT_COMMAND)
+    // The plugin's one command (one session.start hook per plugin).
     await $.command.register({
       name: 'ide-panels',
       description: 'Open every ide-panes pane (explorer and git)',
@@ -443,21 +437,6 @@ export const register = (on: On): void => {
     return ran
   })
 
-  on('command.run', { command: 'explorer' }, async ($, e) => {
-    const words = e.args.trim().split(/\s+/).filter(Boolean)
-    if (words.length > 0) {
-      const want = words[0] === 'mode' ? words[1] : words[0]
-      if (!isMode(want)) return { text: 'Usage: /explorer [mode unity|files]' }
-      await setMode($, want)
-    }
-    await $.ui.open({ id: PANE, title: 'Explorer', focus: true })
-    const { mode } = await read($, explorer)
-
-    return { text: `Explorer opened (${mode} mode).` }
-  })
-
-  // Every pane at once. They are tabs in open order (Explorer, Git); the
-  // explorer is opened again with focus to bring it in front.
   on('command.run', { command: 'ide-panels' }, async $ => {
     await $.ui.open({ id: PANE, title: 'Explorer' })
     await $.ui.open({ id: GIT_PANE, title: 'Git' })
