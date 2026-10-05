@@ -6,6 +6,7 @@ import { window as windowOf } from '../explorer/tree'
 import { borderOf } from '../shared/color'
 import { scrollbar } from '../shared/scrollbar'
 import {
+  branchTree,
   branchesArgv,
   commitLabel,
   diffLines,
@@ -18,7 +19,7 @@ import {
   statArgv,
   trackLabel,
 } from './git'
-import type { Branch, GraphLine } from './git'
+import type { Branch, BranchRow, GraphLine } from './git'
 
 type On = Parameters<Register>[0]
 
@@ -30,6 +31,9 @@ const sessionColor = atom<'ide-panes', 'sessionColor'>(
   '',
 )
 const PANE = 'ide-git'
+// Background of the selected branch, as the explorer's selected row.
+const SELECTED = 'ansi256(238)'
+
 const PAGE = 200
 // Pane body columns from which the three-column layout is used.
 const WIDE = 140
@@ -363,13 +367,14 @@ export const register = (on: On): void => {
       details === undefined ? '' : sliceDiff(details.diff, detailOffset, diffRows)
     const head0 = branches.find(branch => branch.isHead)
     const branchRoom = Math.max(2, topInner - 1)
-    const branchWin = windowOf(branches, -1, branchRoom, state.branchOffset ?? 0)
+    const tree = branchTree(branches, new Set(state.collapsed ?? []))
+    const branchWin = windowOf(tree, -1, branchRoom, state.branchOffset ?? 0)
     const branchRows = branchWin.rows
     view.isWide = isWide
     view.branchEnd = sideCols
     view.graphEnd = sideCols + graphCols
     view.topRows = topRows
-    view.branchMax = Math.max(0, branches.length - branchRoom)
+    view.branchMax = Math.max(0, tree.length - branchRoom)
     view.graphMax = Math.max(0, lines.length - graphRows)
     view.detailMax = Math.max(0, diffTotal - diffRows)
     view.detailRows = diffRows
@@ -425,6 +430,16 @@ export const register = (on: On): void => {
         limit: PAGE,
       }))
 
+    const toggle = (key: string) =>
+      update($, git, s => {
+        const shut = s.collapsed ?? []
+
+        return {
+          ...s,
+          collapsed: shut.includes(key) ? shut.filter(k => k !== key) : [...shut, key],
+        }
+      })
+
     const branchColumn = (
       <Box flexDirection="row" width={sideCols} flexShrink={0} height={topRows} {...border}>
         <Box flexDirection="column" flexGrow={1}>
@@ -432,28 +447,56 @@ export const register = (on: On): void => {
           key="all"
           hotkey="a"
           plain
-          label={(state.ref === 'all' ? '>' : ' ') + ' all'}
+          label={(state.ref === 'all' ? '▌' : ' ') + 'all'}
           onPress={() => select('all')}
         />
-        {branchRows.map(branch => (
-          <Button
-            key={'branch:' + branch.name}
-            plain
-            dimColor={branch.isRemote}
-            label={fit(
-              (state.ref === branch.name ? '>' : ' ') +
-                (branch.isHead ? '* ' : '  ') +
-                branch.name +
-                (trackLabel(branch.track) === ''
-                  ? ''
-                  : ' ' + trackLabel(branch.track)),
-              sideWidth,
-            )}
-            onPress={() => select(branch.name)}
-          />
-        ))}
+        {branchRows.map((row: BranchRow) => {
+          // Rails per depth as in the explorer; a folder opens or closes.
+          const rails = '│ '.repeat(row.depth)
+          const room = Math.max(4, sideWidth - 1 - rails.length)
+          if (row.kind === 'folder') {
+            return (
+              <Box key={'bline:' + row.key} flexDirection="row">
+                <Text> </Text>
+                {row.depth > 0 && <Text dimColor>{rails}</Text>}
+                <Button
+                  key={'bdir:' + row.key}
+                  plain
+                  dimColor={row.key.startsWith('r:')}
+                  label={fit((row.isOpen ? '▾ ' : '▸ ') + row.name + '/', room)}
+                  onPress={() => toggle(row.key)}
+                />
+              </Box>
+            )
+          }
+          const { branch } = row
+          const isSelected = state.ref === branch.name
+
+          return (
+            <Box
+              key={'bline:' + branch.name}
+              flexDirection="row"
+              backgroundColor={isSelected ? SELECTED : undefined}
+            >
+              <Text color={border.borderColor}>{isSelected ? '▌' : ' '}</Text>
+              {row.depth > 0 && <Text dimColor>{rails}</Text>}
+              <Button
+                key={'branch:' + branch.name}
+                plain
+                dimColor={branch.isRemote}
+                label={fit(
+                  (branch.isHead ? '* ' : '  ') +
+                    row.name +
+                    (trackLabel(branch.track) === '' ? '' : ' ' + trackLabel(branch.track)),
+                  room,
+                )}
+                onPress={() => select(branch.name)}
+              />
+            </Box>
+          )
+        })}
         </Box>
-        {dragBar('sb:branches', branches.length, branchRoom, branchWin.offset, 1)}
+        {dragBar('sb:branches', tree.length, branchRoom, branchWin.offset, 1)}
       </Box>
     )
 

@@ -333,3 +333,48 @@ export const sliceDiff = (diff: string, offset: number, rows: number): string =>
 // The first `rows` lines of a unified diff, still a valid diff.
 export const clipDiff = (diff: string, rows: number): string =>
   sliceDiff(diff, 0, rows)
+
+// One row of the branch list grouped by `/`: a folder or a branch, with its
+// depth under the root. Local branches come first, then each remote.
+export type BranchRow =
+  | { kind: 'folder'; key: string; name: string; depth: number; isOpen: boolean }
+  | { kind: 'branch'; branch: Branch; name: string; depth: number }
+
+type Node = { folders: Map<string, Node>; leaves: { name: string; branch: Branch }[] }
+
+const nodeOf = (): Node => ({ folders: new Map(), leaves: [] })
+
+// `collapsed` holds folder keys (`l:fix` / `r:origin/feature`) the person closed.
+export const branchTree = (
+  branches: readonly Branch[],
+  collapsed: ReadonlySet<string>,
+): BranchRow[] => {
+  const local = nodeOf()
+  const remote = nodeOf()
+  for (const branch of branches) {
+    const parts = branch.name.split('/')
+    let node = branch.isRemote ? remote : local
+    for (const part of parts.slice(0, -1)) {
+      const next = node.folders.get(part) ?? nodeOf()
+      node.folders.set(part, next)
+      node = next
+    }
+    node.leaves.push({ name: parts[parts.length - 1] ?? branch.name, branch })
+  }
+  const rows: BranchRow[] = []
+  const walk = (node: Node, prefix: string, depth: number): void => {
+    for (const leaf of node.leaves) {
+      rows.push({ kind: 'branch', branch: leaf.branch, name: leaf.name, depth })
+    }
+    for (const name of [...node.folders.keys()].sort()) {
+      const key = prefix + (prefix.endsWith(':') ? '' : '/') + name
+      const isOpen = !collapsed.has(key)
+      rows.push({ kind: 'folder', key, name, depth, isOpen })
+      if (isOpen) walk(node.folders.get(name) as Node, key, depth + 1)
+    }
+  }
+  walk(local, 'l:', 0)
+  walk(remote, 'r:', 0)
+
+  return rows
+}

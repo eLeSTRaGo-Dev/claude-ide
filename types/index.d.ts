@@ -15,6 +15,7 @@ export type GitState = {
   limit: number
   branchOffset: number // first branch row shown
   detailOffset: number // first diff line shown
+  collapsed?: string[] // branch folders closed (`l:fix`, `r:origin/team`)
 }
 
 declare module 'claude-code' {

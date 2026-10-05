@@ -2,6 +2,7 @@ import { expect, test } from 'claude-code/testing'
 
 import { BRANCHES, GRAPH, PATCH } from './fixtures'
 import {
+  branchTree,
   clipDiff,
   diffLines,
   commitLabel,
@@ -154,4 +155,25 @@ test('sliceDiff: fixture slices keep valid hunks', () => {
       expect([o, n]).toEqual([Number(m[1]), Number(m[2])])
     }
   }
+})
+
+test('branchTree groups branches by / with local first', () => {
+  const b = (name: string, isRemote = false, isHead = false) =>
+    ({ name, sha: 'x', isHead, isRemote }) as const
+  const rows = branchTree(
+    [b('main', false, true), b('fix/a'), b('fix/b'), b('origin/main', true), b('origin/team/x', true)],
+    new Set(),
+  )
+  expect(rows.map(r => '  '.repeat(r.depth) + (r.kind === 'folder' ? r.name + '/' : r.name))).toEqual([
+    'main',
+    'fix/',
+    '  a',
+    '  b',
+    'origin/',
+    '  main',
+    '  team/',
+    '    x',
+  ])
+  const shut = branchTree([b('fix/a'), b('origin/main', true)], new Set(['l:fix']))
+  expect(shut.map(r => r.name)).toEqual(['fix', 'origin', 'main'])
 })
