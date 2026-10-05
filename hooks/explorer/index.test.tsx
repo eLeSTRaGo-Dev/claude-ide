@@ -74,6 +74,18 @@ const fake = (
   })
   on('process.run', (_$, e) => {
     calls.push([...e.argv])
+    // a repo on `main` with one untracked, two modified and one deleted file
+    if (e.argv[0] === 'git' && (e.argv[1] === 'rev-parse' || e.argv[1] === 'status')) {
+      return {
+        value: {
+          exitCode: 0,
+          stdout: e.argv[1] === 'rev-parse' ? 'main\n' : '?? new.ts\0 M a.ts\0 D b.ts\0 M c.ts\0',
+          stderr: '',
+          isStdoutTruncated: false,
+          isStderrTruncated: false,
+        },
+      }
+    }
     if (e.argv[0] === 'grep') {
       return {
         value: {
@@ -98,6 +110,7 @@ const fake = (
       },
     }
   })
+  on('env.get', () => ({ value: '/home/u' }))
   on('session.cwd', () => ({ value: CWD }))
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('command.register', (_$, e) => {
@@ -145,6 +158,23 @@ for (const surface of ['terminal', 'desktop'] as const) {
     const code = await ui.find({ type: 'Code' })
     expect(code?.text).toContain('answer = 42')
     expect(code?.props.language).toBe('typescript')
+  })
+
+  test(`${surface}: footer shows dir, branch and change counts`, async ($, on) => {
+    mock.store(on)
+    fake(on)
+    await $.session.start(start(surface))
+    const ui = await $.ui.mount({
+      plugin: PLUGIN,
+      surface,
+      component: 'Pane',
+      props: PROPS,
+      requestId: 'ide-explorer',
+      viewport: VIEWPORT,
+    })
+
+    expect(await ui.find({ type: 'Text', text: CWD + ' (main)' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: '+1 ~2 -1' })).toBeDefined()
   })
 
   test(`${surface}: binary shows metadata, ignored entry is dimmed`, async ($, on) => {
@@ -208,13 +238,13 @@ for (const surface of ['terminal', 'desktop'] as const) {
       viewport: VIEWPORT,
     })
 
-    expect(await ui.find({ type: 'Text', text: /Files/ })).toBeDefined()
+    expect((await ui.find({ key: 'mode' }))?.props.label).toBe('mode: files (m)')
     await ui.press({ key: 'mode' })
     expect(store.get('explorer.mode:' + CWD)).toBe('unity')
-    expect(await ui.find({ type: 'Text', text: /Unity/ })).toBeDefined()
+    expect((await ui.find({ key: 'mode' }))?.props.label).toBe('mode: unity (m)')
 
     await $.session.start(start(surface))
-    expect(await ui.find({ type: 'Text', text: /Unity/ })).toBeDefined()
+    expect((await ui.find({ key: 'mode' }))?.props.label).toBe('mode: unity (m)')
   })
 
   test(`${surface}: unity mode hints when the root is not a Unity project`, async ($, on) => {
@@ -243,13 +273,13 @@ for (const surface of ['terminal', 'desktop'] as const) {
       viewport: VIEWPORT,
     })
 
-    expect(await ui.find({ type: 'Text', text: /\[Unity\]/ })).toBeDefined()
+    expect((await ui.find({ key: 'mode' }))?.props.label).toBe('mode: unity (m)')
     expect(
       await ui.find({ type: 'Text', text: /not a Unity project/ }),
     ).toBeDefined()
 
     await $.session.start({ ...start(surface), cwd: '/game' })
-    expect(await ui.find({ type: 'Text', text: /\[Unity\]/ })).toBeDefined()
+    expect((await ui.find({ key: 'mode' }))?.props.label).toBe('mode: unity (m)')
     expect(
       await ui.find({ type: 'Text', text: /not a Unity project/ }),
     ).toBeUndefined()
@@ -363,7 +393,7 @@ test('focus moving past the window edge scrolls the tree', async ($, on) => {
     plugin: PLUGIN,
     surface: 'terminal',
     component: 'Pane',
-    props: { ...PROPS, scroll: { offset: 0, bodyRows: 7 } },
+    props: { ...PROPS, scroll: { offset: 0, bodyRows: 8 } },
     requestId: 'ide-explorer',
     viewport: VIEWPORT,
   })
@@ -599,7 +629,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
       plugin: PLUGIN,
       surface,
       component: 'Pane',
-      props: { ...PROPS, scroll: { offset: 0, bodyRows: 12 } },
+      props: { ...PROPS, scroll: { offset: 0, bodyRows: 13 } },
       requestId: 'ide-explorer',
       viewport: VIEWPORT,
     })

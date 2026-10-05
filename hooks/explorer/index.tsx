@@ -14,7 +14,7 @@ import {
   window as windowOf,
 } from './tree'
 import type { Entry, Mode, Row } from './tree'
-import { GIT_PANE } from '../git/git'
+import { GIT_PANE, changeCounts, shortDir, parseStatus, statusArgv } from '../git/git'
 import { borderOf, lastAgentColor, parseColorAnswer } from '../shared/color'
 import { scrollbar } from '../shared/scrollbar'
 import {
@@ -52,6 +52,12 @@ const ignored = new Set<string>()
 // Whether a root holds `ProjectSettings/ProjectVersion.txt`; checked in Unity
 // mode only.
 const unityRoots = new Map<string, boolean>()
+// The footer's branch and change counts per root; undefined `branch`: not a
+// repo. Cleared with the listings.
+const footers = new Map<
+  string,
+  { branch?: string; counts: { added: number; modified: number; deleted: number } }
+>()
 // Rows the tree window shows; set by render, read by the focus hook.
 let treeRows = 20
 // The last drawing's geometry, set by render and read by the scroll hook: the
@@ -83,6 +89,41 @@ const syncColor = async ($: EngineInterface): Promise<void> => {
   } catch {
     // no transcript yet
   }
+}
+
+// Read-only git call in `cwd`; undefined on a non-zero exit or any failure.
+const gitOut = async (
+  $: EngineInterface,
+  cwd: string,
+  argv: string[],
+): Promise<string | undefined> => {
+  try {
+    const ran = await $.process.run(argv, { cwd, timeoutMs: 15000 })
+
+    return ran.exitCode === 0 ? ran.stdout : undefined
+  } catch {
+    return undefined
+  }
+}
+
+// The branch (a short sha when detached) and the working tree's change
+// counts for the footer; no branch outside a repo.
+const footerOf = async ($: EngineInterface, root: string) => {
+  let footer = footers.get(root)
+  if (footer === undefined) {
+    let branch = (await gitOut($, root, ['git', 'rev-parse', '--abbrev-ref', 'HEAD']))?.trim()
+    if (branch === 'HEAD') {
+      branch = (await gitOut($, root, ['git', 'rev-parse', '--short', 'HEAD']))?.trim()
+    }
+    const status = branch === undefined ? undefined : await gitOut($, root, statusArgv())
+    footer = {
+      branch: branch === '' ? undefined : branch,
+      counts: changeCounts(parseStatus(status ?? '')),
+    }
+    footers.set(root, footer)
+  }
+
+  return footer
 }
 
 const modeKey = (root: string): string => 'explorer.mode:' + root
@@ -356,6 +397,7 @@ const dropFile = (file: string): void => {
     listings.delete(path)
     ignored.delete(path)
   }
+  footers.clear()
   if (file.endsWith('.meta')) indexes.clear()
 }
 
@@ -429,6 +471,7 @@ export const register = (on: On): void => {
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
     const ran = await next(e)
     listings.clear()
+    footers.clear()
     ignored.clear()
     unityRoots.clear()
     if (isIndexCommand(e.command)) indexes.clear()
@@ -550,8 +593,13 @@ export const register = (on: On): void => {
       state.mode === 'unity' && !(await isUnityProject($, root))
     const index = rows.findIndex(row => row.path === state.selected)
     const bodyRows = e.props.scroll.bodyRows
-    // One header row, then the bordered sections: 2 rows of frame each.
-    const sectionRows = Math.max(5, bodyRows - 1)
+    // One header row, the bordered sections (2 rows of frame each), then the
+    // footer row.
+    const sectionRows = Math.max(5, bodyRows - 2)
+    const footer = await footerOf($, root)
+    const counts = footer.counts
+    const isClean = counts.added + counts.modified + counts.deleted === 0
+    const homeDir = await $.env.get('HOME')
     // Each section is framed in the session color.
     const border = borderOf(await read($, sessionColor))
     treeRows = sectionRows - 2
@@ -622,10 +670,6 @@ export const register = (on: On): void => {
     return (
       <Box flexDirection="column" width="100%" minHeight={e.props.scroll.bodyRows} backgroundColor={BACKGROUND}>
         <Box flexDirection="row" gap={1}>
-          <Text bold>Explorer [{state.mode === 'unity' ? 'Unity' : 'Files'}]</Text>
-          <Text dimColor wrap="truncate-start">
-            {root}
-          </Text>
           {isNotUnity && (
             <Text dimColor>
               not a Unity project
@@ -645,6 +689,7 @@ export const register = (on: On): void => {
             label="refresh (r)"
             onPress={() => {
               listings.clear()
+              footers.clear()
               ignored.clear()
               unityRoots.clear()
               indexes.clear()
@@ -722,6 +767,25 @@ export const register = (on: On): void => {
             </Box>
             {dragBar('sb:preview', previewTotal, previewRows, previewOffset)}
           </Box>
+        </Box>
+        <Box flexDirection="row" justifyContent="space-between" gap={2}>
+          <Box flexShrink={1}>
+            <Text key="footer:dir" wrap="truncate-start">
+              <Text dimColor>{shortDir(root, homeDir)}</Text>
+              {footer.branch !== undefined && <Text color="cyan">{` (${footer.branch})`}</Text>}
+            </Text>
+          </Box>
+          {footer.branch !== undefined && (
+            <Box flexShrink={0} paddingRight={1}>
+              <Text key="footer:counts" dimColor={isClean}>
+                <Text color={isClean ? undefined : 'green'}>{`+${counts.added}`}</Text>
+                <Text> </Text>
+                <Text color={isClean ? undefined : 'yellow'}>{`~${counts.modified}`}</Text>
+                <Text> </Text>
+                <Text color={isClean ? undefined : 'red'}>{`-${counts.deleted}`}</Text>
+              </Text>
+            </Box>
+          )}
         </Box>
       </Box>
     )

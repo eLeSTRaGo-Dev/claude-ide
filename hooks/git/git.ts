@@ -13,13 +13,12 @@ export type Branch = {
 export type Commit = {
   sha: string
   short: string
+  parents: string[]
   refs: string[]
   author: string
   date: string
   subject: string
 }
-
-export type GraphLine = { graph: string; commit?: Commit }
 
 const SEP = '\x1f'
 const LOCAL = 'refs/heads/'
@@ -28,7 +27,7 @@ const REMOTE = 'refs/remotes/'
 export const BRANCH_FORMAT =
   '%(HEAD)%1f%(refname)%1f%(objectname:short)%1f%(upstream:short)%1f%(upstream:track)'
 
-export const GRAPH_FORMAT = '%x1f%H%x1f%h%x1f%D%x1f%an%x1f%ad%x1f%s'
+export const LOG_FORMAT = '%H%x1f%h%x1f%P%x1f%D%x1f%an%x1f%ad%x1f%s'
 
 export const SHOW_FORMAT = '%H%n%an <%ae>%n%ad%n%n%B'
 
@@ -71,50 +70,167 @@ export const parseRefs = (decoration: string): string[] =>
         .map(ref => ref.trim())
         .filter(ref => ref !== '' && !ref.endsWith('/HEAD'))
 
-// A line with a separator is a commit: `<graph prefix>\x1f<fields>`. One
-// without is a connector (`| |\`) kept so the graph stays continuous.
-export const parseGraph = (stdout: string): GraphLine[] => {
-  const result: GraphLine[] = []
+// One commit per line: `LOG_FORMAT` fields split by the separator. A line
+// with fewer fields (an error message) is skipped.
+export const parseLog = (stdout: string): Commit[] => {
+  const commits: Commit[] = []
   for (const raw of stdout.split('\n')) {
-    if (raw === '') continue
     const parts = raw.split(SEP)
-    if (parts.length < 7) {
-      result.push({ graph: raw.trimEnd() })
-      continue
-    }
-    const [graph = '', sha = '', short = '', refs = '', author = '', date = ''] =
+    if (parts.length < 7) continue
+    const [sha = '', short = '', parents = '', refs = '', author = '', date = ''] =
       parts
-    result.push({
-      graph,
-      commit: {
-        sha,
-        short,
-        refs: parseRefs(refs),
-        author,
-        date,
-        // a subject cannot hold the separator, but keep any stray tail
-        subject: parts.slice(6).join(SEP),
-      },
+    commits.push({
+      sha,
+      short,
+      parents: parents.split(' ').filter(parent => parent !== ''),
+      refs: parseRefs(refs),
+      author,
+      date,
+      // a subject cannot hold the separator, but keep any stray tail
+      subject: parts.slice(6).join(SEP),
     })
   }
 
-  return result
+  return commits
 }
+
+// Where a commit sits in the graph: `cells` are the glyphs of every lane
+// (2 characters per lane), each with the color index of its lane-run.
+export type GraphCell = { glyph: string; color: number }
+export type GraphRow = { commit: Commit; lane: number; cells: GraphCell[] }
+
+export const PALETTE_SIZE = 8
+
+// Lanes from parent hashes, one row per commit (`commits` newest first, parents
+// after their children, as `--topo-order`). A lane expects the sha of the next
+// commit it will meet. A commit takes the first lane expecting it (else a free
+// one); other lanes expecting it close into it (`╯`). Its lane then expects the
+// first parent; every other parent joins a lane already expecting it (`┤`/`├`)
+// or opens a free one to the right (`╮`). A lane keeps its color from open to
+// close. Lanes at or past `maxLanes` collapse into one `…` cell.
+export const layoutGraph = (
+  commits: readonly Commit[],
+  maxLanes = Infinity,
+): GraphRow[] => {
+  const lanes: (string | null)[] = []
+  const colors: number[] = []
+  let runs = 0
+  const rows: GraphRow[] = []
+  for (const commit of commits) {
+    const closing: number[] = []
+    lanes.forEach((sha, i) => {
+      if (sha === commit.sha) closing.push(i)
+    })
+    let lane = closing[0] ?? lanes.indexOf(null)
+    if (lane < 0) lane = lanes.length
+    if (closing.length === 0) colors[lane] = runs++
+    const above = [...lanes]
+    const spans: { to: number; glyph: string; color: number }[] = []
+    for (const i of closing.slice(1)) {
+      spans.push({ to: i, glyph: '╯', color: colors[i] ?? 0 })
+      lanes[i] = null
+    }
+    const [first, ...others] = commit.parents
+    lanes[lane] = first ?? null
+    for (const parent of others) {
+      const at = lanes.findIndex((sha, i) => sha === parent && i !== lane)
+      if (at >= 0) {
+        spans.push({ to: at, glyph: at > lane ? '┤' : '├', color: colors[at] ?? 0 })
+        continue
+      }
+      // a free lane to the right, not one closing on this row
+      let free = lanes.findIndex((sha, i) => sha === null && i > lane && !closing.includes(i))
+      if (free < 0) free = lanes.length
+      lanes[free] = parent
+      colors[free] = runs++
+      spans.push({ to: free, glyph: '╮', color: colors[free] ?? 0 })
+    }
+    const width = Math.max(above.length, lanes.length, lane + 1)
+    const cells: GraphCell[] = Array.from({ length: width * 2 }, () => ({ glyph: ' ', color: 0 }))
+    // lanes passing through, as they were above this row
+    for (let i = 0; i < above.length; i++) {
+      if (above[i] != null && i !== lane && !closing.includes(i)) {
+        cells[i * 2] = { glyph: '│', color: colors[i] ?? 0 }
+      }
+    }
+    const at = (i: number, glyph: string, color: number): void => {
+      cells[i] = { glyph, color }
+    }
+    // horizontals first, so ends and the commit are drawn over them
+    for (const span of spans) {
+      const [lo, hi] = span.to > lane ? [lane, span.to] : [span.to, lane]
+      for (let c = lo * 2 + 1; c < hi * 2; c++) {
+        const cell = cells[c]
+        if (cell === undefined) continue
+        at(c, c % 2 === 0 && cell.glyph === '│' ? '┼' : '─', span.color)
+      }
+    }
+    for (const span of spans) at(span.to * 2, span.glyph, span.color)
+    at(lane * 2, commit.parents.length > 1 ? '○' : '●', colors[lane] ?? 0)
+    while (lanes.length > 0 && lanes[lanes.length - 1] === null) {
+      lanes.pop()
+      colors.pop()
+    }
+    rows.push({ commit, lane, cells: collapse(cells, lane, maxLanes) })
+  }
+
+  return rows
+}
+
+// Lanes past `maxLanes` become one `…` cell (the commit glyph if it is there).
+const collapse = (cells: GraphCell[], lane: number, maxLanes: number): GraphCell[] => {
+  const keep = Math.max(1, Math.floor(maxLanes)) * 2
+  if (cells.length <= keep) return cells
+  const rest = cells.slice(keep)
+  const commit = lane * 2 >= keep ? cells[lane * 2] : undefined
+  const isUsed = rest.some(cell => cell.glyph !== ' ')
+
+  return [
+    ...cells.slice(0, keep),
+    ...(isUsed ? [commit ?? { glyph: '…', color: 0 }, { glyph: ' ', color: 0 }] : []),
+  ]
+}
+
+// The cells as colored text runs, padded with blanks to `width` characters.
+export const cellRuns = (
+  cells: readonly GraphCell[],
+  width: number,
+): { text: string; color: number }[] => {
+  const runs: { text: string; color: number }[] = []
+  for (const cell of cells) {
+    const last = runs[runs.length - 1]
+    if (last !== undefined && last.color === cell.color) last.text += cell.glyph
+    else runs.push({ text: cell.glyph, color: cell.color })
+  }
+  const pad = width - cells.length
+  if (pad > 0) runs.push({ text: ' '.repeat(pad), color: 0 })
+
+  return runs
+}
+
+// The commit's info head: the `git show` head lines with parents and refs
+// after the author and date lines.
+export const infoHead = (shown: readonly string[], commit: Commit): string[] => [
+  ...shown.slice(0, 3),
+  'parents ' + (commit.parents.length === 0 ? '(none)' : commit.parents.map(p => p.slice(0, 7)).join(' ')),
+  ...(commit.refs.length === 0 ? [] : ['refs ' + commit.refs.join(', ')]),
+  ...shown.slice(3).filter((line, i) => i > 0 || line !== ''),
+]
 
 // `git show --stat --format=SHOW_FORMAT`: the whole output as text lines.
 export const splitShow = (stdout: string): string[] =>
   stdout.replace(/\n+$/, '').split('\n')
 
-// `git log --graph` and `git show` argv builders.
+// `git log --topo-order` (children before parents) and `git show` argv builders.
 export const logArgv = (ref: string, limit: number): string[] => [
   'git',
   'log',
-  '--graph',
+  '--topo-order',
   '--color=never',
   '--date=short',
   '-n',
   String(limit),
-  '--format=' + GRAPH_FORMAT,
+  '--format=' + LOG_FORMAT,
   ref === 'all' ? '--all' : ref,
 ]
 
@@ -154,14 +270,6 @@ export const trackLabel = (track: string | undefined): string => {
   return [ahead ? '+' + ahead : '', behind ? '-' + behind : '']
     .filter(Boolean)
     .join(' ')
-}
-
-export const commitLabel = (line: GraphLine): string => {
-  const { commit } = line
-  if (commit === undefined) return line.graph
-  const refs = commit.refs.length > 0 ? ' (' + commit.refs.join(', ') + ')' : ''
-
-  return `${line.graph}${commit.short}${refs} ${commit.subject}`
 }
 
 const HUNK = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$/
@@ -332,49 +440,77 @@ export const sliceDiff = (diff: string, offset: number, rows: number): string =>
 export const clipDiff = (diff: string, rows: number): string =>
   sliceDiff(diff, 0, rows)
 
+// A path list grouped by `/`: a folder or a leaf, with its depth under the
+// root. Leaves come before the folders of a level; folders are sorted.
+export type TreeRow<T> =
+  | { kind: 'folder'; key: string; name: string; depth: number; isOpen: boolean }
+  | { kind: 'leaf'; item: T; name: string; depth: number }
+
+type Node<T> = { folders: Map<string, Node<T>>; leaves: { name: string; item: T }[] }
+
+const nodeOf = <T>(): Node<T> => ({ folders: new Map(), leaves: [] })
+
+// `collapsed` holds folder keys (`<root>fix`, `<root>fix/sub`) the person closed;
+// `root` prefixes every key (`l:`, `r:`, `c:`) so trees do not share keys.
+export const pathTree = <T>(
+  items: readonly { path: string; item: T }[],
+  collapsed: ReadonlySet<string>,
+  root: string,
+): TreeRow<T>[] => {
+  const top = nodeOf<T>()
+  for (const { path, item } of items) {
+    const parts = path.split('/')
+    let node = top
+    for (const part of parts.slice(0, -1)) {
+      const next = node.folders.get(part) ?? nodeOf<T>()
+      node.folders.set(part, next)
+      node = next
+    }
+    node.leaves.push({ name: parts[parts.length - 1] ?? path, item })
+  }
+  const rows: TreeRow<T>[] = []
+  const walk = (node: Node<T>, prefix: string, depth: number): void => {
+    for (const leaf of node.leaves) {
+      rows.push({ kind: 'leaf', item: leaf.item, name: leaf.name, depth })
+    }
+    for (const name of [...node.folders.keys()].sort()) {
+      const key = prefix + (prefix.endsWith(':') ? '' : '/') + name
+      const isOpen = !collapsed.has(key)
+      rows.push({ kind: 'folder', key, name, depth, isOpen })
+      if (isOpen) walk(node.folders.get(name) as Node<T>, key, depth + 1)
+    }
+  }
+  walk(top, root, 0)
+
+  return rows
+}
+
 // One row of the branch list grouped by `/`: a folder or a branch, with its
 // depth under the root. Local branches come first, then each remote.
 export type BranchRow =
   | { kind: 'folder'; key: string; name: string; depth: number; isOpen: boolean }
   | { kind: 'branch'; branch: Branch; name: string; depth: number }
 
-type Node = { folders: Map<string, Node>; leaves: { name: string; branch: Branch }[] }
-
-const nodeOf = (): Node => ({ folders: new Map(), leaves: [] })
-
 // `collapsed` holds folder keys (`l:fix` / `r:origin/feature`) the person closed.
 export const branchTree = (
   branches: readonly Branch[],
   collapsed: ReadonlySet<string>,
 ): BranchRow[] => {
-  const local = nodeOf()
-  const remote = nodeOf()
-  for (const branch of branches) {
-    const parts = branch.name.split('/')
-    let node = branch.isRemote ? remote : local
-    for (const part of parts.slice(0, -1)) {
-      const next = node.folders.get(part) ?? nodeOf()
-      node.folders.set(part, next)
-      node = next
-    }
-    node.leaves.push({ name: parts[parts.length - 1] ?? branch.name, branch })
-  }
-  const rows: BranchRow[] = []
-  const walk = (node: Node, prefix: string, depth: number): void => {
-    for (const leaf of node.leaves) {
-      rows.push({ kind: 'branch', branch: leaf.branch, name: leaf.name, depth })
-    }
-    for (const name of [...node.folders.keys()].sort()) {
-      const key = prefix + (prefix.endsWith(':') ? '' : '/') + name
-      const isOpen = !collapsed.has(key)
-      rows.push({ kind: 'folder', key, name, depth, isOpen })
-      if (isOpen) walk(node.folders.get(name) as Node, key, depth + 1)
-    }
-  }
-  walk(local, 'l:', 0)
-  walk(remote, 'r:', 0)
+  const of = (isRemote: boolean, root: string) =>
+    pathTree(
+      branches
+        .filter(branch => branch.isRemote === isRemote)
+        .map(branch => ({ path: branch.name, item: branch })),
+      collapsed,
+      root,
+    )
 
-  return rows
+  return [...of(false, 'l:'), ...of(true, 'r:')].map(
+    (row): BranchRow =>
+      row.kind === 'folder'
+        ? row
+        : { kind: 'branch', branch: row.item, name: row.name, depth: row.depth },
+  )
 }
 
 // The two calls that touch the repo: fetch every remote, and a pull that
@@ -399,3 +535,131 @@ export const remoteSummary = (
 
   return `git ${action}: ${exitCode === 0 ? '' : 'failed: '}${detail}`
 }
+
+export const statusArgv = (): string[] => [
+  'git',
+  'status',
+  '--porcelain=v1',
+  '-z',
+  '--untracked-files=all',
+]
+
+export type Change = {
+  path: string
+  from?: string
+  x: string
+  y: string
+  kind: 'added' | 'modified' | 'deleted'
+}
+
+// `-z` output: `XY path` entries split by NUL; a rename or copy is followed by
+// its source path as a field of its own.
+export const parseStatus = (stdout: string): Change[] => {
+  const fields = stdout.split('\0')
+  const changes: Change[] = []
+  for (let i = 0; i < fields.length; i++) {
+    const field = fields[i] ?? ''
+    if (field.length < 4) continue
+    const x = field[0] ?? ' '
+    const y = field[1] ?? ' '
+    const change: Change = {
+      path: field.slice(3),
+      x,
+      y,
+      kind:
+        (x === '?' && y === '?') || x === 'A' || y === 'A'
+          ? 'added'
+          : x === 'D' || y === 'D'
+            ? 'deleted'
+            : 'modified',
+    }
+    if (x === 'R' || x === 'C' || y === 'R' || y === 'C') {
+      change.from = fields[++i]
+    }
+    changes.push(change)
+  }
+
+  return changes
+}
+
+export const changeCounts = (
+  changes: Change[],
+): { added: number; modified: number; deleted: number } => {
+  const counts = { added: 0, modified: 0, deleted: 0 }
+  for (const change of changes) counts[change.kind]++
+
+  return counts
+}
+
+// `~`-prefixed when the directory is under the home directory.
+export const shortDir = (root: string, home: string | undefined): string => {
+  if (home === undefined || home === '') return root
+  const base = home.replace(/\/+$/, '')
+  if (root === base) return '~'
+
+  return root.startsWith(base + '/') ? '~' + root.slice(base.length) : root
+}
+
+export const isUntracked = (change: Change): boolean =>
+  change.x === '?' && change.y === '?'
+
+// One letter for a change (vs HEAD, staged and unstaged together).
+export const changeGlyph = (change: Change): string =>
+  isUntracked(change)
+    ? '?'
+    : change.from !== undefined
+      ? change.x === 'C' || change.y === 'C'
+        ? 'C'
+        : 'R'
+      : change.kind === 'added'
+        ? 'A'
+        : change.kind === 'deleted'
+          ? 'D'
+          : 'M'
+
+export const changeWords = (change: Change): string =>
+  isUntracked(change)
+    ? 'untracked'
+    : change.from !== undefined
+      ? change.x === 'C' || change.y === 'C'
+        ? 'copied'
+        : 'renamed'
+      : change.kind
+
+// The list as shown: `list` is every path in order; `tree` groups by `/`.
+export type ChangeRow = TreeRow<Change>
+
+export const changeRows = (
+  changes: readonly Change[],
+  mode: 'list' | 'tree',
+  collapsed: ReadonlySet<string>,
+): ChangeRow[] => {
+  const sorted = [...changes].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
+  if (mode === 'tree') {
+    return pathTree(
+      sorted.map(change => ({ path: change.path, item: change })),
+      collapsed,
+      'c:',
+    )
+  }
+
+  return sorted.map(change => ({ kind: 'leaf', item: change, name: change.path, depth: 0 }))
+}
+
+// The diff of one change against HEAD. An untracked file is not known to git,
+// so it is diffed against /dev/null (exit 1 on a difference); with no HEAD yet
+// the index is the base. A rename is shown from its source.
+export const changeDiffArgv = (change: Change, hasHead = true): string[] => {
+  if (isUntracked(change)) {
+    return ['git', 'diff', '--no-index', '--color=never', '--', '/dev/null', change.path]
+  }
+  const paths = change.from === undefined ? [change.path] : [change.from, change.path]
+
+  return hasHead
+    ? ['git', 'diff', 'HEAD', '--color=never', '-M', '--', ...paths]
+    : ['git', 'diff', '--cached', '--color=never', '-M', '--', ...paths]
+}
+
+// A path cut from the start to fit `width` columns.
+export const fitStart = (text: string, width: number): string =>
+  text.length > width ? '…' + text.slice(text.length - Math.max(1, width - 1)) : text

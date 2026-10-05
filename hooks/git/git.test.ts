@@ -1,15 +1,25 @@
 import { expect, test } from 'claude-code/testing'
 
-import { BRANCHES, GRAPH, PATCH } from './fixtures'
+import { BRANCHES, LOG, PATCH } from './fixtures'
 import {
   branchTree,
+  changeDiffArgv,
+  changeGlyph,
+  changeRows,
+  fitStart,
+  pathTree,
   remoteArgv,
   remoteSummary,
   clipDiff,
   diffLines,
-  commitLabel,
+  cellRuns,
+  infoHead,
+  layoutGraph,
+  changeCounts,
   parseBranches,
-  parseGraph,
+  parseStatus,
+  shortDir,
+  parseLog,
   parseRefs,
   sliceDiff,
   splitShow,
@@ -34,26 +44,143 @@ test('parseBranches: local first, current marked, origin/HEAD skipped', () => {
   expect(branches.find(b => b.name === 'origin/main')?.isRemote).toBe(true)
 })
 
-test('parseGraph: commits, merges and connector lines', () => {
-  const lines = parseGraph(GRAPH)
-  const commits = lines.filter(line => line.commit)
+test('parseLog: commits with parents and refs', () => {
+  const commits = parseLog(LOG)
   expect(commits.length).toBe(9)
-  expect(lines.length).toBeGreaterThan(commits.length)
-  const connector = lines.find(line => line.commit === undefined)
-  expect(connector?.graph).toContain('|')
-  const head = lines.find(line => line.commit?.short === '908022a')
-  expect(head?.commit?.refs).toEqual(['HEAD -> develop', 'origin/develop'])
-  expect(head?.commit?.subject).toBe('oh-my-project v0.7.1')
-  expect(head?.commit?.date).toBe('2026-07-09')
-  const merge = lines.find(line => line.commit?.short === '352e0cc')
-  expect(merge?.commit?.refs).toEqual(['origin/main'])
-  expect(commitLabel(head!)).toContain('(HEAD -> develop, origin/develop)')
+  const head = commits.find(c => c.short === '908022a')
+  expect(head?.refs).toEqual(['HEAD -> develop', 'origin/develop'])
+  expect(head?.subject).toBe('oh-my-project v0.7.1')
+  expect(head?.date).toBe('2026-07-09')
+  expect(head?.parents).toEqual(['06615e2e9ee9921f3ec843539189373c6f8963d2'])
+  const merge = commits.find(c => c.short === '352e0cc')
+  expect(merge?.parents.length).toBe(2)
+  expect(merge?.refs).toEqual(['origin/main'])
 })
 
 test('empty and not-a-repo output', () => {
   expect(parseBranches('')).toEqual([])
-  expect(parseGraph('')).toEqual([])
-  expect(parseGraph('fatal: not a git repository\n')[0]?.commit).toBeUndefined()
+  expect(parseLog('')).toEqual([])
+  expect(parseLog('fatal: not a git repository\n')).toEqual([])
+})
+
+const commit = (sha: string, ...parents: string[]) => ({
+  sha,
+  short: sha,
+  parents,
+  refs: [],
+  author: 'a',
+  date: 'd',
+  subject: sha,
+})
+
+// The rows as plain glyph lines.
+const draw = (commits: ReturnType<typeof commit>[], maxLanes?: number): string[] =>
+  layoutGraph(commits, maxLanes).map(row =>
+    row.cells.map(cell => cell.glyph).join('').trimEnd(),
+  )
+
+test('layoutGraph: linear history is one lane', () => {
+  expect(draw([commit('c', 'b'), commit('b', 'a'), commit('a')])).toEqual(['●', '●', '●'])
+})
+
+test('layoutGraph: branch and merge', () => {
+  expect(
+    draw([
+      commit('m', 'a', 'b'),
+      commit('a', 'r'),
+      commit('b', 'r'),
+      commit('r'),
+    ]),
+  ).toEqual(['○─╮', '● │', '│ ●', '●─╯'])
+})
+
+test('layoutGraph: two merges in a row', () => {
+  expect(
+    draw([
+      commit('m2', 'm1', 'y'),
+      commit('m1', 'a', 'x'),
+      commit('a', 'r'),
+      commit('x', 'r'),
+      commit('y', 'r'),
+      commit('r'),
+    ]),
+  ).toEqual(['○─╮', '○─┼─╮', '● │ │', '│ │ ●', '│ ● │', '●─╯─╯'])
+})
+
+test('layoutGraph: octopus merge opens a lane per extra parent', () => {
+  expect(
+    draw([commit('o', 'a', 'b', 'c'), commit('a'), commit('b'), commit('c')]),
+  ).toEqual(['○─╮─╮', '● │ │', '  ● │', '    ●'])
+})
+
+test('layoutGraph: a closed lane is reused by the next branch', () => {
+  const rows = layoutGraph([
+    commit('m', 'a', 'b'),
+    commit('b', 'a'),
+    commit('a', 'r'),
+    commit('t', 'r'),
+    commit('r'),
+  ])
+  // lane 1 closed at `a`; the new tip `t` takes it back
+  expect(rows.map(row => row.lane)).toEqual([0, 1, 0, 1, 0])
+  expect(rows[3]?.cells.map(c => c.glyph).join('').trimEnd()).toBe('│ ●')
+  // a new lane-run gets a new color
+  expect(rows[3]?.cells[2]?.color).not.toBe(rows[1]?.cells[2]?.color)
+})
+
+test('layoutGraph: a horizontal crosses a passing lane', () => {
+  expect(
+    draw([
+      commit('p', 'q', 'r'),
+      commit('q', 'a', 'b'),
+      commit('a'),
+      commit('b'),
+      commit('r'),
+    ]),
+  ).toEqual(['○─╮', '○─┼─╮', '● │ │', '  │ ●', '  ●'])
+})
+
+test('layoutGraph: lane color is stable from open to close', () => {
+  const rows = layoutGraph([
+    commit('m', 'a', 'b'),
+    commit('a', 'r'),
+    commit('x', 'r'),
+    commit('b', 'r'),
+    commit('r'),
+  ])
+  const opened = rows[0]?.cells[2]?.color
+  expect(rows[1]?.cells[2]?.color).toBe(opened)
+  expect(rows[0]?.cells[0]?.color).toBe(rows[1]?.cells[0]?.color)
+})
+
+test('layoutGraph: lanes past the cap collapse into …', () => {
+  const commits = [
+    commit('o', 'a', 'b', 'c', 'd'),
+    commit('a'),
+    commit('b'),
+    commit('c'),
+    commit('d'),
+  ]
+  const lines = draw(commits, 2)
+  expect(lines[0]).toBe('○─╮─…')
+  expect(lines.every(line => line.length <= 5)).toBe(true)
+})
+
+test('cellRuns and infoHead', () => {
+  const rows = layoutGraph([commit('m', 'a', 'b'), commit('a'), commit('b')])
+  expect(cellRuns(rows[0]?.cells ?? [], 6).map(run => run.text).join('')).toBe('○─╮   ')
+  const head = infoHead(['sha', 'A <a@b>', 'date', '', 'subject'], {
+    ...commit('m', '1234567890', 'abcdef0123'),
+    refs: ['origin/main'],
+  })
+  expect(head).toEqual([
+    'sha',
+    'A <a@b>',
+    'date',
+    'parents 1234567 abcdef0',
+    'refs origin/main',
+    'subject',
+  ])
 })
 
 test('helpers', () => {
@@ -188,4 +315,82 @@ test('remote actions: argv and summaries', () => {
   expect(remoteSummary('pull', 128, '', 'fatal: Not possible to fast-forward, aborting.\n')).toBe(
     'git pull: failed: fatal: Not possible to fast-forward, aborting.',
   )
+})
+
+test('parseStatus: untracked, staged add, rename, delete, MM', () => {
+  const out = [
+    '?? new.txt',
+    'A  added.txt',
+    'R  to.txt',
+    'from.txt',
+    ' D gone.txt',
+    'MM both.txt',
+    '',
+  ].join('\0')
+  const changes = parseStatus(out)
+  expect(changes.map(c => c.kind)).toEqual([
+    'added',
+    'added',
+    'modified',
+    'deleted',
+    'modified',
+  ])
+  expect(changes[2]).toMatchObject({ path: 'to.txt', from: 'from.txt' })
+  expect(changes[4]).toMatchObject({ path: 'both.txt', x: 'M', y: 'M' })
+  expect(changeCounts(changes)).toEqual({ added: 2, modified: 2, deleted: 1 })
+  expect(parseStatus('')).toEqual([])
+})
+
+test('shortDir: ~ under home only', () => {
+  expect(shortDir('/home/u/p/repo', '/home/u')).toBe('~/p/repo')
+  expect(shortDir('/home/u', '/home/u/')).toBe('~')
+  expect(shortDir('/home/ux/repo', '/home/u')).toBe('/home/ux/repo')
+  expect(shortDir('/repo', undefined)).toBe('/repo')
+})
+
+test('pathTree: groups by /, leaves first, collapsed folders hide their rows', () => {
+  const items = ['a.txt', 'src/b.ts', 'src/ui/c.ts', 'z/d.ts'].map(path => ({ path, item: path }))
+  const label = (r: ReturnType<typeof pathTree<string>>[number]) =>
+    '  '.repeat(r.depth) + (r.kind === 'folder' ? (r.isOpen ? '▾' : '▸') + r.name + '/' : r.name)
+  expect(pathTree(items, new Set(), 'c:').map(label)).toEqual([
+    'a.txt',
+    '▾src/',
+    '  b.ts',
+    '  ▾ui/',
+    '    c.ts',
+    '▾z/',
+    '  d.ts',
+  ])
+  const shut = pathTree(items, new Set(['c:src', 'c:z']), 'c:')
+  expect(shut.map(label)).toEqual(['a.txt', '▸src/', '▸z/'])
+  expect(shut[1]).toMatchObject({ key: 'c:src' })
+  expect(pathTree(items, new Set(), 'c:')[3]).toMatchObject({ key: 'c:src/ui' })
+})
+
+test('changeRows: list is sorted full paths, tree groups folders', () => {
+  const changes = parseStatus(['?? src/b.ts', ' M a.txt', ''].join('\0'))
+  const list = changeRows(changes, 'list', new Set())
+  expect(list.map(r => (r.kind === 'leaf' ? r.name : ''))).toEqual(['a.txt', 'src/b.ts'])
+  const tree = changeRows(changes, 'tree', new Set())
+  expect(tree.map(r => r.name)).toEqual(['a.txt', 'src', 'b.ts'])
+})
+
+test('changeGlyph and changeDiffArgv', () => {
+  const [untracked, modified, renamed] = parseStatus(
+    ['?? n.txt', ' M m.txt', 'R  to.txt', 'from.txt', ''].join('\0'),
+  )
+  expect([untracked, modified, renamed].map(c => changeGlyph(c!))).toEqual(['?', 'M', 'R'])
+  expect(changeDiffArgv(untracked!)).toEqual([
+    'git', 'diff', '--no-index', '--color=never', '--', '/dev/null', 'n.txt',
+  ])
+  expect(changeDiffArgv(modified!)).toEqual([
+    'git', 'diff', 'HEAD', '--color=never', '-M', '--', 'm.txt',
+  ])
+  expect(changeDiffArgv(renamed!)).toContain('from.txt')
+  expect(changeDiffArgv(modified!, false).slice(0, 3)).toEqual(['git', 'diff', '--cached'])
+})
+
+test('fitStart cuts from the start', () => {
+  expect(fitStart('src/ui/file.ts', 20)).toBe('src/ui/file.ts')
+  expect(fitStart('src/ui/file.ts', 8)).toBe('…file.ts')
 })
