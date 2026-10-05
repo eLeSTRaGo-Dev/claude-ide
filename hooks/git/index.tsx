@@ -126,6 +126,10 @@ const clear = (): void => {
   hasHead = undefined
 }
 
+// Calls that threw (the engine aborts a git call when its render is
+// superseded). Their empty answer is not the repo's, so it is not cached.
+let threw = 0
+
 // Read-only git call; undefined on an exit code outside `ok` or any failure.
 const run = async (
   $: EngineInterface,
@@ -138,6 +142,8 @@ const run = async (
 
     return ok.includes(ran.exitCode) ? ran.stdout : undefined
   } catch {
+    threw += 1
+
     return undefined
   }
 }
@@ -146,10 +152,11 @@ const rootOf = async (
   $: EngineInterface,
   cwd: string,
 ): Promise<string | null> => {
-  if (repoRoot === undefined) {
-    const out = await run($, cwd, ['git', 'rev-parse', '--show-toplevel'])
-    repoRoot = out === undefined ? null : out.trim()
-  }
+  if (typeof repoRoot === 'string') return repoRoot
+  // Not a repo is not cached: the next render looks again.
+  const out = await run($, cwd, ['git', 'rev-parse', '--show-toplevel'])
+  if (out === undefined) return null
+  repoRoot = out.trim()
 
   return repoRoot
 }
@@ -159,7 +166,10 @@ const branchesOf = async (
   cwd: string,
 ): Promise<Branch[]> => {
   if (branchCache === undefined) {
-    branchCache = parseBranches((await run($, cwd, branchesArgv())) ?? '')
+    const before = threw
+    const parsed = parseBranches((await run($, cwd, branchesArgv())) ?? '')
+    if (threw !== before) return parsed
+    branchCache = parsed
   }
 
   return branchCache
@@ -170,7 +180,10 @@ const statusOf = async (
   cwd: string,
 ): Promise<Change[]> => {
   if (statusCache === undefined) {
-    statusCache = parseStatus((await run($, cwd, statusArgv())) ?? '')
+    const before = threw
+    const parsed = parseStatus((await run($, cwd, statusArgv())) ?? '')
+    if (threw !== before) return parsed
+    statusCache = parsed
   }
 
   return statusCache
@@ -184,9 +197,11 @@ const graphOf = async (
   const key = state.ref + '\0' + state.limit
   let lines = graphCache.get(key)
   if (lines === undefined) {
+    const before = threw
     lines = parseLog(
       (await run($, cwd, logArgv(state.ref, state.limit))) ?? '',
     )
+    if (threw !== before) return lines
     graphCache.set(key, lines)
   }
 
@@ -200,6 +215,7 @@ const detailsOf = async (
 ): Promise<{ head: string[]; diff: string }> => {
   let shown = showCache.get(sha)
   if (shown === undefined) {
+    const before = threw
     const [stat, patch] = await Promise.all([
       run($, cwd, statArgv(sha)),
       run($, cwd, patchArgv(sha)),
@@ -208,6 +224,7 @@ const detailsOf = async (
       head: splitShow(stat ?? ''),
       diff: (patch ?? '').replace(/^\n+/, ''),
     }
+    if (threw !== before) return shown
     showCache.set(sha, shown)
   }
 
@@ -224,13 +241,16 @@ const changeDetailsOf = async (
 ): Promise<{ head: string[]; diff: string }> => {
   let shown = changeCache.get(change.path)
   if (shown === undefined) {
-    if (hasHead === undefined) {
-      hasHead = (await run($, cwd, ['git', 'rev-parse', '--verify', '--quiet', 'HEAD'])) !== undefined
+    const before = threw
+    let head = hasHead
+    if (head === undefined) {
+      head = (await run($, cwd, ['git', 'rev-parse', '--verify', '--quiet', 'HEAD'])) !== undefined
+      if (threw === before) hasHead = head
     }
     const out = await run(
       $,
       cwd,
-      changeDiffArgv(change, hasHead),
+      changeDiffArgv(change, head),
       isUntracked(change) ? [0, 1] : [0],
     )
     shown = {
@@ -241,6 +261,7 @@ const changeDetailsOf = async (
       ],
       diff: (out ?? '').replace(/^\n+/, ''),
     }
+    if (threw !== before) return shown
     changeCache.set(change.path, shown)
   }
 
@@ -515,8 +536,13 @@ export const register = (on: On): void => {
     const Client = 'Client' in elements ? elements.Client : undefined
     const state = await read($, git)
     const cwd = await $.session.cwd()
+    const before = threw
     const root = await rootOf($, cwd)
     if (root === null) {
+      // An aborted lookup says nothing about the repo and nothing else redraws
+      // this: look again shortly. A real "not a repo" waits for refresh.
+      if (threw !== before) $.clock.after(1000, () => $.ui.invalidate('ui.render'))
+
       return (
         <Box flexDirection="column" width="100%" minHeight={e.props.scroll.bodyRows} backgroundColor={BACKGROUND}>
           <Text dimColor>Not a git repository</Text>
@@ -703,21 +729,26 @@ export const register = (on: On): void => {
       })
 
     // The section's name sits on its top border; the middle section's name follows
-    // the active tab.
+    // the active tab. A bordered Box clips its children, so the overlay sits after
+    // it in an unbordered wrapper of the same size, at top={0}. A Button has no
+    // text color, so black Text is drawn over it; the press still lands on the Button.
     const titled = (key: string, name: string) => (
-      <Box position="absolute" top={-1} left={1}>
+      <Box position="absolute" top={0} left={1} backgroundColor={border.borderColor}>
         <Button
           key={key}
           plain
           label={' ' + name + ' '}
           onPress={press => copyName($, name, press.surface)}
         />
+        <Box position="absolute" top={0} left={0}>
+          <Text color="black">{' ' + name + ' '}</Text>
+        </Box>
       </Box>
     )
 
     const branchColumn = (
-      <Box flexDirection="row" width={sideCols} flexShrink={0} height={topRows} {...border}>
-        {titled('title:branches', 'Branches')}
+      <Box flexDirection="column" width={sideCols} flexShrink={0} height={topRows}>
+      <Box {...border} flexDirection="row" height="100%">
         <Box flexDirection="column" flexGrow={1}>
         <Button
           key="all"
@@ -774,49 +805,13 @@ export const register = (on: On): void => {
         </Box>
         {dragBar('sb:branches', tree.length, branchRoom, branchWin.offset, 1)}
       </Box>
+      {titled('title:branches', 'Branches')}
+      </Box>
     )
 
     const graphColumn = (
-      <Box flexDirection="row" width={graphCols} flexShrink={0} height={topRows} {...border}>
-        {titled(isChanges ? 'title:changes' : 'title:commits', isChanges ? 'Changes' : 'Commits')}
-        <Box position="absolute" top={-1} right={1} flexDirection="row" gap={1}>
-          <Button
-            key="tab:graph"
-            hotkey="g"
-            plain
-            dimColor={isChanges ? true : undefined}
-            label={(isChanges ? ' ' : '▌') + 'Graph (g)'}
-            onPress={() => showTab('graph' as const)}
-          />
-          <Button
-            key="tab:changes"
-            hotkey="c"
-            plain
-            dimColor={isChanges ? undefined : true}
-            label={
-              (isChanges ? '▌' : ' ') +
-              'Changes' +
-              (changes.length > 0 ? ' ' + changes.length : '') +
-              ' (c)'
-            }
-            onPress={() => showTab('changes')}
-          />
-          {isChanges && (
-            <Button
-              key="view"
-              hotkey="v"
-              plain
-              label={`view: ${changeMode} (v)`}
-              onPress={() =>
-                update($, git, s => ({
-                  ...s,
-                  changeView: changeMode === 'list' ? ('tree' as const) : ('list' as const),
-                  changeOffset: 0,
-                }))
-              }
-            />
-          )}
-        </Box>
+      <Box flexDirection="column" width={graphCols} flexShrink={0} height={topRows}>
+      <Box {...border} flexDirection="row" height="100%">
         {isChanges ? (
         <Box flexDirection="column" flexGrow={1}>
           {crows.length === 0 && <Text dimColor>Working tree clean</Text>}
@@ -945,11 +940,51 @@ export const register = (on: On): void => {
           ? dragBar('sb:changes', crows.length, changeRoom, cwin.offset)
           : dragBar('sb:graph', lines.length, graphRows, win.offset)}
       </Box>
+        {titled(isChanges ? 'title:changes' : 'title:commits', isChanges ? 'Changes' : 'Commits')}
+        {/* No `(g)` suffixes: the terminal already prefixes a plain Button with its hotkey. */}
+        <Box position="absolute" top={0} right={1} flexDirection="row" gap={1}>
+          <Button
+            key="tab:graph"
+            hotkey="g"
+            plain
+            dimColor={isChanges ? true : undefined}
+            label={(isChanges ? ' ' : '▌') + 'Graph'}
+            onPress={() => showTab('graph' as const)}
+          />
+          <Button
+            key="tab:changes"
+            hotkey="c"
+            plain
+            dimColor={isChanges ? undefined : true}
+            label={
+              (isChanges ? '▌' : ' ') +
+              'Changes' +
+              (changes.length > 0 ? ' ' + changes.length : '')
+            }
+            onPress={() => showTab('changes')}
+          />
+          {isChanges && (
+            <Button
+              key="view"
+              hotkey="v"
+              plain
+              label={`view: ${changeMode}`}
+              onPress={() =>
+                update($, git, s => ({
+                  ...s,
+                  changeView: changeMode === 'list' ? ('tree' as const) : ('list' as const),
+                  changeOffset: 0,
+                }))
+              }
+            />
+          )}
+        </Box>
+      </Box>
     )
 
     const detailColumn = (
-      <Box flexDirection="row" flexGrow={1} height={detailRows} {...border}>
-        {titled('title:info', 'Info')}
+      <Box flexDirection="column" flexGrow={1} height={detailRows}>
+      <Box {...border} flexDirection="row" height="100%" flexGrow={1}>
         <Box flexDirection="column" flexGrow={1}>
         {details === undefined && (
           <Text dimColor>{isChanges ? 'Select a change.' : 'Select a commit.'}</Text>
@@ -971,6 +1006,8 @@ export const register = (on: On): void => {
         )}
         </Box>
         {dragBar('sb:details', diffTotal, diffRows, detailOffset, head.length)}
+      </Box>
+      {titled('title:info', 'Info')}
       </Box>
     )
 

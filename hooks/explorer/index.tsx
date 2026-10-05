@@ -305,6 +305,18 @@ type Preview =
     }
   | { type: 'text'; lines: string[] }
 
+const copyName = async (
+  $: EngineInterface,
+  name: string,
+  surface: Parameters<EngineInterface['ui']['copy']>[0]['surface'],
+): Promise<void> => {
+  const text = 'Explorer › ' + name
+  const copied = await $.ui.copy({ text, surface })
+  await $.ui.toast(
+    copied.isCopied ? `Copied: ${text}` : `Copy failed: ${copied.reason}`,
+  )
+}
+
 // Select `path` and expand every dir between the root and it; the window
 // offset is recomputed so the row is visible.
 const jump = async ($: EngineInterface, path: string): Promise<void> => {
@@ -667,6 +679,24 @@ export const register = (on: On): void => {
         />
       )
 
+    // The section's name sits on its top border. A bordered Box clips its
+    // children, so the overlay sits after it in an unbordered wrapper of the
+    // same size, at top={0}. A Button has no text color, so black Text is drawn
+    // over it; the press still lands on the Button.
+    const titled = (key: string, name: string) => (
+      <Box position="absolute" top={0} left={1} backgroundColor={border.borderColor}>
+        <Button
+          key={key}
+          plain
+          label={' ' + name + ' '}
+          onPress={pressed => copyName($, name, pressed.surface)}
+        />
+        <Box position="absolute" top={0} left={0}>
+          <Text color="black">{' ' + name + ' '}</Text>
+        </Box>
+      </Box>
+    )
+
     return (
       <Box flexDirection="column" width="100%" minHeight={e.props.scroll.bodyRows} backgroundColor={BACKGROUND}>
         <Box flexDirection="row" gap={1}>
@@ -698,7 +728,8 @@ export const register = (on: On): void => {
           />
         </Box>
         <Box flexDirection="row">
-          <Box flexDirection="row" width="35%" height={sectionRows} {...border}>
+          <Box flexDirection="column" width="35%" height={sectionRows}>
+          <Box {...border} flexDirection="row" height="100%">
             <Box flexDirection="column" flexGrow={1}>
             {rows.length === 0 && <Text dimColor>(empty)</Text>}
             {win.rows.map(row => (
@@ -729,7 +760,10 @@ export const register = (on: On): void => {
             </Box>
             {dragBar('sb:tree', rows.length, treeRows, win.offset)}
           </Box>
-          <Box flexDirection="row" flexGrow={1} height={sectionRows} {...border}>
+          {titled('title:files', 'Files')}
+          </Box>
+          <Box flexDirection="column" flexGrow={1} height={sectionRows}>
+          <Box {...border} flexDirection="row" height="100%" flexGrow={1}>
             <Box flexDirection="column" flexGrow={1}>
             {preview === undefined && <Text dimColor>Select a file.</Text>}
             {preview?.type === 'text' &&
@@ -766,6 +800,8 @@ export const register = (on: On): void => {
             {hidden > 0 && <Text dimColor>+{hidden} more</Text>}
             </Box>
             {dragBar('sb:preview', previewTotal, previewRows, previewOffset)}
+          </Box>
+          {titled('title:preview', 'Preview')}
           </Box>
         </Box>
         <Box flexDirection="row" justifyContent="space-between" gap={2}>

@@ -177,6 +177,38 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect(await ui.find({ type: 'Text', text: '+1 ~2 -1' })).toBeDefined()
   })
 
+  test(`${surface}: sections are titled, pressing a title copies its name`, async ($, on) => {
+    mock.store(on)
+    fake(on)
+    const copied: string[] = []
+    const toasts: string[] = []
+    on('ui.copy', (_$, e) => {
+      copied.push(e.text)
+
+      return { value: { isCopied: true } }
+    })
+    on('ui.toast', (_$, e) => {
+      toasts.push(e.text)
+
+      return { value: undefined }
+    })
+    await $.session.start(start(surface))
+    const ui = await $.ui.mount({
+      plugin: PLUGIN,
+      surface,
+      component: 'Pane',
+      props: PROPS,
+      requestId: 'ide-explorer',
+      viewport: VIEWPORT,
+    })
+
+    expect((await ui.find({ key: 'title:files' }))?.props.label).toBe(' Files ')
+    expect((await ui.find({ key: 'title:preview' }))?.props.label).toBe(' Preview ')
+    await ui.press({ key: 'title:preview' })
+    expect(copied).toEqual(['Explorer › Preview'])
+    expect(toasts.at(-1)).toBe('Copied: Explorer › Preview')
+  })
+
   test(`${surface}: binary shows metadata, ignored entry is dimmed`, async ($, on) => {
     mock.store(on)
     const calls: string[][] = []

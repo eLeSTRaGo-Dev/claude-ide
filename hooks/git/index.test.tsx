@@ -35,7 +35,8 @@ const result = (stdout: string, exitCode = 0, stderr = '') => ({
   },
 })
 
-// `isRepo` false answers every git call with exit 128.
+// `isRepo` false answers every git call with exit 128; the first `rootFails`
+// root lookups throw, as when the engine aborts a superseded render's call.
 const fake = (
   on: On,
   calls: string[][],
@@ -43,10 +44,16 @@ const fake = (
   log = LOG,
   head: { name: string } = { name: 'main' },
   status = STATUS,
+  rootFails = 0,
 ): void => {
+  let failsLeft = rootFails
   on('process.run', (_$, e) => {
     calls.push([...e.argv])
     if (!isRepo) return result('', 128)
+    if (failsLeft > 0 && e.argv.includes('--show-toplevel')) {
+      failsLeft -= 1
+      throw new Error('aborted')
+    }
     const sub = e.argv[1]
     if (sub === 'rev-parse') {
       if (e.argv.includes('--abbrev-ref')) return result(head.name + '\n')
@@ -240,6 +247,54 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect(
       await ui.find({ type: 'Text', text: /Not a git repository/ }),
     ).toBeDefined()
+  })
+
+  test(`${surface}: a real not-a-repo does not look again on its own`, async ($, on) => {
+    mock.store(on)
+    const clock = mock.clock(on)
+    const calls: string[][] = []
+    fake(on, calls, false)
+    await $.session.start(start(surface))
+    const ui = await $.ui.mount({
+      plugin: PLUGIN,
+      surface,
+      component: 'Pane',
+      props: props(120),
+      requestId: 'ide-git',
+      viewport: VIEWPORT,
+    })
+
+    expect(
+      await ui.find({ type: 'Text', text: /Not a git repository/ }),
+    ).toBeDefined()
+    const lookups = () => calls.filter(a => a.includes('--show-toplevel')).length
+    const seen = lookups()
+    await clock.advance(5000)
+    expect(lookups()).toBe(seen)
+  })
+
+  test(`${surface}: an aborted root lookup is not cached, a retry recovers`, async ($, on) => {
+    mock.store(on)
+    const clock = mock.clock(on)
+    fake(on, [], true, LOG, { name: 'main' }, STATUS, 1)
+    await $.session.start(start(surface))
+    const ui = await $.ui.mount({
+      plugin: PLUGIN,
+      surface,
+      component: 'Pane',
+      props: props(120),
+      requestId: 'ide-git',
+      viewport: VIEWPORT,
+    })
+
+    expect(
+      await ui.find({ type: 'Text', text: /Not a git repository/ }),
+    ).toBeDefined()
+    await clock.advance(1000)
+    expect(
+      await ui.find({ type: 'Text', text: /Not a git repository/ }),
+    ).toBeUndefined()
+    expect(await ui.find({ key: 'branch:develop' })).toBeDefined()
   })
 }
 

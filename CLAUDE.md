@@ -39,6 +39,7 @@ There is no single-test flag; to run one test, narrow the test files or the `tes
   - `next(e)` passes to the plugins beneath and then the engine's default. Returning without calling `next` overrides the default, and `next({ ...e, x })` rewrites what the rest of the chain sees.
 - UI is JSX compiled against the global `h`. Get elements from the surface: `const { Box, Text, Button } = $.ui.resolve(e)`. `e.surface` is `terminal | desktop | vscode | mobile`, so don't assume terminal.
 - Panes: open one with `$.ui.open({ id, title })` and draw it from `on('ui.render', { component: 'Pane', requestId: id }, ...)`. A pane opened unprompted (`session.start`, a timer) only seats at 144 or more terminal columns; one opened by user action seats at any width.
+- Section titles: a bordered Box clips its children, so a border title is an absolute Box (`top={0}`) placed after the bordered Box inside an unbordered wrapper of the same size.
 - Band above the prompt: `ui.render` on `{ component: 'AbovePrompt' }`. Status line: `$.ui.status(text)`. Toasts: `$.ui.toast(text)`.
 - Commands: `$.command.register(...)` in `session.start`, handled by a `command.run` hook.
 - Reactive state: `atom(ref, initial)`, `read($, atom)` while rendering, and `update($, atom, fn)` from handlers. Writes redraw the components that read the atom.
@@ -61,7 +62,7 @@ Use these names in code, comments, tests and chat.
 ## Features
 
 - `/ide-panels` is the only command: it opens both panes as tabs (Explorer, Git), explorer in front.
-- Explorer pane `ide-explorer` (`hooks/explorer/`): file tree and preview pane; `files` and `unity` modes (Unity: `.meta` GUID references). Pure helpers in `tree.ts`, `unity.ts`.
+- Explorer pane `ide-explorer` (`hooks/explorer/`): sections `Files` (tree) and `Preview`; `files` and `unity` modes (Unity: `.meta` GUID references). Pure helpers in `tree.ts`, `unity.ts`.
 - Git pane `ide-git` (`hooks/git/`): branches (grouped by `/`), commit graph (tab `Graph`; `git log --topo-order` with `%P`, one row per commit, colored lanes from `layoutGraph` in `git.ts`) or working-tree `Changes` (one list vs HEAD, `list` or `tree` view, diff in Info) and diff pane, plus `fetch` (`git fetch --all`) and `pull` (`git pull --ff-only`) buttons; nothing else writes to the repo. The current branch also shows in the status line. Pure helpers in `git.ts`.
 - Caches are module-level in each `index.tsx` (not `$.state`): explorer `listings`, `ignored`, `unityRoots`, GUID `indexes`, `footers` (branch + change counts per root); git `repoRoot`, `branchCache`, `statusCache`, `graphCache`, `showCache`, `changeCache` (diff per path), `hasHead`.
 - Footer (both panes): `~/path (branch)` left, `+added ~modified -deleted` right (dim when clean; untracked count as added). Explorer: no counts outside a repo; its `footers` is cleared with the listings by every hook and `refresh`.
