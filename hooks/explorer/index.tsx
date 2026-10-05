@@ -15,6 +15,7 @@ import {
 } from './tree'
 import type { Entry, Mode, Row } from './tree'
 import { GIT_COMMAND } from '../git/git'
+import { borderOf, lastAgentColor, parseColorAnswer } from '../shared/color'
 import {
   classify,
   hasRefs,
@@ -29,8 +30,11 @@ type On = Parameters<Register>[0]
 
 // Black behind the whole pane, as the console default.
 const BACKGROUND = 'black'
-// Frame around each section so the blocks read apart.
-const BORDER = { borderStyle: 'round', borderColor: 'gray' } as const
+// The `/color` of this session; the explorer's hooks keep it current.
+const sessionColor = atom<'ide-panes', 'sessionColor'>(
+  { plugin: 'ide-panes', key: 'sessionColor' } as const,
+  '',
+)
 const PANE = 'ide-explorer'
 const MODES: readonly Mode[] = ['files', 'unity']
 
@@ -52,6 +56,22 @@ let treeRows = 20
 
 const isMode = (value: unknown): value is Mode =>
   MODES.includes(value as Mode)
+
+// The session's `/color` as the transcript last recorded it (`agent-color`
+// entries); nothing recorded leaves the current value.
+const syncColor = async ($: EngineInterface): Promise<void> => {
+  try {
+    const id = await $.session.id()
+    const ran = await $.process.run(
+      ['sh', '-c', 'grep -h \'"agentColor"\' "$HOME"/.claude/projects/*/"$1".jsonl', 'sh', id],
+      { timeoutMs: 5000 },
+    )
+    const name = lastAgentColor(ran.stdout)
+    if (name !== undefined) await update($, sessionColor, () => name)
+  } catch {
+    // no transcript yet
+  }
+}
 
 const modeKey = (root: string): string => 'explorer.mode:' + root
 
@@ -344,8 +364,23 @@ export const register = (on: On): void => {
         offset: isSame ? s.offset : 0,
       }
     })
+    // A resumed session keeps its `/color`.
+    await syncColor($)
 
     return next(e)
+  })
+
+  // Follow `/color` so the section frames match the prompt bar.
+  on('command.run', { command: 'color' }, async ($, e, next) => {
+    const ran = await next(e)
+    // The answer names the color when the command prints it; otherwise (a
+    // random pick, a panel) the transcript has it by now.
+    const name = parseColorAnswer(ran.text ?? '')
+    if (name !== undefined) await update($, sessionColor, () => name)
+    else await syncColor($)
+    $.ui.invalidate('ui.render')
+
+    return ran
   })
 
   // Refresh after Claude changes files; never denies or rewrites the call.
@@ -438,6 +473,8 @@ export const register = (on: On): void => {
     const bodyRows = e.props.scroll.bodyRows
     // One header row, then the bordered sections: 2 rows of frame each.
     const sectionRows = Math.max(5, bodyRows - 1)
+    // Each section is framed in the session color.
+    const border = borderOf(await read($, sessionColor))
     treeRows = sectionRows - 2
     const win = windowOf(rows, index, treeRows, state.offset)
     const current = index < 0 ? undefined : rows[index]
@@ -491,7 +528,7 @@ export const register = (on: On): void => {
           />
         </Box>
         <Box flexDirection="row">
-          <Box flexDirection="column" width="35%" height={sectionRows} {...BORDER}>
+          <Box flexDirection="column" width="35%" height={sectionRows} {...border}>
             {rows.length === 0 && <Text dimColor>(empty)</Text>}
             {win.rows.map(row => (
               <Button
@@ -509,7 +546,7 @@ export const register = (on: On): void => {
               />
             ))}
           </Box>
-          <Box flexDirection="column" flexGrow={1} height={sectionRows} {...BORDER}>
+          <Box flexDirection="column" flexGrow={1} height={sectionRows} {...border}>
             {preview === undefined && <Text dimColor>Select a file.</Text>}
             {preview?.type === 'text' &&
               preview.lines.map(line => <Text>{line}</Text>)}

@@ -15,6 +15,10 @@ export type GitState = {
 
 declare module 'claude-code' {
   interface PluginState {
-    'ide-panes': { explorer: ExplorerState; git: GitState }
+    'ide-panes': {
+      explorer: ExplorerState
+      git: GitState
+      sessionColor: string // `/color` name; '' is the default
+    }
   }
 }

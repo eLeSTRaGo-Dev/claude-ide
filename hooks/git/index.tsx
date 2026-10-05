@@ -3,6 +3,7 @@ import type { EngineInterface, Register } from 'claude-code'
 
 import type { GitState } from '../../types'
 import { window as windowOf } from '../explorer/tree'
+import { borderOf } from '../shared/color'
 import {
   branchesArgv,
   clipDiff,
@@ -21,8 +22,11 @@ type On = Parameters<Register>[0]
 
 // Black behind the whole pane, as the console default.
 const BACKGROUND = 'black'
-// Frame around each section so the blocks read apart.
-const BORDER = { borderStyle: 'round', borderColor: 'gray' } as const
+// The `/color` of this session; set by the explorer's hooks.
+const sessionColor = atom<'ide-panes', 'sessionColor'>(
+  { plugin: 'ide-panes', key: 'sessionColor' } as const,
+  '',
+)
 const PANE = 'ide-git'
 const PAGE = 200
 // Pane body columns from which the three-column layout is used.
@@ -213,6 +217,8 @@ export const register = (on: On): void => {
     const columns = e.props.bodyColumns
     const bodyRows = e.props.scroll.bodyRows
     const isWide = columns >= WIDE
+    // Each section is framed in the session color.
+    const border = borderOf(await read($, sessionColor))
     // One header row; wide: the graph keeps a row for `more`; stacked: the
     // graph and branches take the top ~55%, the details the rest.
     const area = Math.max(4, bodyRows - 1)
@@ -257,7 +263,7 @@ export const register = (on: On): void => {
       }))
 
     const branchColumn = (
-      <Box flexDirection="column" width={isWide ? '20%' : '30%'} height={topRows} {...BORDER}>
+      <Box flexDirection="column" width={isWide ? '20%' : '30%'} height={topRows} {...border}>
         <Button
           key="all"
           hotkey="a"
@@ -286,7 +292,7 @@ export const register = (on: On): void => {
     )
 
     const graphColumn = (
-      <Box flexDirection="column" flexGrow={isWide ? undefined : 1} width={isWide ? '40%' : undefined} height={topRows} {...BORDER}>
+      <Box flexDirection="column" flexGrow={isWide ? undefined : 1} width={isWide ? '40%' : undefined} height={topRows} {...border}>
         {lines.length === 0 && <Text dimColor>(no commits)</Text>}
         {win.rows.map((line, i) =>
           line.commit === undefined ? (
@@ -323,7 +329,7 @@ export const register = (on: On): void => {
     )
 
     const detailColumn = (
-      <Box flexDirection="column" flexGrow={1} height={detailRows} {...BORDER}>
+      <Box flexDirection="column" flexGrow={1} height={detailRows} {...border}>
         {selected === undefined && <Text dimColor>Select a commit.</Text>}
         {head.map((text, i) => (
           <Text key={'head:' + i} bold={i === 0} wrap="truncate-end">
