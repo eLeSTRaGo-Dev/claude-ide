@@ -14,7 +14,7 @@ import {
   window as windowOf,
 } from './tree'
 import type { Entry, Mode, Row } from './tree'
-import { GIT_PANE, changeCounts, shortDir, parseStatus, statusArgv } from '../git/git'
+import { GIT_PANE, changeCounts, shortDir, parseStatus, statusArgv } from '../git-panel/git'
 import { borderOf, lastAgentColor, parseColorAnswer } from '../shared/color'
 import { scrollbar } from '../shared/scrollbar'
 import {

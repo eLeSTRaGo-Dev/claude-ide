@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
 import type { GitState } from '../../types'
-import { window as windowOf } from '../explorer/tree'
+import { window as windowOf } from '../explorer-panel/tree'
 import { borderOf } from '../shared/color'
 import { scrollbar } from '../shared/scrollbar'
 import {
