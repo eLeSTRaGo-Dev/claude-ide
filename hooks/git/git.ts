@@ -378,3 +378,26 @@ export const branchTree = (
 
   return rows
 }
+
+// The two calls that touch the repo: fetch every remote, and a pull that
+// only fast-forwards (it fails rather than merging).
+export type RemoteAction = 'fetch' | 'pull'
+
+export const remoteArgv = (action: RemoteAction): string[] =>
+  action === 'fetch' ? ['git', 'fetch', '--all'] : ['git', 'pull', '--ff-only']
+
+// A short line for a toast from a finished fetch or pull.
+export const remoteSummary = (
+  action: RemoteAction,
+  exitCode: number,
+  stdout: string,
+  stderr: string,
+): string => {
+  const lines = (exitCode === 0 ? stdout + '\n' + stderr : stderr + '\n' + stdout)
+    .split('\n')
+    .map(line => line.trim())
+    .filter(line => line !== '' && !line.startsWith('Fetching '))
+  const detail = exitCode === 0 ? (lines.at(-1) ?? 'done') : (lines[0] ?? 'exit ' + exitCode)
+
+  return `git ${action}: ${exitCode === 0 ? '' : 'failed: '}${detail}`
+}

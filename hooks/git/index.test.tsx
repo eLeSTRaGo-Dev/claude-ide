@@ -17,11 +17,11 @@ const props = (bodyColumns: number) =>
     view: {},
   }) as const
 
-const result = (stdout: string, exitCode = 0) => ({
+const result = (stdout: string, exitCode = 0, stderr = '') => ({
   value: {
     exitCode,
     stdout,
-    stderr: '',
+    stderr,
     isStdoutTruncated: false,
     isStderrTruncated: false,
   },
@@ -46,6 +46,8 @@ const fake = (
       return result(CWD + '\n')
     }
     if (sub === 'for-each-ref') return result(BRANCHES)
+    if (sub === 'fetch') return result('')
+    if (sub === 'pull') return result('', 128, 'fatal: Not possible to fast-forward, aborting.\n')
     if (sub === 'log') return result(log)
     if (sub === 'show') {
       return result(e.argv.includes('--stat') ? STAT : PATCH)
@@ -251,6 +253,36 @@ for (const surface of ['terminal', 'desktop'] as const) {
     ).toBeGreaterThan(0)
     await ui.press({ key: 'refresh' })
     expect(calls.filter(a => a[1] === 'log').length).toBeGreaterThan(before)
+  })
+
+  test(`${surface}: fetch and pull run git and report in a toast`, async ($, on) => {
+    mock.store(on)
+    const calls: string[][] = []
+    const toasts: string[] = []
+    fake(on, calls)
+    on('ui.toast', (_$, e) => {
+      toasts.push(e.text)
+
+      return { value: undefined }
+    })
+    await $.session.start(start(surface))
+    const ui = await $.ui.mount({
+      plugin: PLUGIN,
+      surface,
+      component: 'Pane',
+      props: props(120),
+      requestId: 'ide-git',
+      viewport: VIEWPORT,
+    })
+
+    expect((await ui.find({ key: 'fetch' }))?.props.hotkey).toBe('f')
+    expect((await ui.find({ key: 'pull' }))?.props.hotkey).toBe('p')
+    await ui.press({ key: 'fetch' })
+    expect(calls).toContainEqual(['git', 'fetch', '--all'])
+    expect(toasts.at(-1)).toBe('git fetch: done')
+    await ui.press({ key: 'pull' })
+    expect(calls).toContainEqual(['git', 'pull', '--ff-only'])
+    expect(toasts.at(-1)).toBe('git pull: failed: fatal: Not possible to fast-forward, aborting.')
   })
 }
 

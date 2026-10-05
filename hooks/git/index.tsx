@@ -7,6 +7,8 @@ import { borderOf } from '../shared/color'
 import { scrollbar } from '../shared/scrollbar'
 import {
   branchTree,
+  remoteArgv,
+  remoteSummary,
   branchesArgv,
   commitLabel,
   diffLines,
@@ -19,7 +21,7 @@ import {
   statArgv,
   trackLabel,
 } from './git'
-import type { Branch, BranchRow, GraphLine } from './git'
+import type { Branch, BranchRow, GraphLine, RemoteAction } from './git'
 
 type On = Parameters<Register>[0]
 
@@ -169,6 +171,34 @@ const showBranch = async ($: EngineInterface, cwd: string): Promise<void> => {
   if (text === shown) return
   shown = text
   await $.ui.status(text)
+}
+
+// The fetch or pull running now; a second press waits for it to finish.
+let busy: RemoteAction | undefined
+
+// Runs a fetch or pull (no credential prompt: it fails instead of hanging),
+// reports it in a toast and reloads every cached view of the repo.
+const remote = async ($: EngineInterface, action: RemoteAction): Promise<void> => {
+  if (busy !== undefined) return
+  busy = action
+  $.ui.invalidate('ui.render')
+  const cwd = await $.session.cwd()
+  let text: string
+  try {
+    const ran = await $.process.run(remoteArgv(action), {
+      cwd,
+      env: { GIT_TERMINAL_PROMPT: '0' },
+      timeoutMs: 120000,
+    })
+    text = remoteSummary(action, ran.exitCode, ran.stdout, ran.stderr)
+  } catch (error) {
+    text = `git ${action}: failed: ${error instanceof Error ? error.message : String(error)}`
+  }
+  busy = undefined
+  clear()
+  await showBranch($, cwd)
+  await $.ui.toast(text)
+  $.ui.invalidate('ui.render')
 }
 
 const keyOf = (line: GraphLine): string => 'commit:' + (line.commit?.sha ?? '')
@@ -574,6 +604,18 @@ export const register = (on: On): void => {
               clear()
               $.ui.invalidate('ui.render')
             }}
+          />
+          <Button
+            key="fetch"
+            hotkey="f"
+            label={busy === 'fetch' ? 'fetching…' : 'fetch (f)'}
+            onPress={() => remote($, 'fetch')}
+          />
+          <Button
+            key="pull"
+            hotkey="p"
+            label={busy === 'pull' ? 'pulling…' : 'pull (p)'}
+            onPress={() => remote($, 'pull')}
           />
         </Box>
         {isWide ? (

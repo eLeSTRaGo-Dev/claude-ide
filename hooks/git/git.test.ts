@@ -3,6 +3,8 @@ import { expect, test } from 'claude-code/testing'
 import { BRANCHES, GRAPH, PATCH } from './fixtures'
 import {
   branchTree,
+  remoteArgv,
+  remoteSummary,
   clipDiff,
   diffLines,
   commitLabel,
@@ -176,4 +178,14 @@ test('branchTree groups branches by / with local first', () => {
   ])
   const shut = branchTree([b('fix/a'), b('origin/main', true)], new Set(['l:fix']))
   expect(shut.map(r => r.name)).toEqual(['fix', 'origin', 'main'])
+})
+
+test('remote actions: argv and summaries', () => {
+  expect(remoteArgv('fetch')).toEqual(['git', 'fetch', '--all'])
+  expect(remoteArgv('pull')).toEqual(['git', 'pull', '--ff-only'])
+  expect(remoteSummary('pull', 0, 'Already up to date.\n', '')).toBe('git pull: Already up to date.')
+  expect(remoteSummary('fetch', 0, '', 'Fetching origin\n')).toBe('git fetch: done')
+  expect(remoteSummary('pull', 128, '', 'fatal: Not possible to fast-forward, aborting.\n')).toBe(
+    'git pull: failed: fatal: Not possible to fast-forward, aborting.',
+  )
 })

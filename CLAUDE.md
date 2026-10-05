@@ -51,10 +51,10 @@ For any API detail, grep the generated `.claude-plugin/types/claude-code/index.d
 ## Features
 
 - `/explorer` (`hooks/explorer/`): file tree and preview pane; `files` and `unity` modes (Unity: `.meta` GUID references). Pure helpers in `tree.ts`, `unity.ts`.
-- `/git` (`hooks/git/`): read-only branches, commit graph and diff pane; the current branch also shows in the status line. Pure helpers in `git.ts`.
+- `/git` (`hooks/git/`): branches (grouped by `/`), commit graph and diff pane, plus `fetch` (`git fetch --all`) and `pull` (`git pull --ff-only`) buttons; nothing else writes to the repo. The current branch also shows in the status line. Pure helpers in `git.ts`.
 - Caches are module-level in each `index.tsx` (not `$.state`): explorer `listings`, `ignored`, `unityRoots`, GUID `indexes`; git `repoRoot`, `branchCache`, `graphCache`, `showCache`.
 - Cleared by: the `refresh` button (`r`) and each feature's `tool.call` hooks. Explorer: `Write`/`Edit`/`NotebookEdit` drop that file and its parent dir; `Bash` drops all listings (and the GUID index when the command matches `git|mv|rm|cp|unity`). Git: `Bash` clears all and re-reads the branch. The hooks never deny or rewrite a call.
-- Hotkeys on header Buttons: `r` refresh (both), `m` mode (explorer), `a` all branches (git).
+- Hotkeys on header Buttons: `r` refresh (both), `m` mode (explorer), `a` all branches, `f` fetch, `p` pull (git).
 - `$.state` atoms under `ide-panes`: `explorer` (`root`, `mode`, `expanded`, `selected`, `offset`, `previewOffset`) and `git` (`ref`, `selected`, `offset`, `limit`, `branchOffset`, `detailOffset`). `$.store` key `explorer.mode:<root>` holds the saved mode.
 - The explorer owns the plugin's only `session.start` hook and registers both commands; git sets its status line on the first `prompt.submit` and after each `Bash` call.
 
