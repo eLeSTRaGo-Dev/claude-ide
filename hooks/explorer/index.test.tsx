@@ -488,3 +488,75 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect(await ui.find({ type: 'Text', text: /Unity/ })).toBeDefined()
   })
 }
+
+const scroll = ($: Engine, requestId: string, by: number, pointer?: { column: number; row: number }) =>
+  $.ui.scroll({
+    component: 'Pane',
+    requestId,
+    plugin: PLUGIN,
+    offset: 0,
+    by,
+    bodyRows: 20,
+    contentRows: 20,
+    origin: { kind: 'person' },
+    ...(pointer === undefined ? {} : { pointer }),
+  } as never)
+
+for (const surface of ['terminal', 'desktop'] as const) {
+  test(`${surface}: wheel scrolls the section under the pointer, keys move the selection and page the preview`, async ($, on) => {
+    mock.store(on)
+    fake(on)
+    on('ui.focus', () => ({}))
+    on('ui.scroll', () => ({}))
+    const names = Array.from({ length: 30 }, (_, i) => `g${String(i).padStart(2, '0')}.txt`)
+    TREE['/many'] = names.map(name => entry(name, 'file'))
+    for (const name of names) {
+      FILES['/many/' + name] = Array.from({ length: 60 }, (_, i) => `line ${i + 1}`).join('\n') + '\n'
+    }
+    await $.session.start({ cwd: '/many', surface, isInteractive: true })
+    const ui = await $.ui.mount({
+      plugin: PLUGIN,
+      surface,
+      component: 'Pane',
+      props: { ...PROPS, scroll: { offset: 0, bodyRows: 12 } },
+      requestId: 'ide-explorer',
+      viewport: VIEWPORT,
+    })
+    const keys = async () =>
+      (await ui.findAll({ type: 'Button' }))
+        .map(b => b.key ?? '')
+        .filter(key => key.startsWith('row:'))
+    const bars = async () =>
+      (await ui.findAll({ type: 'Text', text: /^[┃│ ]$/ })).map(t => t.text).join('')
+    await ui.press({ key: 'row:/many/g00.txt' })
+    expect(await keys()).toContain('row:/many/g00.txt')
+    expect(await bars()).toContain('┃')
+
+    // wheel over the tree: the window moves, the selection stays
+    await scroll($, 'ide-explorer', 5, { column: 5, row: 3 })
+    const moved = await keys()
+    expect(moved).not.toContain('row:/many/g00.txt')
+    expect(moved).toContain('row:/many/g05.txt')
+    const code = async () => await ui.find({ type: 'Code' })
+    expect((await code())?.props.startLine).toBe(1)
+
+    // wheel over the preview scrolls the file lines
+    await scroll($, 'ide-explorer', 4, { column: 80, row: 3 })
+    expect((await code())?.props.startLine).toBe(5)
+    expect((await code())?.text).toContain('line 5')
+    expect(await keys()).toEqual(moved)
+
+    // a page key (no pointer) scrolls the preview by its rows
+    await scroll($, 'ide-explorer', 20)
+    expect(((await code())?.props.startLine as number) > 5).toBe(true)
+    await scroll($, 'ide-explorer', -20)
+    expect((await code())?.props.startLine).toBe(5)
+    await scroll($, 'ide-explorer', -20)
+    expect((await code())?.props.startLine).toBe(1)
+
+    // an arrow key moves the selection and resets the preview
+    await scroll($, 'ide-explorer', 1)
+    expect(await keys()).toContain('row:/many/g01.txt')
+    expect((await code())?.props.startLine).toBe(1)
+  })
+}

@@ -4,6 +4,7 @@ export type ExplorerState = {
   expanded: string[]
   selected?: string
   offset: number
+  previewOffset: number // first preview line shown
 }
 
 export type GitState = {
@@ -11,6 +12,8 @@ export type GitState = {
   selected?: string // commit sha
   offset: number
   limit: number
+  branchOffset: number // first branch row shown
+  detailOffset: number // first diff line shown
 }
 
 declare module 'claude-code' {

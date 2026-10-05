@@ -166,32 +166,170 @@ export const commitLabel = (line: GraphLine): string => {
   return `${line.graph}${commit.short}${refs} ${commit.subject}`
 }
 
-const HUNK = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@(.*)$/
+const HUNK = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$/
 
-// The first `rows` lines of a unified diff, still a valid diff: the last hunk's
-// header counts are rewritten to the lines kept, and file header lines left
-// with no hunk after them are dropped (`Code format="diff"` rejects both).
-export const clipDiff = (diff: string, rows: number): string => {
-  const all = diff.replace(/\n+$/, '').split('\n')
-  const kept = all.slice(0, Math.max(1, rows))
-  let hunk = -1
-  kept.forEach((line, i) => {
-    if (HUNK.test(line)) hunk = i
-  })
-  if (hunk < 0) return ''
-  let removed = 0
-  let added = 0
-  let context = 0
-  for (const line of kept.slice(hunk + 1)) {
-    if (line.startsWith('-')) removed++
-    else if (line.startsWith('+')) added++
-    else if (line.startsWith(' ')) context++
-  }
-  const match = HUNK.exec(kept[hunk] ?? '')
-  if (match === null) return ''
-  kept[hunk] =
-    `@@ -${match[1]},${context + removed} +${match[2]},${context + added} @@` +
-    (match[3] ?? '')
-
-  return kept.join('\n')
+type Parsed = {
+  kind: 'file' | 'hunk' | 'body'
+  // file lines: index of the `diff` line opening the block
+  block: number
+  // body lines: the hunk header's index and the old/new numbers of the line
+  head: number
+  old: number
+  next: number
 }
+
+// Every line of a diff told apart: hunk headers, file header lines (`diff`,
+// `index`, `---`, `+++`, ...) and hunk body lines. Bodies are followed by the
+// header's counts, so a removed `-- x` is not taken for a `---` line.
+const parseDiff = (all: readonly string[]): Parsed[] => {
+  const parsed: Parsed[] = []
+  let block = 0
+  let head = -1
+  let left = { old: 0, next: 0 }
+  let old = 0
+  let next = 0
+  all.forEach((line, i) => {
+    const isBody = left.old > 0 || left.next > 0
+    if (isBody && !HUNK.test(line)) {
+      parsed.push({ kind: 'body', block, head, old, next })
+      if (line.startsWith('-')) {
+        left.old--
+        old++
+      } else if (line.startsWith('+')) {
+        left.next--
+        next++
+      } else if (line.startsWith(' ')) {
+        left.old--
+        left.next--
+        old++
+        next++
+      }
+
+      return
+    }
+    const match = HUNK.exec(line)
+    if (match !== null) {
+      head = i
+      old = Number(match[1])
+      next = Number(match[3])
+      left = {
+        old: match[2] === undefined ? 1 : Number(match[2]),
+        next: match[4] === undefined ? 1 : Number(match[4]),
+      }
+      parsed.push({ kind: 'hunk', block, head, old, next })
+
+      return
+    }
+    if (line.startsWith('diff ')) block = i
+    parsed.push({ kind: 'file', block, head, old, next })
+  })
+
+  return parsed
+}
+
+type OpenHunk = {
+  at: number
+  head: number
+  old: number
+  next: number
+  section: string
+  context: number
+  removed: number
+  added: number
+  isKept: boolean
+}
+
+export const diffLines = (diff: string): string[] =>
+  diff === '' ? [] : diff.replace(/\n+$/, '').split('\n')
+
+// `rows` lines of a unified diff from line `offset`, still a valid diff: a hunk
+// cut at either end gets its header start/counts rewritten (a hunk entered
+// mid-way gets a header of its own), and file header lines are kept only with a
+// hunk after them (`Code format="diff"` rejects both). '' when no hunk shows.
+export const sliceDiff = (diff: string, offset: number, rows: number): string => {
+  const all = diffLines(diff)
+  const parsed = parseDiff(all)
+  const from = Math.min(Math.max(0, Math.floor(offset)), all.length)
+  const to = Math.min(all.length, from + Math.max(1, Math.floor(rows)))
+  const out: string[] = []
+  let pending: string[] = []
+  let open = undefined as OpenHunk | undefined
+  const close = (): void => {
+    if (open === undefined) return
+    const { at, old, next, context, removed, added, isKept } = open
+    const oldCount = context + removed
+    const newCount = context + added
+    if (!isKept) {
+      const oldStart = oldCount === 0 ? Math.max(0, old - 1) : old
+      const newStart = newCount === 0 ? Math.max(0, next - 1) : next
+      out[at] = `@@ -${oldStart},${oldCount} +${newStart},${newCount} @@${open.section}`
+    }
+    open = undefined
+  }
+  const header = (index: number) => HUNK.exec(all[index] ?? '')
+  for (let i = from; i < to; i++) {
+    const line = all[i] ?? ''
+    const p = parsed[i]
+    if (p === undefined) continue
+    if (p.kind === 'file') {
+      close()
+      if (line.startsWith('diff ') && p.block === i) pending = []
+      if (p.block >= from) pending.push(line)
+    } else if (p.kind === 'hunk') {
+      close()
+      out.push(...pending)
+      pending = []
+      const match = header(i)
+      open = {
+        at: out.length,
+        head: i,
+        old: p.old,
+        next: p.next,
+        section: match?.[5] ?? '',
+        context: 0,
+        removed: 0,
+        added: 0,
+        isKept: true,
+      }
+      out.push(line)
+    } else {
+      if (open === undefined || open.head !== p.head) {
+        if (line.startsWith('\\')) continue
+        close()
+        const match = header(p.head)
+        open = {
+          at: out.length,
+          head: p.head,
+          old: p.old,
+          next: p.next,
+          section: match?.[5] ?? '',
+          context: 0,
+          removed: 0,
+          added: 0,
+          isKept: false,
+        }
+        out.push('')
+      }
+      if (line.startsWith('-')) open.removed++
+      else if (line.startsWith('+')) open.added++
+      else if (line.startsWith(' ')) open.context++
+      out.push(line)
+    }
+  }
+  // a hunk shown from its own header but cut short at the bottom
+  if (open !== undefined && open.isKept) {
+    const match = header(open.head)
+    const oldFull = match?.[2] === undefined ? 1 : Number(match[2])
+    const newFull = match?.[4] === undefined ? 1 : Number(match[4])
+    if (open.context + open.removed !== oldFull || open.context + open.added !== newFull) {
+      open.isKept = false
+    }
+  }
+  close()
+
+  return out.some(line => HUNK.test(line)) ? out.join('\n') : ''
+}
+
+// The first `rows` lines of a unified diff, still a valid diff.
+export const clipDiff = (diff: string, rows: number): string =>
+  sliceDiff(diff, 0, rows)

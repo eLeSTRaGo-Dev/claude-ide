@@ -253,3 +253,88 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect(calls.filter(a => a[1] === 'log').length).toBeGreaterThan(before)
   })
 }
+
+const many = Array.from({ length: 40 }, (_, i) =>
+  `* \x1f${String(i).padStart(40, '0')}\x1f${String(i).padStart(7, '0')}\x1f\x1fa\x1f2026-01-01\x1fc${i}`,
+).join('\n')
+
+for (const surface of ['terminal', 'desktop'] as const) {
+  test(`${surface}: wheel scrolls graph and details, keys move the commit`, async ($, on) => {
+    mock.store(on)
+    fake(on, [], true, many)
+    on('ui.focus', () => ({}))
+    on('ui.scroll', () => ({}))
+    await $.session.start(start(surface))
+    const ui = await $.ui.mount({
+      plugin: PLUGIN,
+      surface,
+      component: 'Pane',
+      props: { ...props(160), scroll: { offset: 0, bodyRows: 14 } },
+      requestId: 'ide-git',
+      viewport: VIEWPORT,
+    })
+    const commits = async () =>
+      (await ui.findAll({ type: 'Button' }))
+        .map(b => b.key ?? '')
+        .filter(key => key.startsWith('commit:'))
+    const scroll = (by: number, pointer?: { column: number; row: number }) =>
+      $.ui.scroll({
+        component: 'Pane',
+        requestId: 'ide-git',
+        plugin: PLUGIN,
+        offset: 0,
+        by,
+        bodyRows: 14,
+        contentRows: 14,
+        origin: { kind: 'person' },
+        ...(pointer === undefined ? {} : { pointer }),
+      } as never)
+    const first = (await commits())[0]
+    expect(await ui.find({ type: 'Text', text: '┃' })).toBeDefined()
+
+    // wide layout: columns 32-95 are the graph
+    await scroll(6, { column: 60, row: 3 })
+    const after = await commits()
+    expect(after[0]).not.toBe(first)
+    expect(after[0]).toBe('commit:' + String(6).padStart(40, '0'))
+
+    // an arrow key selects the next commit
+    await ui.press({ key: after[0] ?? '' })
+    await scroll(1)
+    const next = await ui.find({ key: 'commit:' + String(7).padStart(40, '0') })
+    expect(next?.props.label).toMatch(/^>/)
+  })
+
+  test(`${surface}: wheel over the details scrolls the diff, valid hunks`, async ($, on) => {
+    mock.store(on)
+    fake(on, [], true, GRAPH)
+    on('ui.focus', () => ({}))
+    on('ui.scroll', () => ({}))
+    await $.session.start(start(surface))
+    const ui = await $.ui.mount({
+      plugin: PLUGIN,
+      surface,
+      component: 'Pane',
+      props: { ...props(160), scroll: { offset: 0, bodyRows: 14 } },
+      requestId: 'ide-git',
+      viewport: VIEWPORT,
+    })
+    await ui.press({ key: 'commit:908022ab43fb9bc599342842219a42dfd653f899' })
+    const before = (await ui.find({ type: 'Code' }))?.text ?? ''
+    await $.ui.scroll({
+      component: 'Pane',
+      requestId: 'ide-git',
+      plugin: PLUGIN,
+      offset: 0,
+      by: 6,
+      bodyRows: 14,
+      contentRows: 14,
+      origin: { kind: 'person' },
+      pointer: { column: 150, row: 3 },
+    } as never)
+    const code = await ui.find({ type: 'Code' })
+    expect(code?.props.format).toBe('diff')
+    expect(code?.text).not.toBe(before)
+    expect(code?.text).toMatch(/^@@ -\d+,\d+ \+\d+,\d+ @@/)
+  })
+}

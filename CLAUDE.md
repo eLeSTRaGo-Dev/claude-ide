@@ -55,7 +55,7 @@ For any API detail, grep the generated `.claude-plugin/types/claude-code/index.d
 - Caches are module-level in each `index.tsx` (not `$.state`): explorer `listings`, `ignored`, `unityRoots`, GUID `indexes`; git `repoRoot`, `branchCache`, `graphCache`, `showCache`.
 - Cleared by: the `refresh` button (`r`) and each feature's `tool.call` hooks. Explorer: `Write`/`Edit`/`NotebookEdit` drop that file and its parent dir; `Bash` drops all listings (and the GUID index when the command matches `git|mv|rm|cp|unity`). Git: `Bash` clears all and re-reads the branch. The hooks never deny or rewrite a call.
 - Hotkeys on header Buttons: `r` refresh (both), `m` mode (explorer), `a` all branches (git).
-- `$.state` atoms under `ide-panes`: `explorer` (`root`, `mode`, `expanded`, `selected`, `offset`) and `git` (`ref`, `selected`, `offset`, `limit`). `$.store` key `explorer.mode:<root>` holds the saved mode.
+- `$.state` atoms under `ide-panes`: `explorer` (`root`, `mode`, `expanded`, `selected`, `offset`, `previewOffset`) and `git` (`ref`, `selected`, `offset`, `limit`, `branchOffset`, `detailOffset`). `$.store` key `explorer.mode:<root>` holds the saved mode.
 - The explorer owns the plugin's only `session.start` hook and registers both commands; git sets its status line on the first `prompt.submit` and after each `Bash` call.
 
 ## Validator constraints

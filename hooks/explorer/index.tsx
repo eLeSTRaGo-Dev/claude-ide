@@ -16,6 +16,7 @@ import {
 import type { Entry, Mode, Row } from './tree'
 import { GIT_COMMAND } from '../git/git'
 import { borderOf, lastAgentColor, parseColorAnswer } from '../shared/color'
+import { scrollbar } from '../shared/scrollbar'
 import {
   classify,
   hasRefs,
@@ -40,7 +41,7 @@ const MODES: readonly Mode[] = ['files', 'unity']
 
 const explorer = atom<'ide-panes', 'explorer'>(
   { plugin: 'ide-panes', key: 'explorer' } as const,
-  { root: '', mode: 'files', expanded: [], offset: 0 } satisfies ExplorerState,
+  { root: '', mode: 'files', expanded: [], offset: 0, previewOffset: 0 } satisfies ExplorerState,
 )
 
 // Listings and git-ignore results are cached here, not in $.state: they are
@@ -53,6 +54,13 @@ const ignored = new Set<string>()
 const unityRoots = new Map<string, boolean>()
 // Rows the tree window shows; set by render, read by the focus hook.
 let treeRows = 20
+// The last drawing's geometry, set by render and read by the scroll hook: the
+// column where the preview starts, each section's furthest offset and the
+// rows the preview shows.
+const view = { treeEnd: 0, treeMax: 0, previewMax: 0, previewRows: 1 }
+
+const clamp = (value: number, max: number): number =>
+  Math.min(Math.max(0, value), Math.max(0, max))
 
 const isMode = (value: unknown): value is Mode =>
   MODES.includes(value as Mode)
@@ -229,6 +237,7 @@ const press = async ($: EngineInterface, row: Row): Promise<void> => {
   await update($, explorer, s => ({
     ...s,
     selected: row.path,
+    previewOffset: s.selected === row.path ? s.previewOffset : 0,
     expanded:
       row.kind !== 'dir'
         ? s.expanded
@@ -243,7 +252,7 @@ type Preview =
       type: 'code'
       path: string
       language?: string
-      source: string
+      lines: string[]
       refs: Ref[]
     }
   | { type: 'text'; lines: string[] }
@@ -270,6 +279,7 @@ const jump = async ($: EngineInterface, path: string): Promise<void> => {
   await update($, explorer, s => ({
     ...s,
     selected: path,
+    previewOffset: s.selected === path ? s.previewOffset : 0,
     expanded,
     offset: win.offset,
   }))
@@ -286,7 +296,6 @@ const RANK = { resolved: 0, unresolved: 1, builtin: 2 } as const
 const loadPreview = async (
   $: EngineInterface,
   row: Row,
-  lines: number,
   isUnity: boolean,
   root: string,
 ): Promise<Preview> => {
@@ -325,7 +334,7 @@ const loadPreview = async (
       type: 'code',
       path: row.path,
       language: languageOf(row.name),
-      source: clip(text, lines),
+      lines: text.replace(/\n$/, '').split('\n'),
       refs,
     }
   } catch {
@@ -362,6 +371,7 @@ export const register = (on: On): void => {
         expanded: isSame ? s.expanded : [],
         selected: isSame ? s.selected : undefined,
         offset: isSame ? s.offset : 0,
+        previewOffset: isSame ? (s.previewOffset ?? 0) : 0,
       }
     })
     // A resumed session keeps its `/color`.
@@ -452,12 +462,67 @@ export const register = (on: On): void => {
         await update($, explorer, s => ({
           ...s,
           selected: path,
+          previewOffset: s.selected === path ? s.previewOffset : 0,
           offset: win.offset,
         }))
       }
     }
 
     return next(e)
+  })
+
+  // Wheel: scrolls the section under the pointer, the selection stays. Keys:
+  // an arrow moves the selection, a page key scrolls the preview. The engine's
+  // own window is never used, so the hook always answers `{}` without `next`.
+  on('ui.scroll', { requestId: PANE }, async ($, e) => {
+    const state = await read($, explorer)
+    const pointer = e.pointer
+    if (pointer !== undefined) {
+      if (pointer.column < view.treeEnd) {
+        const offset = clamp(state.offset + e.by, view.treeMax)
+        if (offset !== state.offset) await update($, explorer, s => ({ ...s, offset }))
+      } else {
+        const was = state.previewOffset ?? 0
+        const previewOffset = clamp(was + e.by, view.previewMax)
+        if (previewOffset !== was) {
+          await update($, explorer, s => ({ ...s, previewOffset }))
+        }
+      }
+    } else if (Math.abs(e.by) === 1) {
+      const root = await rootOf($, state)
+      const rows = flatten(listings, new Set(state.expanded), root, {
+        mode: state.mode,
+      })
+      const at = rows.findIndex(row => row.path === state.selected)
+      const target = rows[clamp(at < 0 ? 0 : at + e.by, rows.length - 1)]
+      if (target !== undefined && target.path !== state.selected) {
+        const win = windowOf(
+          rows,
+          rows.indexOf(target),
+          treeRows,
+          state.offset,
+        )
+        await update($, explorer, s => ({
+          ...s,
+          selected: target.path,
+          previewOffset: 0,
+          offset: win.offset,
+        }))
+        await $.ui.focus({ requestId: PANE, key: 'row:' + target.path })
+      }
+    } else {
+      const was = state.previewOffset ?? 0
+      const previewOffset = clamp(
+        was + Math.sign(e.by) * view.previewRows,
+        view.previewMax,
+      )
+      if (previewOffset !== was) {
+        await update($, explorer, s => ({ ...s, previewOffset }))
+      }
+    }
+    $.ui.invalidate('ui.render')
+
+    return {}
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
@@ -476,13 +541,14 @@ export const register = (on: On): void => {
     // Each section is framed in the session color.
     const border = borderOf(await read($, sessionColor))
     treeRows = sectionRows - 2
-    const win = windowOf(rows, index, treeRows, state.offset)
+    // The wheel moves the window off the selection, so it only clamps here.
+    const win = windowOf(rows, -1, treeRows, state.offset)
     const current = index < 0 ? undefined : rows[index]
     const isUnity = state.mode === 'unity' && !isNotUnity
     const preview =
       current === undefined
         ? undefined
-        : await loadPreview($, current, treeRows, isUnity, root)
+        : await loadPreview($, current, isUnity, root)
     // Reference section: a header line, up to `shown` refs and a "+n more"
     // line; Code gets the rest of the pane rows.
     const refs = preview?.type === 'code' ? preview.refs : []
@@ -492,7 +558,36 @@ export const register = (on: On): void => {
         : Math.min(refs.length, Math.max(1, Math.floor((treeRows - 1) / 2)))
     const hidden = refs.length - shown
     const refLines = refs.length === 0 ? 0 : 1 + shown + (hidden > 0 ? 1 : 0)
-    const focusKey = current?.path ?? rows[0]?.path
+    // A row scrolled out of the window is not focused: autoFocus would move
+    // the selection to whatever row the wheel brought in.
+    const focusKey =
+      current === undefined
+        ? win.rows[0]?.path
+        : win.rows.some(row => row.path === current.path)
+          ? current.path
+          : undefined
+    const previewTotal = preview?.type === 'code' ? preview.lines.length : 0
+    const previewRows = Math.max(1, treeRows - refLines)
+    const previewOffset = clamp(state.previewOffset ?? 0, previewTotal - previewRows)
+    view.treeEnd = Math.floor(e.props.bodyColumns * 0.35)
+    view.treeMax = Math.max(0, rows.length - treeRows)
+    view.previewMax = Math.max(0, previewTotal - previewRows)
+    view.previewRows = previewRows
+    const bar = (cells: string[]) => (
+      <Box flexDirection="column" width={1} flexShrink={0}>
+        {cells.map((cell, i) =>
+          cell === '┃' ? (
+            <Text key={'bar:' + i} color={border.borderColor}>
+              {cell}
+            </Text>
+          ) : (
+            <Text key={'bar:' + i} dimColor>
+              {cell}
+            </Text>
+          ),
+        )}
+      </Box>
+    )
 
     return (
       <Box flexDirection="column" width="100%" minHeight={e.props.scroll.bodyRows} backgroundColor={BACKGROUND}>
@@ -528,7 +623,8 @@ export const register = (on: On): void => {
           />
         </Box>
         <Box flexDirection="row">
-          <Box flexDirection="column" width="35%" height={sectionRows} {...border}>
+          <Box flexDirection="row" width="35%" height={sectionRows} {...border}>
+            <Box flexDirection="column" flexGrow={1}>
             {rows.length === 0 && <Text dimColor>(empty)</Text>}
             {win.rows.map(row => (
               <Button
@@ -545,17 +641,25 @@ export const register = (on: On): void => {
                 onPress={() => press($, row)}
               />
             ))}
+            </Box>
+            {bar(scrollbar(rows.length, treeRows, win.offset, treeRows))}
           </Box>
-          <Box flexDirection="column" flexGrow={1} height={sectionRows} {...border}>
+          <Box flexDirection="row" flexGrow={1} height={sectionRows} {...border}>
+            <Box flexDirection="column" flexGrow={1}>
             {preview === undefined && <Text dimColor>Select a file.</Text>}
             {preview?.type === 'text' &&
               preview.lines.map(line => <Text>{line}</Text>)}
             {preview?.type === 'code' && (
               <Code
-                source={clip(preview.source, Math.max(1, treeRows - refLines))}
+                source={clip(
+                  preview.lines
+                    .slice(previewOffset, previewOffset + previewRows)
+                    .join('\n'),
+                  previewRows,
+                )}
                 path={preview.path}
                 language={preview.language}
-                startLine={1}
+                startLine={previewOffset + 1}
                 wrap="truncate-end"
               />
             )}
@@ -575,6 +679,8 @@ export const register = (on: On): void => {
               ),
             )}
             {hidden > 0 && <Text dimColor>+{hidden} more</Text>}
+            </Box>
+            {bar(scrollbar(previewTotal, previewRows, previewOffset, previewRows))}
           </Box>
         </Box>
       </Box>

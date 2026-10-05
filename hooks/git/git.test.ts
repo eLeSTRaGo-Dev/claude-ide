@@ -3,10 +3,12 @@ import { expect, test } from 'claude-code/testing'
 import { BRANCHES, GRAPH, PATCH } from './fixtures'
 import {
   clipDiff,
+  diffLines,
   commitLabel,
   parseBranches,
   parseGraph,
   parseRefs,
+  sliceDiff,
   splitShow,
   trackLabel,
 } from './git'
@@ -76,4 +78,80 @@ test('clipDiff: cut diff keeps hunk counts valid', () => {
   expect(clipDiff(diff, 6).split('\n')[3]).toBe('@@ -1,2 +1,1 @@ ctx')
   expect(clipDiff(diff, 3)).toBe('')
   expect(clipDiff(PATCH, 12)).toContain('@@')
+})
+
+const DIFF = [
+  'diff --git a/x b/x',
+  '--- a/x',
+  '+++ b/x',
+  '@@ -1,3 +1,4 @@ ctx',
+  ' a',
+  '-b',
+  '+c',
+  '+d',
+  ' e',
+  'diff --git a/y b/y',
+  '--- a/y',
+  '+++ b/y',
+  '@@ -10,2 +10,2 @@',
+  '-- q',
+  '+r',
+  ' s',
+].join('\n')
+
+test('sliceDiff: offset 0 is clipDiff, whole diff stays as is', () => {
+  expect(sliceDiff(DIFF, 0, 100)).toBe(DIFF)
+  expect(sliceDiff(DIFF, 0, 6)).toBe(clipDiff(DIFF, 6))
+  expect(sliceDiff(DIFF, 0, 6).split('\n')[3]).toBe('@@ -1,2 +1,1 @@ ctx')
+})
+
+test('sliceDiff: a hunk entered mid-way gets a header of its own', () => {
+  // starts at "-b": old line 2, new line 2; keeps -b +c +d ' e'
+  expect(sliceDiff(DIFF, 5, 4)).toBe(
+    ['@@ -2,2 +2,3 @@ ctx', '-b', '+c', '+d', ' e'].join('\n'),
+  )
+  // cut at both ends
+  expect(sliceDiff(DIFF, 6, 2)).toBe(['@@ -2,0 +2,2 @@ ctx', '+c', '+d'].join('\n'))
+})
+
+test('sliceDiff: file headers only with a hunk after them', () => {
+  // ends inside the second file's header block: nothing of it is kept
+  expect(sliceDiff(DIFF, 3, 8)).toBe(
+    ['@@ -1,3 +1,4 @@ ctx', ' a', '-b', '+c', '+d', ' e'].join('\n'),
+  )
+  // starts at the second file's `diff` line
+  expect(sliceDiff(DIFF, 9, 100)).toBe(DIFF.split('\n').slice(9).join('\n'))
+  // starts inside a header block: its lines are dropped, the hunk kept
+  expect(sliceDiff(DIFF, 10, 100)).toBe(DIFF.split('\n').slice(12).join('\n'))
+  expect(sliceDiff(DIFF, 0, 3)).toBe('')
+  expect(sliceDiff(DIFF, 99, 5)).toBe('')
+  expect(sliceDiff('', 0, 5)).toBe('')
+})
+
+test('sliceDiff: a removed `-- q` line is a body line, not a header', () => {
+  expect(sliceDiff(DIFF, 14, 2)).toBe(['@@ -11,1 +10,2 @@', '+r', ' s'].join('\n'))
+})
+
+test('sliceDiff: fixture slices keep valid hunks', () => {
+  const total = diffLines(PATCH).length
+  for (let offset = 0; offset < total; offset += 7) {
+    const text = sliceDiff(PATCH, offset, 9)
+    const rows = text === '' ? [] : text.split('\n')
+    let i = 0
+    while (i < rows.length) {
+      const m = /^@@ -\d+,(\d+) \+\d+,(\d+) @@/.exec(rows[i] ?? '')
+      if (m === null) {
+        i++
+        continue
+      }
+      let o = 0
+      let n = 0
+      for (i++; i < rows.length && !/^(@@|diff )/.test(rows[i] ?? ''); i++) {
+        const c = (rows[i] ?? '')[0]
+        if (c !== '+') o++
+        if (c !== '-') n++
+      }
+      expect([o, n]).toEqual([Number(m[1]), Number(m[2])])
+    }
+  }
 })
