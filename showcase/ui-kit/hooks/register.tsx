@@ -3,6 +3,7 @@ import type { Register } from 'claude-code'
 import { register as registerChrome } from './chrome'
 import { register as registerComponents } from './components'
 import { register as registerForms } from './forms'
+import { register as registerGit } from './git'
 import { register as registerOverlays } from './overlays'
 import { register as registerWeb } from './web'
 import { register as registerWidgets } from './widgets'
@@ -15,6 +16,7 @@ export const PANES = [
   { id: 'uik-widgets', title: 'Widgets' },
   { id: 'uik-chrome', title: 'Chrome' },
   { id: 'uik-web', title: 'Web' },
+  { id: 'uik-git', title: 'Git' },
 ] as const
 
 export const register: Register = on => {
@@ -37,4 +39,5 @@ export const register: Register = on => {
   registerWidgets(on)
   registerChrome(on)
   registerWeb(on)
+  registerGit(on)
 }

@@ -282,6 +282,7 @@ export type TabsProps = {
   onSelect: (id: string) => void
   style?: 'underline' | 'pill'
   surface?: RenderSurface
+  hotkeys?: Record<string, string> // tab id → hotkey
   keyPrefix?: string // Button keys are `<prefix>:<id>`, default `tab`; unique per drawing
 }
 
@@ -293,7 +294,7 @@ export function Tabs(el: ElementTable, t: Theme, p: TabsProps) {
     return (
       <Box flexDirection="row" gap={1}>
         {p.tabs.map(tab => (
-          <Button key={pre + ':' + tab.id} label={tab.label} variant={tab.id === p.selected ? 'primary' : 'secondary'} onPress={() => p.onSelect(tab.id)} />
+          <Button key={pre + ':' + tab.id} label={tab.label} hotkey={p.hotkeys?.[tab.id]} variant={tab.id === p.selected ? 'primary' : 'secondary'} onPress={() => p.onSelect(tab.id)} />
         ))}
       </Box>
     )
@@ -306,7 +307,7 @@ export function Tabs(el: ElementTable, t: Theme, p: TabsProps) {
 
           return (
             <Box key={pre + ':' + tab.id + ':chrome'} backgroundColor={on ? onDefaultFg(t.accent) : undefined} paddingX={1} hover={on ? undefined : { backgroundColor: onDefaultFg(t.surfaceHover) }}>
-              <Button key={pre + ':' + tab.id} plain label={tab.label} onPress={() => p.onSelect(tab.id)} />
+              <Button key={pre + ':' + tab.id} plain label={tab.label} hotkey={p.hotkeys?.[tab.id]} onPress={() => p.onSelect(tab.id)} />
             </Box>
           )
         })}
@@ -323,7 +324,7 @@ export function Tabs(el: ElementTable, t: Theme, p: TabsProps) {
         return (
           <Box key={pre + ':' + tab.id + ':chrome'} flexDirection="column" hover={on ? undefined : { backgroundColor: onDefaultFg(t.surface) }}>
             <Box paddingX={2} backgroundColor={chromeBg(t)}>
-              <Button key={pre + ':' + tab.id} plain label={tab.label} hover={{ underline: true }} onPress={() => p.onSelect(tab.id)} />
+              <Button key={pre + ':' + tab.id} plain label={tab.label} hotkey={p.hotkeys?.[tab.id]} hover={{ underline: true }} onPress={() => p.onSelect(tab.id)} />
             </Box>
             <Text color={on ? t.accent : t.border}>{(on ? '━' : '─').repeat(w)}</Text>
           </Box>

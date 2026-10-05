@@ -52,6 +52,8 @@ const cleanup = () => {
       try { Deno.removeSync(p) } catch { /* gone */ }
     }
   }
+  // The hook writes the command file; the bridge outlives a killed session, so it removes it too.
+  if (CMD_FILE !== undefined) try { Deno.removeSync(CMD_FILE) } catch { /* gone */ }
 }
 
 let browser: { close: () => Promise<void> } | undefined
