@@ -1,0 +1,6 @@
+{
+  "name": "ide-panes",
+  "version": "0.1.0",
+  "description": "IDE panes: project explorer and git view",
+  "types": "./types/index.d.ts"
+}
