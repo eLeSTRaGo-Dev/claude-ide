@@ -38,9 +38,34 @@ export type EditorProps = {
   isDraft: boolean // the text is a draft: dirty from the start
   ack: string // id of the last message the hook took
   saved: number // seq of the last save the hook wrote
-  command: string // a border Button's action, applied once per `commandSeq`
+  // A border Button's action (an `editor.ts` action, `save`, `overwrite`),
+  // `scroll` (moves the window `by` rows) or `left` (the horizontal bar
+  // dragged: `by` is the first column shown); `scroll` and `left` leave the
+  // cursor where it is. Applied once per `commandSeq`.
+  command: string
   commandSeq: number
-  by: number // rows for `command: 'scroll'`
+  by: number
+}
+
+// The client's horizontal view, posted as `{ hview, version }` whenever one
+// of its numbers changes (an edit, a cursor move, a `left` command, a resize):
+// the Edit section's bar draws from the latest. Columns are the editor's own:
+// one per UTF-16 unit, a tab one cell.
+export type HView = {
+  left: number // the first column shown
+  widest: number // the longest line's length
+  width: number // the text columns (the region less the line-number gutter)
+}
+
+export const parseHView = (data: unknown): HView | undefined => {
+  const d = data as Partial<Record<keyof HView, unknown>> | null
+  if (d === null || typeof d !== 'object') return undefined
+  const { left, widest, width } = d
+  for (const n of [left, widest, width]) {
+    if (typeof n !== 'number' || !Number.isInteger(n) || n < 0) return undefined
+  }
+
+  return { left: left as number, widest: widest as number, width: width as number }
 }
 
 // Chunk size both ways: under the 100,000-char bound of props and posts,

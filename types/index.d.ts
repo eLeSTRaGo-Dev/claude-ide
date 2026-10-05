@@ -6,6 +6,7 @@ export type ExplorerState = {
   cursor?: string // the row the arrows are on (the focus ring)
   offset: number
   previewOffset: number // first preview line shown
+  previewLeft?: number // first preview column shown (horizontal bar); reset with previewOffset
   deleting?: string // the file or dir the delete bar asks about; cleared by its `delete` or `cancel`
   edit?: {
     path: string // the file open in the Edit section
@@ -17,6 +18,7 @@ export type ExplorerState = {
     confirm?: 'select' | 'close' | 'mode' | 'pane' | 'new' // the unsaved-changes bar and what it was asked for
     pending?: string // the path to select (`new`: the dir to name a file in) once the unsaved-changes bar is answered
   }
+  split?: { tree?: number } // dragged Files width as a fraction of the body; absent is 0.35
 }
 
 export type GitState = {
@@ -27,6 +29,8 @@ export type GitState = {
   branchOffset: number // first branch row shown
   detailOffset: number // first diff line shown (Diff Preview)
   infoOffset?: number // first Info line shown
+  infoLeft?: number // first Info column shown (its horizontal bar); 0 when the shown commit changes
+  detailLeft?: number // first Diff Preview column shown (its horizontal bar); 0 when the shown file or commit changes
   collapsed?: string[] // branch folders closed (`l:fix`, `r:origin/team`)
   tab?: 'overview' | 'graph' | 'changelog' // the panel view; absent is `overview`. An old `'changes'` reads as `'changelog'`, any other unknown value as `overview`
   change?: string // path of the selected change

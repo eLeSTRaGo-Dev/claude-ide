@@ -232,12 +232,38 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect(await ui.find({ key: 'row:/proj/src/main.ts' })).toBeUndefined()
 
     await ui.press({ key: 'row:/proj/src' })
+    await ui.press({ key: 'row:/proj/src' })
     expect(await ui.find({ key: 'row:/proj/src/main.ts' })).toBeDefined()
 
     await ui.press({ key: 'row:/proj/src/main.ts' })
     const code = await ui.find({ type: 'Code' })
     expect(code?.text).toContain('answer = 42')
     expect(code?.props.language).toBe('typescript')
+  })
+
+  test(`${surface}: a dir press selects, a press on the selected dir toggles it`, async ($, on) => {
+    mock.store(on)
+    fake(on)
+    await $.session.start(start(surface))
+    const ui = await $.ui.mount({
+      plugin: PLUGIN,
+      surface,
+      component: 'Pane',
+      props: PROPS,
+      requestId: 'ide-explorer',
+      viewport: VIEWPORT,
+    })
+
+    await ui.press({ key: 'row:/proj/src' })
+    expect(await ui.find({ key: 'row:/proj/src/main.ts' })).toBeUndefined()
+    expect(String((await ui.find({ key: 'row:/proj/src' }))?.props.label)).toMatch(/^▸/)
+
+    await ui.press({ key: 'row:/proj/src' })
+    expect(await ui.find({ key: 'row:/proj/src/main.ts' })).toBeDefined()
+    expect(String((await ui.find({ key: 'row:/proj/src' }))?.props.label)).toMatch(/^▾/)
+
+    await ui.press({ key: 'row:/proj/src' })
+    expect(await ui.find({ key: 'row:/proj/src/main.ts' })).toBeUndefined()
   })
 
   test(`${surface}: footer shows dir, branch and change counts`, async ($, on) => {
@@ -343,6 +369,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
       requestId: 'ide-explorer',
       viewport: VIEWPORT,
     })
+    await ui.press({ key: 'row:/proj/src' })
     await ui.press({ key: 'row:/proj/src' })
 
     await $.session.start({ ...start(surface), cwd: CWD + '/src' })
@@ -484,6 +511,8 @@ for (const surface of ['terminal', 'desktop'] as const) {
     })
 
     await ui.press({ key: 'row:/uni/Assets' })
+    await ui.press({ key: 'row:/uni/Assets' })
+    await ui.press({ key: 'row:/uni/Assets/Prefabs' })
     await ui.press({ key: 'row:/uni/Assets/Prefabs' })
     await ui.press({ key: 'row:/uni/Assets/Prefabs/hero.prefab' })
     expect(await ui.find({ type: 'Text', text: /References \(3\)/ })).toBeDefined()
@@ -512,6 +541,7 @@ test('files mode shows no references', async ($, on) => {
     requestId: 'ide-explorer',
     viewport: VIEWPORT,
   })
+  await ui.press({ key: 'row:/proj/src' })
   await ui.press({ key: 'row:/proj/src' })
   await ui.press({ key: 'row:/proj/src/a.prefab' })
   expect(await ui.find({ type: 'Text', text: /References/ })).toBeUndefined()
@@ -637,6 +667,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     on('tool.call', done)
     await $.session.start(start(surface))
     const ui = await mount($)
+    await ui.press({ key: 'row:/proj/src' })
     await ui.press({ key: 'row:/proj/src' })
     expect(await ui.find({ key: 'row:/proj/src/new.ts' })).toBeUndefined()
 
@@ -814,7 +845,123 @@ for (const surface of ['terminal', 'desktop'] as const) {
   })
 }
 
+// `$.store` from a Map the test reads back.
+const memoryStore = (on: On, store: Map<string, unknown>) => {
+  on('store.get', (_$, e) => ({ value: store.get(e.key) }))
+  on('store.set', (_$, e) => {
+    store.set(e.key, e.value)
+
+    return { value: undefined }
+  })
+}
+
 // ------------------------------------------------------------ Edit section
+
+for (const surface of ['terminal', 'desktop'] as const) {
+  const mountMany = async ($: Engine, on: On, store?: Map<string, unknown>) => {
+    if (store === undefined) mock.store(on)
+    else memoryStore(on, store)
+    fake(on, [], [], [], () => '/many2')
+    on('ui.focus', () => ({}))
+    on('ui.scroll', () => ({}))
+    const names = Array.from({ length: 30 }, (_, i) => `h${String(i).padStart(2, '0')}.txt`)
+    TREE['/many2'] = names.map(name => entry(name, 'file'))
+    for (const name of names) FILES['/many2/' + name] = 'x\n'
+    await $.session.start({ cwd: '/many2', surface, isInteractive: true })
+
+    return $.ui.mount({
+      plugin: PLUGIN,
+      surface,
+      component: 'Pane',
+      props: { ...PROPS, scroll: { offset: 0, bodyRows: 12 } },
+      requestId: 'ide-explorer',
+      viewport: VIEWPORT,
+    })
+  }
+  const cellsOf = async (ui: Awaited<ReturnType<typeof mountMany>>) => {
+    const props = (await ui.find({ key: 'split:tree' }))?.props.props as { cells?: number } | undefined
+
+    return props?.cells
+  }
+
+  test(`${surface}: dragging the Files seam widens Files and wheel routing follows`, async ($, on) => {
+    const ui = await mountMany($, on)
+    const keys = async () =>
+      (await ui.findAll({ type: 'Button' }))
+        .map(b => b.key ?? '')
+        .filter(key => key.startsWith('row:'))
+    // 35% of 118 body columns
+    expect(await cellsOf(ui)).toBe(41)
+
+    await ui.pointer({ type: 'down', button: 'left', x: 0, y: 3, in: 'split:tree' })
+    await ui.pointer({ type: 'move', button: 'left', x: 10, y: 3, in: 'split:tree' })
+    expect(await cellsOf(ui)).toBe(51)
+    await ui.pointer({ type: 'up', button: 'left', x: 0, y: 3, in: 'split:tree' })
+    expect(await cellsOf(ui)).toBe(51)
+
+    // a grab on Preview's border (the seam's second cell) drags too
+    await ui.pointer({ type: 'down', button: 'left', x: 1, y: 3, in: 'split:tree' })
+    await ui.pointer({ type: 'move', button: 'left', x: 6, y: 3, in: 'split:tree' })
+    expect(await cellsOf(ui)).toBe(56)
+    // the seam moved under the pointer: the release is where the grab now is
+    await ui.pointer({ type: 'up', button: 'left', x: 1, y: 3, in: 'split:tree' })
+    expect(await cellsOf(ui)).toBe(56)
+
+    // column 50 was Preview, now Files: the wheel moves the tree
+    const first = (await keys())[0]
+    await scroll($, 'ide-explorer', 5, { column: 50, row: 3 })
+    expect((await keys())[0]).not.toBe(first)
+
+    // a drag far left stops at the minimum
+    await ui.pointer({ type: 'down', button: 'left', x: 0, y: 3, in: 'split:tree' })
+    await ui.pointer({ type: 'move', button: 'left', x: -100, y: 3, in: 'split:tree' })
+    expect(await cellsOf(ui)).toBe(12)
+    await ui.pointer({ type: 'up', button: 'left', x: 0, y: 3, in: 'split:tree' })
+  })
+
+  test(`${surface}: a narrow Files cuts long tree labels with … so each row stays one line`, async ($, on) => {
+    const ui = await mountMany($, on)
+    await ui.pointer({ type: 'down', button: 'left', x: 0, y: 3, in: 'split:tree' })
+    await ui.pointer({ type: 'move', button: 'left', x: -100, y: 3, in: 'split:tree' })
+    await ui.pointer({ type: 'up', button: 'left', x: -100, y: 3, in: 'split:tree' })
+    expect(await cellsOf(ui)).toBe(12)
+    const labels = (await ui.findAll({ type: 'Button' }))
+      .filter(b => (b.key ?? '').startsWith('row:'))
+      .map(b => String(b.props.label))
+    expect(labels.length > 0).toBe(true)
+    // 12 columns: frame 2, vertical bar 1, mark 1, so 8 for '  h00.txt'
+    for (const label of labels) {
+      expect(label.length).toBe(8)
+      expect(label.endsWith('…')).toBe(true)
+      expect(label.includes('\n')).toBe(false)
+    }
+    expect(labels[0]).toBe('  h00.t…')
+  })
+
+  test(`${surface}: a Files seam drag writes layout:explorer on release only`, async ($, on) => {
+    const store = new Map<string, unknown>()
+    const ui = await mountMany($, on, store)
+    await ui.pointer({ type: 'down', button: 'left', x: 0, y: 3, in: 'split:tree' })
+    await ui.pointer({ type: 'move', button: 'left', x: 10, y: 3, in: 'split:tree' })
+    expect(await cellsOf(ui)).toBe(51)
+    expect(store.has('layout:explorer')).toBe(false)
+    await ui.pointer({ type: 'up', button: 'left', x: 0, y: 3, in: 'split:tree' })
+    const saved = store.get('layout:explorer') as { tree?: number }
+    expect(Math.round((saved.tree ?? 0) * 118)).toBe(51)
+  })
+
+  test(`${surface}: session.start restores a stored layout:explorer`, async ($, on) => {
+    const ui = await mountMany($, on, new Map<string, unknown>([['layout:explorer', { tree: 0.5 }]]))
+    // 50% of 118 body columns
+    expect(await cellsOf(ui)).toBe(59)
+  })
+
+  for (const value of ['x', { tree: 7 }])
+    test(`${surface}: a garbage layout:explorer (${JSON.stringify(value)}) falls back to the default`, async ($, on) => {
+      const ui = await mountMany($, on, new Map<string, unknown>([['layout:explorer', value]]))
+      expect(await cellsOf(ui)).toBe(41)
+    })
+}
 
 // A root of one dir with the given files; mounts the pane, selects the first
 // file and opens the editor on it.
@@ -867,6 +1014,8 @@ for (const surface of ['terminal', 'desktop'] as const) {
     const { ui, settle, text, title } = await editing($, on, surface, '/ed1', { 'a.ts': 'one\ntwo\n' })
     expect(await text()).toContain('one')
     expect(await title()).toBe(' Edit ')
+    // the Files seam is drawn beside the Edit section too
+    expect(await ui.find({ key: 'split:tree' })).toBeDefined()
 
     await ui.key({ key: 'x', in: 'editor' })
     await settle()
@@ -1016,6 +1165,108 @@ for (const surface of ['terminal', 'desktop'] as const) {
       expect((await text()).match(/one/g)).toHaveLength(2)
     },
   )
+
+  test(`${surface}: the Edit section's horizontal bar drags the view, the cursor still scrolls it`, async ($, on) => {
+    const long = Array.from({ length: 300 }, (_, i) => String.fromCharCode(97 + (i % 26))).join('')
+    const { ui, settle, text } = await editing($, on, surface, '/ed9', { 'a.txt': long + '\nshort\n' })
+    const firstRow = async () => (await text()).split('\n')[0]!
+    const barProps = async () =>
+      (await ui.find({ key: 'hb:edit' }))?.props.props as {
+        total: number
+        visible: number
+        offset: number
+        height: number
+      }
+
+    // 3 lines: a 2-cell gutter, so 58 text columns of the 60
+    expect(await ui.find({ key: 'hb:edit' })).toBeDefined()
+    const props = await barProps()
+    expect(props.total).toBe(301) // the widest line and the caret cell past its end
+    expect(props.visible).toBe(58)
+    expect(props.offset).toBe(0)
+    expect(await firstRow()).toBe('1 ' + long.slice(0, 58))
+    // the border Buttons on the top border are still there
+    expect(await ui.find({ key: 'edit:save' })).toBeDefined()
+
+    // a drag: the client gets `left`, the rows start at that column
+    const width = props.height
+    await ui.resize({ columns: width, rows: 1, in: 'hb:edit' })
+    const thumb = Math.round((width * props.visible) / props.total)
+    const free = width - thumb
+    const span = props.total - props.visible
+    await ui.pointer({ type: 'down', x: 0, y: 0, button: 'left', in: 'hb:edit' })
+    await ui.pointer({ type: 'move', x: 10, y: 0, button: 'left', in: 'hb:edit' })
+    await ui.pointer({ type: 'up', x: 10, y: 0, button: 'left', in: 'hb:edit' })
+    await settle()
+    const mid = Math.round((10 / free) * span)
+    expect(mid > 0).toBe(true)
+    expect(await firstRow()).toBe('1 ' + long.slice(mid, mid + 58))
+    expect((await barProps()).offset).toBe(mid)
+
+    // the cursor did not move: typing lands at column 0, and the view follows
+    // the cursor (now at column 1) back as it always has
+    await ui.key({ key: 'X', shift: true, in: 'editor' })
+    await settle()
+    expect(await firstRow()).toBe('1 ' + long.slice(0, 58))
+    expect((await barProps()).total).toBe(302)
+    expect((await barProps()).offset).toBe(1)
+    await ui.key({ key: 'home', in: 'editor' })
+    await settle()
+    expect(await firstRow()).toBe('1 X' + long.slice(0, 57))
+    expect((await barProps()).offset).toBe(0)
+
+    // the cursor past the right edge scrolls the view as before
+    await ui.key({ key: 'end', in: 'editor' })
+    await settle()
+    const left = 301 - 58 + 1
+    expect(await firstRow()).toBe('1 ' + ('X' + long).slice(left) + ' ')
+    expect((await barProps()).offset).toBe(left)
+
+    // the widest line deleted: every line is measured again, all fits, no bar
+    await ui.press({ key: 'edit:deleteLines' })
+    await settle()
+    expect(await ui.find({ key: 'hb:edit' })).toBeUndefined()
+  })
+
+  test(`${surface}: a short file draws no horizontal bar in the Edit section`, async ($, on) => {
+    const { ui, text } = await editing($, on, surface, '/ed10', { 'a.ts': 'one\ntwo\n' })
+    expect(await text()).toContain('one')
+    expect(await ui.find({ key: 'hb:edit' })).toBeUndefined()
+  })
+
+  test(`${surface}: a line exactly as wide as the view, caret at its end: a bar to drag back`, async ($, on) => {
+    const line = 'a'.repeat(57) + 'z'
+    const { ui, settle, text } = await editing($, on, surface, '/ed11', { 'a.txt': line + '\nb\n' })
+    const firstRow = async () => (await text()).split('\n')[0]!
+    const barProps = async () =>
+      (await ui.find({ key: 'hb:edit' }))?.props.props as { total: number; visible: number; offset: number; height: number }
+    // 58 columns, 58 text columns, plus the caret cell past the end: a bar
+    expect((await barProps()).total).toBe(59)
+    expect((await barProps()).offset).toBe(0)
+    await ui.key({ key: 'end', in: 'editor' })
+    await settle()
+    // the caret cell past the end scrolled the view one column: a bar shows it
+    expect((await barProps()).total).toBe(59)
+    expect((await barProps()).offset).toBe(1)
+    const width = (await barProps()).height
+    await ui.resize({ columns: width, rows: 1, in: 'hb:edit' })
+    // dragged fully left: back to column 0, shown at once on release
+    await ui.pointer({ type: 'down', x: width - 1, y: 0, button: 'left', in: 'hb:edit' })
+    await ui.pointer({ type: 'move', x: -100, y: 0, button: 'left', in: 'hb:edit' })
+    await ui.pointer({ type: 'up', x: -100, y: 0, button: 'left', in: 'hb:edit' })
+    expect((await barProps()).offset).toBe(0)
+    await settle()
+    expect((await barProps()).offset).toBe(0)
+    expect(await firstRow()).toBe('1 ' + line)
+    // dragged fully right: where End put the view
+    await ui.pointer({ type: 'down', x: 0, y: 0, button: 'left', in: 'hb:edit' })
+    await ui.pointer({ type: 'move', x: 100, y: 0, button: 'left', in: 'hb:edit' })
+    await ui.pointer({ type: 'up', x: 100, y: 0, button: 'left', in: 'hb:edit' })
+    expect((await barProps()).offset).toBe(1)
+    await settle()
+    expect((await barProps()).offset).toBe(1)
+    expect(await firstRow()).toBe('1 ' + line.slice(1) + ' ')
+  })
 }
 
 test('vscode: no Client, so no edit button', async ($, on) => {
@@ -1118,6 +1369,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     const { ui } = await naming($, on, surface, '/nf3-' + surface)
     await ui.press({ key: 'new' })
     expect((await ui.find({ key: 'new-file' }))?.props.label).toBe('new file in ./')
+    await ui.press({ key: `row:/nf3-${surface}/src` })
     await ui.press({ key: `row:/nf3-${surface}/src` })
     await ui.press({ key: `row:/nf3-${surface}/src/x.ts` })
     await ui.press({ key: 'new' })
@@ -1249,6 +1501,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     const root = '/del2-' + surface
     const { ui, bar, rms } = await deleting($, on, surface, root)
     await ui.press({ key: `row:${root}/src` })
+    await ui.press({ key: `row:${root}/src` })
     expect(await ui.find({ key: `row:${root}/src/x.ts` })).toBeDefined()
 
     await ui.press({ key: 'delete' })
@@ -1349,6 +1602,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
       viewport: VIEWPORT,
     })
     await ui.press({ key: `row:${root}/Assets` })
+    await ui.press({ key: `row:${root}/Assets` })
     await ui.press({ key: `row:${root}/Assets/a.png` })
     await ui.press({ key: 'delete' })
     expect((await ui.find({ type: 'Text', text: /^Delete / }))?.text).toBe('Delete a.png? + .meta')
@@ -1358,5 +1612,103 @@ for (const surface of ['terminal', 'desktop'] as const) {
     ])
     expect(FILES[root + '/Assets/a.png.meta']).toBeUndefined()
     expect(await ui.find({ key: `row:${root}/Assets/b.png` })).toBeDefined()
+  })
+}
+
+for (const surface of ['terminal', 'desktop'] as const) {
+  test(`${surface}: Preview's horizontal bar drags the code sideways, a new file starts at column 0`, async ($, on) => {
+    mock.store(on)
+    fake(on, [], [], [], () => '/wide')
+    on('ui.focus', () => ({}))
+    const long = Array.from({ length: 300 }, (_, i) => String.fromCharCode(97 + (i % 26))).join('')
+    TREE['/wide'] = [entry('a.txt', 'file'), entry('b.txt', 'file')]
+    FILES['/wide/a.txt'] = long + '\nshort\n'
+    FILES['/wide/b.txt'] = 'tiny\n'
+    await $.session.start({ cwd: '/wide', surface, isInteractive: true })
+    const ui = await $.ui.mount({
+      plugin: PLUGIN,
+      surface,
+      component: 'Pane',
+      props: PROPS,
+      requestId: 'ide-explorer',
+      viewport: VIEWPORT,
+    })
+    const source = async () => String((await ui.find({ type: 'Code' }))?.props.source ?? '')
+    const startLine = async () => (await ui.find({ type: 'Code' }))?.props.startLine
+
+    // a short file: everything fits, no bar
+    await ui.press({ key: 'row:/wide/b.txt' })
+    expect(await source()).toBe('tiny')
+    expect(await ui.find({ key: 'hb:preview' })).toBeUndefined()
+
+    // the 300-column line overflows: the bar is drawn, the thumb at the left
+    await ui.press({ key: 'row:/wide/a.txt' })
+    expect(await ui.find({ key: 'hb:preview' })).toBeDefined()
+    expect((await source()).startsWith(long)).toBe(true)
+    const bar = async () => (await ui.findAll({ type: 'Text', in: 'hb:preview' })).map(t => t.text).join('')
+    expect((await bar()).startsWith('━')).toBe(true)
+
+    // a drag moves the first column shown; the line numbers stay
+    const props = (await ui.find({ key: 'hb:preview' }))?.props.props as {
+      total: number
+      visible: number
+      height: number
+    }
+    expect(props.total).toBe(300)
+    const width = props.height
+    await ui.resize({ columns: width, rows: 1, in: 'hb:preview' })
+    const thumb = Math.round((width * props.visible) / props.total)
+    const free = width - thumb
+    const span = props.total - props.visible
+    await ui.pointer({ type: 'down', x: 0, y: 0, button: 'left', in: 'hb:preview' })
+    await ui.pointer({ type: 'move', x: 10, y: 0, button: 'left', in: 'hb:preview' })
+    const mid = Math.round((10 / free) * span)
+    expect(mid > 0).toBe(true)
+    expect((await source()).startsWith(long.slice(mid, mid + 20))).toBe(true)
+    expect(await startLine()).toBe(1)
+    await ui.pointer({ type: 'up', x: free, y: 0, button: 'left', in: 'hb:preview' })
+    expect((await source()).split('\n')[0]).toBe(long.slice(span))
+    expect((await bar()).endsWith('━')).toBe(true)
+    expect(await startLine()).toBe(1)
+
+    // another file, then back: the slice starts at column 0 again
+    await ui.press({ key: 'row:/wide/b.txt' })
+    expect(await source()).toBe('tiny')
+    await ui.press({ key: 'row:/wide/a.txt' })
+    expect((await source()).startsWith(long)).toBe(true)
+  })
+
+  test(`${surface}: a text preview scrolled past a line's end keeps that line's row`, async ($, on) => {
+    mock.store(on)
+    fake(on, [], [], [], () => '/wide2')
+    on('ui.focus', () => ({}))
+    const long = 'd'.repeat(200)
+    TREE['/wide2'] = [entry(long, 'dir')]
+    TREE['/wide2/' + long] = [entry('x.txt', 'file')]
+    await $.session.start({ cwd: '/wide2', surface, isInteractive: true })
+    const ui = await $.ui.mount({
+      plugin: PLUGIN,
+      surface,
+      component: 'Pane',
+      props: PROPS,
+      requestId: 'ide-explorer',
+      viewport: VIEWPORT,
+    })
+    const lines = async () =>
+      (await ui.findAll({ type: 'Text' })).filter(t => t.props.wrap === 'truncate-end').map(t => t.text)
+    await ui.press({ key: 'row:/wide2/' + long })
+    expect(await lines()).toContain('1 entries')
+    const count = (await lines()).length
+    const props = (await ui.find({ key: 'hb:preview' }))?.props.props as { height: number }
+    const width = props.height
+    await ui.resize({ columns: width, rows: 1, in: 'hb:preview' })
+    await ui.pointer({ type: 'down', x: 0, y: 0, button: 'left', in: 'hb:preview' })
+    await ui.pointer({ type: 'move', x: 1000, y: 0, button: 'left', in: 'hb:preview' })
+    await ui.pointer({ type: 'up', x: 1000, y: 0, button: 'left', in: 'hb:preview' })
+    // the dir's name is cut to its tail; the short lines are a blank row each
+    const after = await lines()
+    expect(after).not.toContain('1 entries')
+    expect(after.length).toBe(count)
+    expect(after.filter(t => t === ' ').length).toBe(2)
   })
 }

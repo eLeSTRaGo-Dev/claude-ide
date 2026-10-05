@@ -29,7 +29,7 @@ import type { EditorProps } from './edit'
 // The Edit section's surface module: holds the buffer, maps keys and the
 // pointer to `editor.ts` ops and draws the visible rows. The hooks module
 // (index.tsx) owns the file: text arrives in chunks through props, and every
-// message back (`need`, `dirty`, draft and save chunks, `copy`) waits in an
+// message back (`need`, `dirty`, `hview`, draft and save chunks, `copy`) waits in an
 // outbox until the props ack it, resent every 1.2 s.
 
 type Outgoing = { id: string; data: { [key: string]: JsonValue }; sentAt?: number }
@@ -49,6 +49,11 @@ type Cells = {
   isDirty: boolean
   top: number
   left: number
+  // Length of the longest line in the editor's columns (one per UTF-16 unit,
+  // a tab one cell, as drawn below): the horizontal bar's total.
+  widest: number
+  // The `hview` last queued, so an unchanged view is not sent again.
+  hview?: { left: number; widest: number; width: number }
   drag?: number // the cursor index a held pointer extends
   outbox: Outgoing[]
   tick: number
@@ -73,6 +78,34 @@ const columnsOf = (surface: ClientSurface<State>, cells: Cells): number =>
   Math.max(1, surface.columns > 0 ? surface.columns : cells.props.columns)
 
 const gutterOf = (buffer: Buffer): number => String(buffer.lines.length).length + 1
+
+// Text columns: the region less the line-number gutter.
+const widthOf = (surface: ClientSurface<State>, cells: Cells, buffer: Buffer): number =>
+  Math.max(1, columnsOf(surface, cells) - gutterOf(buffer))
+
+const widestOf = (lines: readonly string[], from = 0, to = lines.length): number => {
+  let most = 0
+  for (let i = from; i < to; i++) most = Math.max(most, lines[i]!.length)
+
+  return most
+}
+
+// `widest` after the lines `was` became `next`: the changed run is what lies
+// between the common head and tail (unchanged lines keep their string, so the
+// scan is mostly reference compares). Every line is measured again only when
+// a widest line left that run and nothing as wide came in.
+const widestAfter = (widest: number, was: readonly string[], next: readonly string[]): number => {
+  const shorter = Math.min(was.length, next.length)
+  let head = 0
+  while (head < shorter && was[head] === next[head]) head++
+  let tail = 0
+  while (tail < shorter - head && was[was.length - 1 - tail] === next[next.length - 1 - tail]) tail++
+  const added = widestOf(next, head, next.length - tail)
+  if (added >= widest) return added
+  if (widestOf(was, head, was.length - tail) < widest) return widest
+
+  return widestOf(next)
+}
 
 // --------------------------------------------------------------- outbox
 
@@ -126,6 +159,17 @@ const markDirty = (surface: ClientSurface<State>, cells: Cells, isNow: boolean):
   send(surface, cells, { dirty: isNow, version: cells.version ?? -1 }, d => 'dirty' in d)
 }
 
+// Tells the hook the horizontal view (the Edit section's bar) when it changed:
+// the first column shown, the longest line and the text columns.
+const syncView = (surface: ClientSurface<State>, cells: Cells, width: number): void => {
+  if (cells.buffer === undefined || cells.version === undefined) return
+  const was = cells.hview
+  if (was !== undefined && was.left === cells.left && was.widest === cells.widest && was.width === width) return
+  const hview = { left: cells.left, widest: cells.widest, width }
+  cells.hview = hview
+  send(surface, cells, { hview, version: cells.version }, d => 'hview' in d)
+}
+
 // ----------------------------------------------------------------- props
 
 // New props: take a chunk, an ack, a save mark or a command. Mutates the
@@ -144,6 +188,7 @@ const take = (surface: ClientSurface<State>, cells: Cells, props: EditorProps): 
     cells.isDirty = false
     cells.isDraftDue = false
     cells.outbox = []
+    cells.hview = undefined
     cells.loading = { version: props.version, parts: [] }
     send(surface, cells, { need: 0, version: props.version })
   }
@@ -175,6 +220,7 @@ const take = (surface: ClientSurface<State>, cells: Cells, props: EditorProps): 
       cells.original = props.isDraft ? '\0' : text
       cells.top = 0
       cells.left = 0
+      cells.widest = widestOf(cells.buffer.lines)
       cells.isDirty = props.isDraft
       cells.commandSeq = props.commandSeq
       // `need: total` lets the hook drop the text from the props; the dirty
@@ -212,7 +258,7 @@ const follow = (surface: ClientSurface<State>, cells: Cells): void => {
   if (buffer === undefined) return
   const head = buffer.cursors[buffer.cursors.length - 1]!.head
   const rows = rowsOf(surface, cells)
-  const width = Math.max(1, columnsOf(surface, cells) - gutterOf(buffer))
+  const width = widthOf(surface, cells, buffer)
   if (head.line < cells.top) cells.top = head.line
   else if (head.line >= cells.top + rows) cells.top = head.line - rows + 1
   if (head.col < cells.left) cells.left = head.col
@@ -225,6 +271,7 @@ const apply = (surface: ClientSurface<State>, cells: Cells, next: Buffer): void 
   const was = cells.buffer
   cells.buffer = next
   if (was !== undefined && was.lines !== next.lines) {
+    cells.widest = widestAfter(cells.widest, was.lines, next.lines)
     cells.idle = 0
     cells.isDraftDue = true
     markDirty(surface, cells, isDirty(next, cells.original))
@@ -253,6 +300,11 @@ const run = (surface: ClientSurface<State>, cells: Cells, command: string, by: n
   } else if (command === 'scroll' && cells.buffer !== undefined) {
     const max = Math.max(0, cells.buffer.lines.length - rowsOf(surface, cells))
     cells.top = Math.min(Math.max(0, cells.top + by), max)
+  } else if (command === 'left' && cells.buffer !== undefined) {
+    // The horizontal bar dragged: the view moves, the cursor stays. The caret
+    // cell past a line's end counts (End puts the view there), as in the bar.
+    const max = Math.max(0, cells.widest + 1 - widthOf(surface, cells, cells.buffer))
+    cells.left = Math.min(Math.max(0, Math.round(by)), max)
   } else if ((ACTIONS as readonly string[]).includes(command)) {
     act(surface, cells, command as Action)
   }
@@ -363,6 +415,7 @@ const Editor: ClientModule<EditorProps, State> = (props, surface) => {
       isDirty: false,
       top: 0,
       left: 0,
+      widest: 0,
       outbox: [],
       tick: 0,
       idle: 0,
@@ -396,7 +449,10 @@ const Editor: ClientModule<EditorProps, State> = (props, surface) => {
   }
   const rows = rowsOf(surface, cells)
   const gutter = gutterOf(buffer)
-  const width = Math.max(1, columnsOf(surface, cells) - gutter)
+  const width = widthOf(surface, cells, buffer)
+  // Every change to the view (an edit, a move, a resize) ends in a drawing:
+  // the bar's numbers go out from here.
+  syncView(surface, cells, width)
   const top = Math.min(cells.top, Math.max(0, buffer.lines.length - 1))
   const shown = buffer.lines.slice(top, top + rows)
 

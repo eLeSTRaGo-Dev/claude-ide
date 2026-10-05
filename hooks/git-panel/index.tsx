@@ -4,8 +4,9 @@ import type { EngineInterface, Register } from 'claude-code'
 import type { GitState } from '../../types'
 import { window as windowOf } from '../explorer-panel/tree'
 import { borderOf } from '../shared/color'
-import { scrollbar } from '../shared/scrollbar'
-import { fractionOf, splitAt } from '../shared/split'
+import { sliceCols, sliceDiffCols, widest } from '../shared/hscroll'
+import { H_THUMB, H_TRACK, scrollbar } from '../shared/scrollbar'
+import { dragTo, layoutOf, splitAt } from '../shared/split'
 import {
   GIT_PANE,
   branchTree,
@@ -26,6 +27,8 @@ import {
   graphColumns,
   maxLanesFor,
   isUntracked,
+  diffBody,
+  diffGutter,
   diffLines,
   infoHead,
   layoutGraph,
@@ -124,6 +127,15 @@ const showCache = new Map<string, { head: string[]; diff: string }>()
 const diffCache = new Map<string, { files: Change[]; patch: string }>()
 const changeCache = new Map<string, { head: string[]; diff: string }>()
 let hasHead: boolean | undefined
+// Diff Preview's body width (Code's gutter + widest body line) for the last
+// diff measured: one entry keyed by the diff string, so a redraw of the same
+// diff (wheel ticks, drags) does not walk the whole, uncapped patch again.
+let diffWidth: { diff: string; cols: number } | undefined
+const diffWidthOf = (diff: string): number => {
+  if (diffWidth?.diff !== diff) diffWidth = { diff, cols: diffGutter(diff) + widest(diffBody(diff)) }
+
+  return diffWidth.cols
+}
 // Rows the graph and the Files list show; set by render, read by the focus hook.
 let graphRows = 20
 // Commit rows of each tab, so a tab switch can window the list for the tab it goes to.
@@ -133,7 +145,8 @@ let changeRoom = 20
 // each section sits (Overview: columns split at `branchEnd`, the right column's
 // rows at `infoTop`; Change Log: columns split at `filesEnd`), each section's
 // furthest offset (`filesMax`: the Files list of Change Log or the diff view) and
-// the rows Info and Diff Preview show.
+// the rows Info and Diff Preview show, and their furthest first column (the
+// horizontal bars).
 const view = {
   columns: 0, // the totals the splitters divide: the body's columns, the sections' rows
   area: 0,
@@ -147,6 +160,8 @@ const view = {
   detailMax: 0,
   detailRows: 1,
   infoRows: 1,
+  infoLeftMax: 0,
+  detailLeftMax: 0,
 }
 
 // The splitters' messages: which `split` fraction each sets, and its axis.
@@ -155,6 +170,21 @@ const SEAMS = {
   'split:info': { key: 'info', axis: 'y', min: MIN_ROWS },
   'split:files': { key: 'files', axis: 'x', min: MIN_COLS },
 } as const
+
+// The section sizes, global (every repo): the whole `split` object, written
+// when a splitter drag ends. Git has no session.start (one per plugin) and a
+// render may not write `$.state`, so the render reads the store once per load
+// while `split` is unset and keeps it here: the draw's fallback under
+// `state.split`, and the base the first drag merges into. Both reset on
+// reload, harmlessly, as `$.state` keeps the session's own sizes.
+const LAYOUT_KEY = 'layout:git'
+let layoutLoaded = false
+let storedLayout: GitState['split']
+
+const loadLayout = async ($: EngineInterface): Promise<void> => {
+  storedLayout = layoutOf(await $.store.get(LAYOUT_KEY), ['side', 'info', 'files']) as GitState['split']
+  layoutLoaded = true
+}
 
 const clamp = (value: number, max: number): number =>
   Math.min(Math.max(0, value), Math.max(0, max))
@@ -467,6 +497,7 @@ export const register = (on: On): void => {
           selected: sha,
           offset: win.offset,
           infoOffset: s.selected === sha ? s.infoOffset : 0,
+          infoLeft: s.selected === sha ? s.infoLeft : 0,
         }))
       }
     }
@@ -487,6 +518,7 @@ export const register = (on: On): void => {
           change: path,
           changeOffset: win.offset,
           detailOffset: s.change === path ? s.detailOffset : 0,
+          detailLeft: s.change === path ? s.detailLeft : 0,
         }))
       }
     }
@@ -507,6 +539,7 @@ export const register = (on: On): void => {
           diffFile: path,
           diffFileOffset: win.offset,
           detailOffset: s.diffFile === path ? s.detailOffset : 0,
+          detailLeft: s.diffFile === path ? s.detailLeft : 0,
         }))
       }
     }
@@ -568,8 +601,8 @@ export const register = (on: On): void => {
         )
         await update($, git, s =>
           isDiff
-            ? { ...s, diffFile: path, diffFileOffset: win.offset, detailOffset: 0 }
-            : { ...s, change: path, changeOffset: win.offset, detailOffset: 0 },
+            ? { ...s, diffFile: path, diffFileOffset: win.offset, detailOffset: 0, detailLeft: 0 }
+            : { ...s, change: path, changeOffset: win.offset, detailOffset: 0, detailLeft: 0 },
         )
         await $.ui.focus({ requestId: PANE, key: (isDiff ? 'dfile:' : 'change:') + path })
       }
@@ -589,6 +622,7 @@ export const register = (on: On): void => {
           selected: sha,
           offset: win.offset,
           infoOffset: 0,
+          infoLeft: 0,
         }))
         await $.ui.focus({ requestId: PANE, key: 'commit:' + sha })
       }
@@ -615,7 +649,7 @@ export const register = (on: On): void => {
 
   // A scrollbar dragged: the window moves, the selection stays (as the wheel).
   on('ui.message', { requestId: PANE }, async ($, e) => {
-    const data = e.data as { offset?: unknown; start?: unknown; delta?: unknown } | null
+    const data = e.data as { offset?: unknown; start?: unknown; delta?: unknown; done?: unknown } | null
     const seam = SEAMS[e.element as keyof typeof SEAMS]
     if (seam !== undefined) {
       // A splitter dragged: the section's new size is where it started plus
@@ -625,12 +659,13 @@ export const register = (on: On): void => {
       if (!Number.isFinite(start) || !Number.isFinite(delta)) return {}
       const total = seam.axis === 'x' ? view.columns : view.area
       if (total <= 0) return {}
-      const cells = splitAt(total, fractionOf(Math.round(start + delta), total), seam.min)
-      const fraction = fractionOf(cells, total)
-      await update($, git, s => ({
+      const fraction = dragTo(total, start, delta, seam.min)
+      const after = await update($, git, s => ({
         ...s,
-        split: { ...s.split, [seam.key]: seam.key === 'info' ? 1 - fraction : fraction },
+        split: { ...(s.split ?? storedLayout), [seam.key]: seam.key === 'info' ? 1 - fraction : fraction },
       }))
+      // The drag ended: the sizes outlive the session (mid-drag moves don't write).
+      if (data?.done === true) await $.store.set(LAYOUT_KEY, after.split ?? {})
       $.ui.invalidate('ui.render')
 
       return {}
@@ -644,6 +679,8 @@ export const register = (on: On): void => {
       'sb:changes': ['changeOffset', view.filesMax],
       'sb:dfiles': ['diffFileOffset', view.filesMax],
       'sb:details': ['detailOffset', view.detailMax],
+      'hb:info': ['infoLeft', view.infoLeftMax],
+      'hb:details': ['detailLeft', view.detailLeftMax],
     } as const
     const part = parts[e.element as keyof typeof parts]
     if (part === undefined) return {}
@@ -659,6 +696,7 @@ export const register = (on: On): void => {
     const { Box, Text, Button, Code } = elements
     const Client = 'Client' in elements ? elements.Client : undefined
     const state = await read($, git)
+    if (state.split === undefined && !layoutLoaded) await loadLayout($)
     const cwd = await $.session.root()
     const before = threw
     const root = await rootOf($, cwd)
@@ -702,7 +740,7 @@ export const register = (on: On): void => {
     // default fraction. Fixed cell widths (not percentages) so labels,
     // hit-testing and the drawn columns agree.
     // Branches' width (Overview).
-    const split = state.split ?? {}
+    const split = state.split ?? storedLayout ?? {}
     const sideCols = splitAt(columns, split.side ?? (isWide ? SPLIT.sideWide : SPLIT.sideNarrow), MIN_COLS)
     // Commits' height; Info takes the rest of the right column (Overview).
     const topRows = Math.max(3, splitAt(area, 1 - (split.info ?? SPLIT.info), MIN_ROWS))
@@ -778,11 +816,28 @@ export const register = (on: On): void => {
     const infoMax = Math.max(0, infoAll.length - infoInner)
     const infoOffset = clamp(state.infoOffset ?? 0, infoMax)
     const infoShown = infoAll.slice(infoOffset, infoOffset + infoInner)
+    // Info's columns, past the frame and the vertical bar, scrolled by `infoLeft`.
+    const infoCols = Math.max(1, rightCols - 3)
+    const infoWide = widest(infoAll)
+    const infoLeftMax = Math.max(0, infoWide - infoCols)
+    const infoLeft = clamp(state.infoLeft ?? 0, infoLeftMax)
     // Diff Preview: a few head lines, then the diff windowed by `detailOffset`.
     const headRows = Math.max(6, Math.floor(fullInner / 2))
     const previewHead = isFiles && details !== undefined ? details.head.slice(0, headRows) : []
     const diffRows = Math.max(1, fullInner - previewHead.length)
     const diffTotal = isFiles && details !== undefined ? diffLines(details.diff).length : 0
+    // Diff Preview's columns, past the frame and the vertical bar, scrolled by
+    // `detailLeft`. Measured over the whole diff, not the window, so the thumb
+    // keeps its size while the diff scrolls. A body line sits after Code's
+    // gutter, so it needs the gutter's columns more; head lines have none.
+    const previewCols = columns - filesCols
+    const detailCols = Math.max(1, previewCols - 3)
+    const detailWide =
+      isFiles && details !== undefined
+        ? Math.max(widest(previewHead), diffWidthOf(details.diff))
+        : 0
+    const detailLeftMax = Math.max(0, detailWide - detailCols)
+    const detailLeft = clamp(state.detailLeft ?? 0, detailLeftMax)
     const head0 = branches.find(branch => branch.isHead)
     const branchRoom = Math.max(2, fullInner - 1)
     const tree = branchTree(branches, new Set(state.collapsed ?? []))
@@ -797,6 +852,8 @@ export const register = (on: On): void => {
     view.graphMax = Math.max(0, lines.length - graphRows)
     view.infoMax = infoMax
     view.infoRows = infoInner
+    view.infoLeftMax = infoLeftMax
+    view.detailLeftMax = detailLeftMax
     view.filesMax = Math.max(0, frows.length - changeRoom)
     view.detailMax = Math.max(0, diffTotal - diffRows)
     view.detailRows = diffRows
@@ -842,12 +899,52 @@ export const register = (on: On): void => {
         </Box>
       )
 
+    // A horizontal bar over a text section's bottom border: an absolute Box at
+    // `top` (that border's row) in the section's unbordered wrapper, drawn after
+    // the frame so it paints over it, `width` columns from the corner (the
+    // right corner stays). Draggable on surfaces that draw a `Client`, a Text
+    // row elsewhere; nothing while every line fits.
+    const hbar = (
+      key: string,
+      total: number,
+      visible: number,
+      offset: number,
+      top: number,
+      width: number,
+    ) =>
+      total <= visible || width <= 0 ? null : (
+        <Box position="absolute" top={top} left={1} flexDirection="row">
+          {Client === undefined ? (
+            scrollbar(total, visible, offset, width, { thumb: H_THUMB, track: H_TRACK }).map((cell, i) =>
+              cell === H_THUMB ? (
+                <Text key={'hbar:' + i} color={border.borderColor}>
+                  {cell}
+                </Text>
+              ) : (
+                <Text key={'hbar:' + i} dimColor>
+                  {cell}
+                </Text>
+              ),
+            )
+          ) : (
+            <Client
+              key={key}
+              module="../shared/scrollbar-client.tsx"
+              props={{ axis: 'x', total, visible, offset, height: width, color: border.borderColor }}
+              width={width}
+              height={1}
+            />
+          )}
+        </Box>
+      )
+
     const select = (ref: string) =>
       update($, git, s => ({
         ...s,
         ref,
         offset: 0,
         infoOffset: 0,
+        infoLeft: 0,
         selected: undefined,
         limit: PAGE,
       }))
@@ -878,7 +975,9 @@ export const register = (on: On): void => {
         diffFile: undefined,
         diffFileOffset: 0,
         detailOffset: 0,
+        detailLeft: 0,
         infoOffset: 0,
+        infoLeft: 0,
         ...(to === 'changelog' ? { changeOffset: 0 } : { offset: offsetFor(s, to) }),
       }))
 
@@ -889,10 +988,12 @@ export const register = (on: On): void => {
         ...s,
         selected: sha,
         infoOffset: s.selected === sha ? s.infoOffset : 0,
+        infoLeft: s.selected === sha ? s.infoLeft : 0,
         diff: sha,
         diffFile: undefined,
         diffFileOffset: 0,
         detailOffset: 0,
+        detailLeft: 0,
       }))
     const closeDiff = () =>
       update($, git, s => ({
@@ -901,6 +1002,7 @@ export const register = (on: On): void => {
         diffFile: undefined,
         diffFileOffset: 0,
         detailOffset: 0,
+        detailLeft: 0,
       }))
 
     const toggleChange = (key: string) =>
@@ -931,9 +1033,12 @@ export const register = (on: On): void => {
       </Box>
     )
 
-    // A Client on the seam, over the first section's last row or column (the
-    // frame's border), in an unbordered wrapper like the titles; surfaces
-    // without `Client` keep the plain border.
+    // A Client on the seam, two cells across: the first section's last column
+    // or row and the second's first (both frames' borders), so the seam takes
+    // a grab from either side. Drawn last in the container holding both
+    // sections, so it paints over both borders; `left`/`top` are relative to
+    // that container and name the first section's border. `length` stops short
+    // of the frames' corners. Surfaces without `Client` keep the plain borders.
     const splitter = (
       key: keyof typeof SEAMS,
       axis: 'x' | 'y',
@@ -941,15 +1046,23 @@ export const register = (on: On): void => {
       top: number,
       length: number,
       cells: number,
+      marks?: readonly { row: number; text: string }[],
     ) =>
       Client === undefined ? null : (
         <Box position="absolute" top={top} left={left}>
           <Client
             key={key}
             module="../shared/splitter-client.tsx"
-            props={{ axis, length, cells, color: border.borderColor }}
-            width={axis === 'x' ? 1 : length}
-            height={axis === 'x' ? length : 1}
+            props={{
+              axis,
+              length,
+              cells,
+              span: 2,
+              color: border.borderColor,
+              ...(marks === undefined ? {} : { marks }),
+            }}
+            width={axis === 'x' ? 2 : length}
+            height={axis === 'x' ? length : 2}
           />
         </Box>
       )
@@ -1014,7 +1127,6 @@ export const register = (on: On): void => {
         {dragBar('sb:branches', tree.length, branchRoom, branchWin.offset, 1)}
       </Box>
       {titled('title:branches', 'Branches')}
-      {splitter('split:side', 'x', sideCols - 1, 1, area - 2, sideCols)}
       </Box>
     )
 
@@ -1028,6 +1140,7 @@ export const register = (on: On): void => {
           ...s,
           selected: commit.sha,
           infoOffset: s.selected === commit.sha ? s.infoOffset : 0,
+          infoLeft: s.selected === commit.sha ? s.infoLeft : 0,
         }))
       const cols = graphColumns(width, laneCols, wide)
       // refs that fit ~40% of the subject's room, the rest as `…`
@@ -1121,7 +1234,6 @@ export const register = (on: On): void => {
       <Box flexDirection="column" width={rightCols} flexShrink={0} height={topRows}>
         {commitList(graphWidth, false)}
         {titled('title:commits', 'Commits')}
-        {splitter('split:info', 'y', 1, topRows - 1, rightCols - 2, topRows)}
       </Box>
     )
 
@@ -1139,13 +1251,13 @@ export const register = (on: On): void => {
         {details === undefined && <Text dimColor>Select a commit.</Text>}
         {infoShown.map((text, i) => (
           <Text key={'info:' + (infoOffset + i)} bold={infoOffset + i === 0} wrap="truncate-end">
-            {text}
+            {sliceCols(text, infoLeft) || ' '}
           </Text>
         ))}
         </Box>
         {dragBar('sb:info', infoAll.length, infoInner, infoOffset)}
       </Box>
-      {titled('title:info', 'Info')}
+      {hbar('hb:info', infoWide, infoCols, infoLeft, infoRows - 1, infoCols)}
       </Box>
     )
 
@@ -1172,7 +1284,6 @@ export const register = (on: On): void => {
       onToggle: (key: string) => void
     }) => {
       const fwin = windowOf(p.rows, -1, changeRoom, p.fileOffset)
-      const previewCols = columns - filesCols
       const filesWidth = filesCols - 5
       const pHead = p.details === undefined ? [] : p.details.head.slice(0, headRows)
       const pRows = Math.max(1, fullInner - pHead.length)
@@ -1234,7 +1345,6 @@ export const register = (on: On): void => {
             </Box>
             {dragBar(p.barKey, p.rows.length, changeRoom, fwin.offset)}
           </Box>
-            {splitter('split:files', 'x', filesCols - 1, 1, area - 2, filesCols)}
             {titled('title:files', fit(p.title, Math.max(5, filesCols - 16)))}
             <Box position="absolute" top={0} right={1} flexDirection="row" gap={1}>
               <Button
@@ -1259,10 +1369,10 @@ export const register = (on: On): void => {
             {p.details === undefined && <Text dimColor>{p.noneText}</Text>}
             {pHead.map((text, i) => (
               <Text key={'head:' + i} bold={i === 0} wrap="truncate-end">
-                {text}
+                {sliceCols(text, detailLeft) || ' '}
               </Text>
             ))}
-            {pDiff !== '' && <Code source={pDiff} format="diff" wrap="truncate-end" />}
+            {pDiff !== '' && <Code source={sliceDiffCols(pDiff, detailLeft)} format="diff" wrap="truncate-end" />}
             {p.details !== undefined && pDiff === '' && (
               <Text dimColor>
                 {/^(Binary files|GIT binary patch)/m.test(p.details.diff)
@@ -1274,7 +1384,9 @@ export const register = (on: On): void => {
             {dragBar('sb:details', pTotal, pRows, pOffset, pHead.length)}
           </Box>
           {titled('title:diff', 'Diff Preview')}
+          {hbar('hb:details', detailWide, detailCols, detailLeft, area - 1, detailCols)}
           </Box>
+          {splitter('split:files', 'x', filesCols - 1, 1, area - 2, filesCols)}
         </Box>
       )
     }
@@ -1341,6 +1453,7 @@ export const register = (on: On): void => {
                 ...s,
                 diffFile: path,
                 detailOffset: s.diffFile === path ? s.detailOffset : 0,
+                detailLeft: s.diffFile === path ? s.detailLeft : 0,
               })),
             onToggle: toggleChange,
           })
@@ -1362,6 +1475,7 @@ export const register = (on: On): void => {
                 ...s,
                 change: path,
                 detailOffset: s.change === path ? s.detailOffset : 0,
+                detailLeft: s.change === path ? s.detailLeft : 0,
               })),
             onToggle: toggleChange,
           })
@@ -1373,7 +1487,18 @@ export const register = (on: On): void => {
             <Box flexDirection="column">
               {commitsSection}
               {infoSection}
+              {splitter('split:info', 'y', 1, topRows - 1, rightCols - 2, topRows)}
+              {/* Info's title sits on the row the seam covers: drawn after it */}
+              <Box position="absolute" top={topRows} left={0}>
+                {titled('title:info', 'Info')}
+              </Box>
             </Box>
+            {/* the seam's second column is the right column's left border: keep
+                Commits' bottom-left and Info's top-left corners (rows from top=1) */}
+            {splitter('split:side', 'x', sideCols - 1, 1, area - 2, sideCols, [
+              { row: topRows - 2, text: '╰' },
+              { row: topRows - 1, text: '╭' },
+            ])}
           </Box>
         )}
         <Box flexDirection="row" justifyContent="space-between" gap={2}>

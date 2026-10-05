@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { DRAFT_DIR, accept, draftFile, hashPath, parseChunk } from './edit'
+import { DRAFT_DIR, accept, draftFile, hashPath, parseChunk, parseHView } from './edit'
 import type { ChunkMsg } from './edit'
 
 const msg = (over: Partial<ChunkMsg> = {}): ChunkMsg => ({
@@ -67,4 +67,15 @@ test('accept: a new seq, version or kind starts over', () => {
   expect(got.text).toBe('v2')
   got = accept(got.incoming, msg({ version: 2, kind: 'draft', chunk: 'd' }))
   expect(got.text).toBe('d')
+})
+
+test('parseHView takes three non-negative integers, nothing else', () => {
+  expect(parseHView({ left: 3, widest: 300, width: 58 })).toEqual({ left: 3, widest: 300, width: 58 })
+  expect(parseHView({ left: 0, widest: 0, width: 1, extra: 'x' })).toEqual({ left: 0, widest: 0, width: 1 })
+  expect(parseHView(null)).toBeUndefined()
+  expect(parseHView('x')).toBeUndefined()
+  expect(parseHView({ left: -1, widest: 300, width: 58 })).toBeUndefined()
+  expect(parseHView({ left: 1.5, widest: 300, width: 58 })).toBeUndefined()
+  expect(parseHView({ left: 1, widest: '300', width: 58 })).toBeUndefined()
+  expect(parseHView({ left: 1, widest: 300 })).toBeUndefined()
 })

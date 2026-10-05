@@ -1,6 +1,15 @@
 import { expect, test } from 'claude-code/testing'
 
-import { scrollbar } from './scrollbar'
+import { H_THUMB, H_TRACK, scrollbar } from './scrollbar'
+
+const H = { thumb: H_THUMB, track: H_TRACK }
+
+test('scrollbar: horizontal glyphs', () => {
+  expect(scrollbar(20, 10, 0, 10, H).join('')).toBe('━━━━━─────')
+  expect(scrollbar(20, 10, 10, 10, H).join('')).toBe('─────━━━━━')
+  expect(scrollbar(20, 10, 5, 10, H).join('')).toBe('───━━━━━──')
+  expect(scrollbar(5, 5, 0, 3, H)).toEqual([' ', ' ', ' '])
+})
 
 test('scrollbar: blank when everything fits', () => {
   expect(scrollbar(5, 5, 0, 4)).toEqual([' ', ' ', ' ', ' '])

@@ -2,6 +2,7 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
+import { sliceCols } from '../shared/hscroll'
 import { BRANCHES, LOG, MERGE_NAME_STATUS, MERGE_PATCH, MULTI_PATCH, NAME_STATUS, STAT } from './fixtures'
 
 const CWD = '/repo'
@@ -37,6 +38,7 @@ const result = (stdout: string, exitCode = 0, stderr = '') => ({
 
 // `isRepo` false answers every git call with exit 128; the first `rootFails`
 // root lookups throw, as when the engine aborts a superseded render's call.
+// `answer` may answer a call first (undefined: the defaults below).
 const fake = (
   on: On,
   calls: string[][],
@@ -45,11 +47,14 @@ const fake = (
   head: { name: string } = { name: 'main' },
   status = STATUS,
   rootFails = 0,
+  answer: (argv: readonly string[]) => ReturnType<typeof result> | undefined = () => undefined,
 ): void => {
   let failsLeft = rootFails
   on('process.run', (_$, e) => {
     calls.push([...e.argv])
     if (!isRepo) return result('', 128)
+    const answered = answer(e.argv)
+    if (answered !== undefined) return answered
     if (failsLeft > 0 && e.argv.includes('--show-toplevel')) {
       failsLeft -= 1
       throw new Error('aborted')
@@ -919,9 +924,20 @@ for (const surface of ['terminal', 'desktop'] as const) {
   }
 }
 
+// `$.store` from a Map the test reads back.
+const memoryStore = (on: On, store: Map<string, unknown>) => {
+  on('store.get', (_$, e) => ({ value: store.get(e.key) }))
+  on('store.set', (_$, e) => {
+    store.set(e.key, e.value)
+
+    return { value: undefined }
+  })
+}
+
 for (const surface of ['terminal', 'desktop'] as const) {
-  const open = async ($: Engine, on: On, columns: number, bodyRows: number) => {
-    mock.store(on)
+  const open = async ($: Engine, on: On, columns: number, bodyRows: number, store?: Map<string, unknown>) => {
+    if (store === undefined) mock.store(on)
+    else memoryStore(on, store)
     fake(on, [], true, LOG, { name: 'main' }, STATUS)
     on('ui.focus', () => ({}))
     on('ui.scroll', () => ({}))
@@ -1001,6 +1017,31 @@ for (const surface of ['terminal', 'desktop'] as const) {
     await ui.pointer({ type: 'up', button: 'left', x: 0, y: 5, in: 'split:side' })
   })
 
+  test(`${surface}: a stored layout:git sizes Branches; a drag's release writes it`, async ($, on) => {
+    const store = new Map<string, unknown>([['layout:git', { side: 0.4, files: 0.5 }]])
+    const ui = await open($, on, 160, 14, store)
+    // 40% of 160 body columns
+    expect(await cellsOf(ui, 'split:side')).toBe(64)
+
+    await ui.pointer({ type: 'down', button: 'left', x: 0, y: 5, in: 'split:side' })
+    await ui.pointer({ type: 'move', button: 'left', x: -10, y: 5, in: 'split:side' })
+    expect(await cellsOf(ui, 'split:side')).toBe(54)
+    // mid-drag moves don't write
+    expect(store.get('layout:git')).toEqual({ side: 0.4, files: 0.5 })
+    await ui.pointer({ type: 'up', button: 'left', x: 0, y: 5, in: 'split:side' })
+    const saved = store.get('layout:git') as { side?: number; info?: number; files?: number }
+    expect(Math.round((saved.side ?? 0) * 160)).toBe(54)
+    expect(saved.info).toBeUndefined()
+    // the stored Files width rides along
+    expect(saved.files).toBe(0.5)
+  })
+
+  for (const value of ['x', { side: 7, info: -1, files: 'a' }])
+    test(`${surface}: a garbage layout:git (${JSON.stringify(value)}) falls back to the default`, async ($, on) => {
+      const ui = await open($, on, 160, 14, new Map<string, unknown>([['layout:git', value]]))
+      expect(await cellsOf(ui, 'split:side')).toBe(32)
+    })
+
   test(`${surface}: dragging the Commits/Info seam moves the Info boundary`, async ($, on) => {
     const ui = await open($, on, 160, 30)
     const before = (await cellsOf(ui, 'split:info')) ?? 0
@@ -1012,6 +1053,59 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect(await cellsOf(ui, 'split:info')).toBe(before + 4)
   })
 
+  test(`${surface}: the Branches seam takes a grab on Commits' border too`, async ($, on) => {
+    const ui = await open($, on, 160, 14)
+    const seam = await ui.find({ key: 'split:side' })
+    expect(seam?.props.width).toBe(2)
+    expect((seam?.props.props as { span?: number } | undefined)?.span).toBe(2)
+    expect(await cellsOf(ui, 'split:side')).toBe(32)
+
+    await ui.pointer({ type: 'down', button: 'left', x: 1, y: 5, in: 'split:side' })
+    await ui.pointer({ type: 'move', button: 'left', x: 11, y: 5, in: 'split:side' })
+    expect(await cellsOf(ui, 'split:side')).toBe(42)
+    await ui.pointer({ type: 'up', button: 'left', x: 1, y: 5, in: 'split:side' })
+    expect(await cellsOf(ui, 'split:side')).toBe(42)
+  })
+
+  test(`${surface}: the Branches seam keeps Commits' and Info's left corners`, async ($, on) => {
+    const ui = await open($, on, 160, 14)
+    const topRows = (await cellsOf(ui, 'split:info')) ?? 0
+    const marks = ((await ui.find({ key: 'split:side' }))?.props.props as { marks?: unknown } | undefined)?.marks
+    expect(marks).toEqual([
+      { row: topRows - 2, text: '╰' },
+      { row: topRows - 1, text: '╭' },
+    ])
+    // one outer Text per seam row; a marked row nests its corner Text
+    const rows = (await ui.findAll({ type: 'Text', in: 'split:side' }))
+      .map(text => text.text)
+      .filter(text => text.length === 2)
+    expect(rows[topRows - 3]).toBe('││')
+    expect(rows[topRows - 2]).toBe('│╰')
+    expect(rows[topRows - 1]).toBe('│╭')
+    expect(rows[topRows]).toBe('││')
+    // held, the corners stay
+    await ui.pointer({ type: 'down', button: 'left', x: 0, y: 1, in: 'split:side' })
+    const held = (await ui.findAll({ type: 'Text', in: 'split:side' })).map(text => text.text)
+    expect(held).toContain('│╰')
+    expect(held).toContain('│╭')
+    await ui.pointer({ type: 'up', button: 'left', x: 0, y: 1, in: 'split:side' })
+  })
+
+  test(`${surface}: the Commits/Info seam takes a grab on Info's border too`, async ($, on) => {
+    const ui = await open($, on, 160, 40)
+    const seam = await ui.find({ key: 'split:info' })
+    expect(seam?.props.height).toBe(2)
+    const before = (await cellsOf(ui, 'split:info')) ?? 0
+
+    await ui.pointer({ type: 'down', button: 'left', x: 3, y: 1, in: 'split:info' })
+    await ui.pointer({ type: 'move', button: 'left', x: 3, y: 11, in: 'split:info' })
+    // the seam moved under the pointer: the same spot reads y 1 again
+    await ui.pointer({ type: 'up', button: 'left', x: 3, y: 1, in: 'split:info' })
+    expect(await cellsOf(ui, 'split:info')).toBe(before + 10)
+    // Info keeps its title over the seam
+    expect(await ui.find({ key: 'title:info' })).toBeDefined()
+  })
+
   test(`${surface}: dragging the Files seam resizes Files in Change Log`, async ($, on) => {
     const ui = await open($, on, 100, 30)
     await ui.press({ key: 'tab:changelog' })
@@ -1020,5 +1114,163 @@ for (const surface of ['terminal', 'desktop'] as const) {
     await ui.pointer({ type: 'move', button: 'left', x: -8, y: 3, in: 'split:files' })
     await ui.pointer({ type: 'up', button: 'left', x: 0, y: 3, in: 'split:files' })
     expect(await cellsOf(ui, 'split:files')).toBe(22)
+  })
+}
+
+// Horizontal bars: a line wider than Info or Diff Preview draws one on the
+// section's bottom border; a drag moves the first column shown.
+// 300 columns, column 5k starting `w<k>`, so a slice shows where it starts.
+const WIDE_LINE = Array.from({ length: 60 }, (_, i) => ('w' + i).padEnd(5, '.')).join('')
+const WIDE_STAT = STAT.replace('oh-my-project v0.7.1', WIDE_LINE)
+const WIDE_DIFF =
+  'diff --git a/b.txt b/b.txt\nindex 111..222 100644\n--- a/b.txt\n+++ b/b.txt\n' +
+  '@@ -1,2 +1,2 @@\n keep\n-old line\n+' + WIDE_LINE + '\n' +
+  '@@ -40,2 +40,2 @@\n tail\n-gone\n+came\n'
+const WIDE_PATCH =
+  'diff --git a/CHANGELOG.md b/CHANGELOG.md\nindex 2ab3741..af8640a 100644\n--- a/CHANGELOG.md\n+++ b/CHANGELOG.md\n' +
+  '@@ -1 +1,2 @@\n keep\n+' + WIDE_LINE + '\n'
+
+const wide = (argv: readonly string[]) => {
+  const sub = argv[1] === '-c' ? argv[3] : argv[1]
+  if (sub === 'show' && argv.includes('--stat')) return result(WIDE_STAT)
+  if (sub === 'show' && !argv.includes('--name-status') && !(argv.at(-1) ?? '').startsWith('352e0cc')) {
+    return result(WIDE_PATCH)
+  }
+  if (sub === 'diff' && argv.includes('b.txt')) return result(WIDE_DIFF)
+
+  return undefined
+}
+
+for (const surface of ['terminal', 'desktop'] as const) {
+  const open = async ($: Engine, on: On, isWide = true) => {
+    mock.store(on)
+    fake(on, [], true, LOG, { name: 'main' }, STATUS, 0, isWide ? wide : undefined)
+    on('ui.focus', () => ({}))
+    on('ui.scroll', () => ({}))
+    await $.session.start(start(surface))
+
+    return $.ui.mount({
+      plugin: PLUGIN,
+      surface,
+      component: 'Pane',
+      props: props(100),
+      requestId: 'ide-git',
+      viewport: VIEWPORT,
+    })
+  }
+  type Ui = Awaited<ReturnType<typeof open>>
+  const drag = async (ui: Ui, key: string, to: number) => {
+    await ui.pointer({ type: 'down', button: 'left', x: 0, y: 0, in: key })
+    await ui.pointer({ type: 'move', button: 'left', x: to, y: 0, in: key })
+    await ui.pointer({ type: 'up', button: 'left', x: to, y: 0, in: key })
+  }
+  const barOf = async (ui: Ui, key: string) =>
+    (await ui.find({ key }))?.props.props as { axis?: string; offset: number; total: number; visible: number } | undefined
+  // what every Text shows (a found Text carries no key)
+  const texts = async (ui: Ui) => (await ui.findAll({ type: 'Text' })).map(text => text.text)
+  const hunks = (source: string) => source.split('\n').filter(line => line.startsWith('@@'))
+
+  test(`${surface}: a wide Info line draws hb:info; a drag shifts Info's lines`, async ($, on) => {
+    const ui = await open($, on)
+    await ui.press({ key: 'commit:' + HEAD_SHA })
+    const before = ['eLeSTRaGo <elestrago63@gmail.com>', WIDE_LINE]
+    for (const line of before) expect(await texts(ui)).toContain(line)
+    const bar = await barOf(ui, 'hb:info')
+    expect(bar?.axis).toBe('x')
+    expect(bar?.offset).toBe(0)
+    expect(bar?.total).toBe(300)
+
+    await drag(ui, 'hb:info', 20)
+    const left = (await barOf(ui, 'hb:info'))?.offset ?? 0
+    expect(left).toBeGreaterThan(0)
+    const shown = await texts(ui)
+    // a line scrolled past its end draws a space
+    for (const line of before) expect(shown).toContain(sliceCols(line, left) || ' ')
+    expect(shown).not.toContain(WIDE_LINE)
+
+    // another commit: back to column 0
+    const other = (await ui.findAll({ type: 'Button' }))
+      .map(b => b.key ?? '')
+      .find(key => key.startsWith('commit:') && key !== 'commit:' + HEAD_SHA)
+    await ui.press({ key: other ?? '' })
+    expect((await barOf(ui, 'hb:info'))?.offset).toBe(0)
+  })
+
+  test(`${surface}: Info scrolled past its short lines keeps one Text row per line`, async ($, on) => {
+    const ui = await open($, on)
+    await ui.press({ key: 'commit:' + HEAD_SHA })
+    await drag(ui, 'hb:info', 1000)
+    const left = (await barOf(ui, 'hb:info'))?.offset ?? 0
+    expect(left).toBeGreaterThan('eLeSTRaGo <elestrago63@gmail.com>'.length)
+    const shown = await texts(ui)
+    // a line shorter than `left` draws a space, not an empty Text (zero rows)
+    expect(shown).not.toContain('')
+    expect(shown).toContain(' ')
+    expect(shown).toContain(sliceCols(WIDE_LINE, left))
+  })
+
+  test(`${surface}: short Info and Diff Preview lines draw no bar`, async ($, on) => {
+    const ui = await open($, on, false)
+    await ui.press({ key: 'commit:' + HEAD_SHA })
+    expect(await ui.find({ key: 'hb:info' })).toBeUndefined()
+    await ui.press({ key: 'tab:changelog' })
+    await ui.press({ key: 'change:b.txt' })
+    expect(await ui.find({ type: 'Code' })).toBeDefined()
+    expect(await ui.find({ key: 'hb:details' })).toBeUndefined()
+  })
+
+  test(`${surface}: a wide change draws hb:details; a drag slices the diff and head, @@ kept`, async ($, on) => {
+    const ui = await open($, on)
+    await ui.press({ key: 'tab:changelog' })
+    await ui.press({ key: 'change:b.txt' })
+    const source = () => ui.find({ type: 'Code' }).then(code => String(code?.props.source ?? ''))
+    const whole = await source()
+    expect(whole).toContain('+' + WIDE_LINE)
+    expect(await texts(ui)).toContain('modified')
+    const bar = await barOf(ui, 'hb:details')
+    expect(bar?.offset).toBe(0)
+    // the body line's marker and the diff gutter (" 41 ") count
+    expect(bar?.total).toBe(301 + 4)
+
+    // a short drag, so the head line `modified` is cut, not gone
+    await drag(ui, 'hb:details', 1)
+    const left = (await barOf(ui, 'hb:details'))?.offset ?? 0
+    expect(left).toBeGreaterThan(0)
+    expect(left).toBeLessThan(8)
+    const sliced = await source()
+    expect(hunks(sliced)).toEqual(hunks(whole))
+    expect(sliced).toContain('\n+' + sliceCols(WIDE_LINE, left) + '\n')
+    expect(sliced).not.toContain('+' + WIDE_LINE)
+    expect(await texts(ui)).toContain(sliceCols('modified', left))
+    expect(await texts(ui)).not.toContain('modified')
+
+    // another file: column 0, and its short diff draws no bar
+    await ui.press({ key: 'change:a.txt' })
+    expect(await ui.find({ key: 'hb:details' })).toBeUndefined()
+    await ui.press({ key: 'change:b.txt' })
+    expect((await barOf(ui, 'hb:details'))?.offset).toBe(0)
+    expect(await source()).toBe(whole)
+  })
+
+  test(`${surface}: the diff view's Diff Preview scrolls sideways too`, async ($, on) => {
+    const ui = await open($, on)
+    await ui.press({ key: 'diff:' + HEAD_SHA })
+    await ui.press({ key: 'dfile:CHANGELOG.md' })
+    const source = () => ui.find({ type: 'Code' }).then(code => String(code?.props.source ?? ''))
+    const whole = await source()
+    expect(whole).toContain('+' + WIDE_LINE)
+    expect(await barOf(ui, 'hb:details')).toBeDefined()
+
+    await drag(ui, 'hb:details', 30)
+    const left = (await barOf(ui, 'hb:details'))?.offset ?? 0
+    expect(left).toBeGreaterThan(0)
+    const sliced = await source()
+    expect(hunks(sliced)).toEqual(hunks(whole))
+    expect(sliced).toContain('+' + sliceCols(WIDE_LINE, left))
+
+    // back closes the view: column 0 again
+    await ui.press({ key: 'back' })
+    await ui.press({ key: 'diff:' + HEAD_SHA })
+    expect((await barOf(ui, 'hb:details'))?.offset).toBe(0)
   })
 }

@@ -1,3 +1,5 @@
+import { widthOf } from '../shared/hscroll'
+
 export type Mode = 'files' | 'unity'
 
 export type Entry = {
@@ -237,4 +239,24 @@ export const clip = (text: string, lines: number, chars = 10000): string => {
   const kept = text.split('\n').slice(0, Math.max(1, lines)).join('\n')
 
   return kept.length > chars ? kept.slice(0, chars) : kept
+}
+
+// A tree row's label cut to `width` columns, its last kept column a `…` when
+// cut (wide chars count 2, so it never paints wider), so a narrow Files keeps
+// each row on one line. A `width` under 1 leaves just the `…`.
+export const fitLabel = (label: string, width: number): string => {
+  const room = Math.max(1, Math.floor(width))
+  let cols = 0
+  for (const ch of label) cols += widthOf(ch.codePointAt(0)!)
+  if (cols <= room) return label
+  let out = ''
+  let used = 0
+  for (const ch of label) {
+    const w = widthOf(ch.codePointAt(0)!)
+    if (used + w > room - 1) break
+    out += ch
+    used += w
+  }
+
+  return out + '…'
 }

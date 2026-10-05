@@ -2,8 +2,8 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, PluginOptions, Register } from 'claude-code'
 
 import type { ExplorerState } from '../../types'
-import { TRANSFER_CHUNK, accept, draftFile, parseChunk } from './edit'
-import type { EditorProps, Incoming } from './edit'
+import { TRANSFER_CHUNK, accept, draftFile, parseChunk, parseHView } from './edit'
+import type { EditorProps, HView, Incoming } from './edit'
 import { KEYMAPS, chunks, mergeKeymap } from './editor'
 import type { Action, Keymap } from './editor'
 import {
@@ -11,6 +11,7 @@ import {
   afterDelete,
   clip,
   deleteTarget,
+  fitLabel,
   flatten,
   formatSize,
   isBinary,
@@ -23,7 +24,9 @@ import {
 import type { Entry, Mode, Row } from './tree'
 import { GIT_PANE, changeCounts, shortDir, parseStatus, statusArgv } from '../git-panel/git'
 import { borderOf, lastAgentColor, parseColorAnswer } from '../shared/color'
-import { scrollbar } from '../shared/scrollbar'
+import { H_THUMB, H_TRACK, scrollbar } from '../shared/scrollbar'
+import { sliceCols, widest } from '../shared/hscroll'
+import { dragTo, layoutOf, splitAt } from '../shared/split'
 import {
   classify,
   hasRefs,
@@ -67,14 +70,18 @@ const footers = new Map<
 >()
 // Rows the tree window shows; set by render, read by the focus hook.
 let treeRows = 20
+// Each side of the splitter keeps at least this many columns.
+const MIN_COLS = 12
 // The last drawing's geometry, set by render and read by the scroll hook: the
 // column where the preview starts, each section's furthest offset and the
 // rows the preview shows; the Edit region and whether it was drawn (read by
 // the scroll and editor message hooks too).
 const view = {
+  columns: 0, // the total the splitter divides: the body's columns
   treeEnd: 0,
   treeMax: 0,
   previewMax: 0,
+  previewLeftMax: 0, // the preview's furthest first column (horizontal bar)
   previewRows: 1,
   editRows: 1,
   editColumns: 1,
@@ -99,16 +106,33 @@ const editing = {
   commandSeq: 0,
   by: 0,
   incoming: undefined as Incoming | undefined,
+  hview: undefined as HView | undefined, // the client's horizontal view, for the bar
 }
 // The merged keymap (register's options) and what was wrong with the overrides.
 let keymap: Keymap = KEYMAPS.jetbrains
 let keymapErrors: string[] = []
+// Columns of the widest line of the last previewed file, keyed by path, mtime
+// and line count: the horizontal bar measures every line, not just the shown
+// ones (its thumb must not jump on a vertical scroll), and a 4 MiB file is too
+// many to walk on each drawing. One entry: only the shown file is measured.
+let widthCache: { key: string; cols: number } | undefined
 // The dir the `new` name field creates in; undefined: the field is not shown.
 // Module-level: a reload just drops the field.
 let naming: string | undefined
 
 const clamp = (value: number, max: number): number =>
   Math.min(Math.max(0, value), Math.max(0, max))
+
+// The Edit section bar's total columns: the widest line plus the caret cell
+// past its end, which the client's follow logic scrolls to (End on that line).
+const editTotal = (hview: HView): number => hview.widest + 1
+
+// Columns of the widest of `lines`, through `widthCache`.
+const widestCached = (key: string, lines: readonly string[]): number => {
+  if (widthCache?.key !== key) widthCache = { key, cols: widest(lines) }
+
+  return widthCache.cols
+}
 
 const isMode = (value: unknown): value is Mode =>
   MODES.includes(value as Mode)
@@ -169,6 +193,9 @@ const footerOf = async ($: EngineInterface, root: string) => {
 }
 
 const modeKey = (root: string): string => 'explorer.mode:' + root
+// The section sizes, global (every root): the whole `split` object, written
+// when a splitter drag ends and read by session.start while `split` is unset.
+const LAYOUT_KEY = 'layout:explorer'
 
 const ensureListed = async ($: EngineInterface, dir: string): Promise<void> => {
   if (listings.has(dir)) return
@@ -336,7 +363,7 @@ const setMode = async ($: EngineInterface, mode: Mode): Promise<void> => {
 }
 
 // Enter or a click: the row becomes the selection (shown in the preview);
-// a dir also opens or closes.
+// a press on the selected dir opens or closes it.
 const press = async ($: EngineInterface, row: Row): Promise<void> => {
   const edit = (await read($, explorer)).edit
   if (edit !== undefined && (row.kind === 'dir' || row.path === edit.path)) {
@@ -360,8 +387,9 @@ const press = async ($: EngineInterface, row: Row): Promise<void> => {
     cursor: row.path,
     selected: row.path,
     previewOffset: s.selected === row.path ? s.previewOffset : 0,
+    previewLeft: s.selected === row.path ? s.previewLeft : 0,
     expanded:
-      row.kind !== 'dir'
+      row.kind !== 'dir' || s.selected !== row.path
         ? s.expanded
         : s.expanded.includes(row.path)
           ? s.expanded.filter(path => path !== row.path)
@@ -373,6 +401,7 @@ type Preview =
   | {
       type: 'code'
       path: string
+      mtime: number
       language?: string
       lines: string[]
       refs: Ref[]
@@ -416,6 +445,7 @@ const jump = async ($: EngineInterface, path: string): Promise<void> => {
     selected: path,
     cursor: path,
     previewOffset: s.selected === path ? s.previewOffset : 0,
+    previewLeft: s.selected === path ? s.previewLeft : 0,
     expanded,
     offset: win.offset,
   }))
@@ -469,6 +499,7 @@ const loadPreview = async (
     return {
       type: 'code',
       path: row.path,
+      mtime: stat.mtimeMs,
       language: languageOf(row.name),
       lines: text.replace(/\n$/, '').split('\n'),
       refs,
@@ -503,6 +534,7 @@ const resetEditing = (): void => {
   editing.isDraft = false
   editing.isDirty = false
   editing.incoming = undefined
+  editing.hview = undefined
 }
 
 const statOf = async ($: EngineInterface, path: string) => {
@@ -870,6 +902,7 @@ const confirmDelete = async ($: EngineInterface): Promise<void> => {
       selected: isGone(s.selected) || s.selected === undefined ? next : s.selected,
       cursor: isGone(s.cursor) || s.cursor === undefined ? next : s.cursor,
       previewOffset: isGone(s.selected) ? 0 : s.previewOffset,
+      previewLeft: isGone(s.selected) ? 0 : s.previewLeft,
     }
   })
   await toast($, 'Deleted ' + nameOf(target.path) + (facts.hasMeta ? ' + .meta' : ''))
@@ -968,7 +1001,7 @@ const writeDraft = async ($: EngineInterface, text: string): Promise<void> => {
   if (edit.hasDraft !== true) await patchEdit($, edit.version, { hasDraft: true })
 }
 
-// A message of the editor client: `need` a chunk, `dirty`, `copy`, or a
+// A message of the editor client: `need` a chunk, `dirty`, `hview`, `copy`, or a
 // draft or save chunk. Every answer is the client's next props, acking it.
 const editorMessage = async (
   $: EngineInterface,
@@ -994,6 +1027,12 @@ const editorMessage = async (
       await patchEdit($, edit.version, { hasDraft: undefined })
     }
     $.ui.invalidate('ui.render')
+  } else if ('hview' in d) {
+    const hview = parseHView(d.hview)
+    if (hview !== undefined && isCurrent) {
+      editing.hview = hview
+      $.ui.invalidate('ui.render')
+    }
   } else if (typeof d.copy === 'string') {
     try {
       const copied = await $.ui.copy({ text: d.copy, surface })
@@ -1054,18 +1093,22 @@ export const register = (on: On, options?: PluginOptions): void => {
     })
     const root = await $.session.root()
     const saved = await $.store.get(modeKey(root))
+    // Sizes from an earlier session; a reload keeps the session's own.
+    const layout = layoutOf(await $.store.get(LAYOUT_KEY), ['tree']) as { tree?: number } | undefined
     await update($, explorer, s => {
       const isSame = s.root === '' || s.root === root
 
       return {
         ...s,
         root,
+        split: s.split ?? layout,
         mode: isMode(saved) ? saved : 'files',
         expanded: isSame ? s.expanded : [],
         selected: isSame ? s.selected : undefined,
         cursor: isSame ? s.cursor : undefined,
         offset: isSame ? s.offset : 0,
         previewOffset: isSame ? (s.previewOffset ?? 0) : 0,
+        previewLeft: isSame ? (s.previewLeft ?? 0) : 0,
         // A reload or restart: the editor asks for its text again, and a
         // draft newer than the file comes back with it (loadEdit).
         edit:
@@ -1238,7 +1281,22 @@ export const register = (on: On, options?: PluginOptions): void => {
   // A scrollbar dragged: the window moves, the selection stays (as the wheel).
   on('ui.message', { requestId: PANE }, async ($, e) => {
     if (e.element === 'editor') return editorMessage($, e.data, e.surface)
-    const data = e.data as { offset?: unknown } | null
+    const data = e.data as { offset?: unknown; start?: unknown; delta?: unknown; done?: unknown } | null
+    if (e.element === 'split:tree') {
+      // The splitter dragged: Files' new width is where it started plus the
+      // pointer's travel, kept as a fraction so a resize keeps it.
+      const { start, delta } = data ?? {}
+      if (typeof start !== 'number' || typeof delta !== 'number') return {}
+      if (!Number.isFinite(start) || !Number.isFinite(delta)) return {}
+      if (view.columns <= 0) return {}
+      const fraction = dragTo(view.columns, start, delta, MIN_COLS)
+      const after = await update($, explorer, s => ({ ...s, split: { ...s.split, tree: fraction } }))
+      // The drag ended: the sizes outlive the session (mid-drag moves don't write).
+      if (data?.done === true) await $.store.set(LAYOUT_KEY, after.split ?? {})
+      $.ui.invalidate('ui.render')
+
+      return {}
+    }
     const to = typeof data?.offset === 'number' ? data.offset : NaN
     if (!Number.isFinite(to)) return {}
     if (e.element === 'sb:tree') {
@@ -1247,6 +1305,18 @@ export const register = (on: On, options?: PluginOptions): void => {
     } else if (e.element === 'sb:preview') {
       const previewOffset = clamp(Math.round(to), view.previewMax)
       await update($, explorer, s => ({ ...s, previewOffset }))
+    } else if (e.element === 'hb:preview') {
+      const previewLeft = clamp(Math.round(to), view.previewLeftMax)
+      await update($, explorer, s => ({ ...s, previewLeft }))
+    } else if (e.element === 'hb:edit') {
+      // The client holds the editor's first column: it gets a `left` command.
+      const hview = editing.hview
+      if (hview === undefined) return {}
+      const left = clamp(Math.round(to), editTotal(hview) - hview.width)
+      // Shown at once, so the thumb does not snap back on release while the
+      // client's own hview (which confirms it) is on its way.
+      editing.hview = { ...hview, left }
+      sendCommand($, 'left', left)
     } else {
       return {}
     }
@@ -1345,13 +1415,58 @@ export const register = (on: On, options?: PluginOptions): void => {
     const previewTotal = preview?.type === 'code' ? preview.lines.length : 0
     const previewRows = Math.max(1, innerRows - refLines)
     const previewOffset = clamp(state.previewOffset ?? 0, previewTotal - previewRows)
-    view.treeEnd = Math.floor(e.props.bodyColumns * 0.35)
+    const treeCols = splitAt(e.props.bodyColumns, state.split?.tree ?? 0.35, MIN_COLS)
+    view.columns = e.props.bodyColumns
+    view.treeEnd = treeCols
     view.treeMax = Math.max(0, rows.length - treeRows)
     view.previewMax = Math.max(0, previewTotal - previewRows)
     view.previewRows = previewRows
+    // Horizontal scroll: lines are cut at column `previewLeft` (Code and Text
+    // have no column offset). The room is Preview's inner columns less the
+    // vertical bar and, for Code, its line-number gutter: one space, the
+    // widest shown number, one space (probed live on 2.1.289: ` 9 `, `  99 `
+    // for 99-100). `total` measures every line, so a vertical scroll keeps the
+    // thumb's size.
+    const previewInner = Math.max(1, e.props.bodyColumns - treeCols - 2)
+    const previewLines = preview === undefined ? [] : preview.lines
+    const shownLast = preview?.type === 'code' ? Math.min(previewTotal, previewOffset + previewRows) : 0
+    const gutter = preview?.type === 'code' ? String(Math.max(1, shownLast)).length + 2 : 0
+    const previewWide =
+      preview?.type === 'code'
+        ? widestCached(preview.path + '\0' + preview.mtime + '\0' + preview.lines.length, preview.lines)
+        : widest(previewLines)
+    const previewVisible = Math.max(1, previewInner - 1 - gutter)
+    view.previewLeftMax = Math.max(0, previewWide - previewVisible)
+    const previewLeft = clamp(state.previewLeft ?? 0, view.previewLeftMax)
     view.editRows = innerRows
     view.editColumns = Math.max(1, e.props.bodyColumns - view.treeEnd - 2)
     view.isEditDrawn = edit !== undefined
+    // A Client on the seam, two cells across: the first section's last column
+    // and the second's first (both frames' borders), so the seam takes a grab
+    // from either side. Drawn last in the container holding both sections, so
+    // it paints over both borders; `left`/`top` are relative to that container
+    // and name the first section's border. `length` stops short of the frames'
+    // corners. Surfaces without `Client` keep the plain borders. Keep in sync
+    // with git's `splitter`.
+    const splitter = (
+      key: 'split:tree',
+      axis: 'x' | 'y',
+      left: number,
+      top: number,
+      length: number,
+      cells: number,
+    ) =>
+      Client === undefined ? null : (
+        <Box position="absolute" top={top} left={left}>
+          <Client
+            key={key}
+            module="../shared/splitter-client.tsx"
+            props={{ axis, length, cells, span: 2, color: border.borderColor }}
+            width={axis === 'x' ? 2 : length}
+            height={axis === 'x' ? length : 2}
+          />
+        </Box>
+      )
     const bar = (cells: string[]) => (
       <Box flexDirection="column" width={1} flexShrink={0}>
         {cells.map((cell, i) =>
@@ -1381,6 +1496,44 @@ export const register = (on: On, options?: PluginOptions): void => {
           height={rows}
         />
       )
+
+    // A horizontal scrollbar laid over the section's bottom border (no row of
+    // its own), only while the content is wider than the room. Like the title,
+    // it sits after the bordered Box in the unbordered wrapper; `left={1}`
+    // skips the corner and `width` stops short of the far one. Draggable on
+    // surfaces that draw a `Client`, a static Text row elsewhere. The engine's
+    // wheel has no horizontal axis, so dragging is the only way to scroll.
+    const hbar = (key: string, total: number, visible: number, offset: number, width: number) => {
+      if (total <= visible || width <= 0) return null
+
+      return (
+        <Box position="absolute" top={sectionRows - 1} left={1}>
+          {Client === undefined ? (
+            <Box flexDirection="row" height={1}>
+              {scrollbar(total, visible, offset, width, { thumb: H_THUMB, track: H_TRACK }).map((cell, i) =>
+                cell === H_THUMB ? (
+                  <Text key={'hbar:' + i} color={border.borderColor}>
+                    {cell}
+                  </Text>
+                ) : (
+                  <Text key={'hbar:' + i} dimColor>
+                    {cell}
+                  </Text>
+                ),
+              )}
+            </Box>
+          ) : (
+            <Client
+              key={key}
+              module="../shared/scrollbar-client.tsx"
+              props={{ axis: 'x', total, visible, offset, height: width, color: border.borderColor }}
+              width={width}
+              height={1}
+            />
+          )}
+        </Box>
+      )
+    }
 
     // The section's name sits on its top border. A bordered Box clips its
     // children, so the overlay sits after it in an unbordered wrapper of the
@@ -1542,7 +1695,7 @@ export const register = (on: On, options?: PluginOptions): void => {
           </Box>
         ) : undefined}
         <Box flexDirection="row">
-          <Box flexDirection="column" width="35%" height={sectionRows}>
+          <Box flexDirection="column" width={treeCols} flexShrink={0} height={sectionRows}>
           <Box {...border} flexDirection="row" height="100%">
             <Box flexDirection="column" flexGrow={1}>
             {rows.length === 0 && <Text dimColor>(empty)</Text>}
@@ -1562,11 +1715,14 @@ export const register = (on: On, options?: PluginOptions): void => {
                   plain
                   dimColor={ignored.has(row.path)}
                   autoFocus={row.path === focusKey ? true : undefined}
-                  label={
-                    (row.kind === 'dir'
+                  label={fitLabel(
+                    row.kind === 'dir'
                       ? (row.isExpanded ? '▾ ' : '▸ ') + row.name + '/'
-                      : '  ' + row.name)
-                  }
+                      : '  ' + row.name,
+                    // the room left: frame, vertical bar, mark, rails; no
+                    // horizontal scroll in list sections, so a long name is cut
+                    Math.max(3, treeCols - 2 - 1 - 1 - 2 * row.depth),
+                  )}
                   onPress={() => press($, row)}
                 />
               </Box>
@@ -1587,7 +1743,12 @@ export const register = (on: On, options?: PluginOptions): void => {
                 flexGrow={1}
               />
             </Box>
-            {titled('title:edit', (isEditDirty(edit) ? '● ' : '') + 'Edit')}
+            {/* The client holds the first column; it reports the view. No
+                vertical bar here, so the bar spans all the inner columns. */}
+            {editing.hview !== undefined &&
+              editing.version === edit.version &&
+              hbar('hb:edit', editTotal(editing.hview),editing.hview.width, editing.hview.left, view.editColumns)}
+            {titled('title:edit',(isEditDirty(edit) ? '● ' : '') + 'Edit')}
             {/* Line actions for terminals that do not report their chords. */}
             <Box position="absolute" top={0} right={1} flexDirection="row" gap={1}>
               <Button key="edit:save" plain label=" save " onPress={() => sendCommand($, 'save')} />
@@ -1608,12 +1769,14 @@ export const register = (on: On, options?: PluginOptions): void => {
             <Box flexDirection="column" flexGrow={1}>
             {preview === undefined && <Text dimColor>Select a file.</Text>}
             {preview?.type === 'text' &&
-              preview.lines.map(line => <Text>{line}</Text>)}
+              // ' ' for a line scrolled past its end: an empty Text takes no row
+              preview.lines.map(line => <Text wrap="truncate-end">{sliceCols(line, previewLeft) || ' '}</Text>)}
             {preview?.type === 'code' && (
               <Code
                 source={clip(
                   preview.lines
                     .slice(previewOffset, previewOffset + previewRows)
+                    .map(line => sliceCols(line, previewLeft))
                     .join('\n'),
                   previewRows,
                 )}
@@ -1643,8 +1806,10 @@ export const register = (on: On, options?: PluginOptions): void => {
             {dragBar('sb:preview', previewTotal, previewRows, previewOffset)}
           </Box>
           {titled('title:preview', 'Preview')}
+          {hbar('hb:preview', previewWide, previewVisible, previewLeft, previewInner - 1)}
           </Box>
           )}
+          {splitter('split:tree', 'x', treeCols - 1, 1, sectionRows - 2, treeCols)}
         </Box>
         <Box flexDirection="row" justifyContent="space-between" gap={2}>
           <Box flexShrink={1}>

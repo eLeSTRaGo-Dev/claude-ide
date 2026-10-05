@@ -18,6 +18,8 @@ import {
   remoteArgv,
   remoteSummary,
   clipDiff,
+  diffBody,
+  diffGutter,
   diffLines,
   cellRuns,
   infoHead,
@@ -235,6 +237,19 @@ const DIFF = [
   '+r',
   ' s',
 ].join('\n')
+
+test('diffBody: hunk body lines only, a removed -- line included', () => {
+  expect(diffBody(DIFF)).toEqual([' a', '-b', '+c', '+d', ' e', '-- q', '+r', ' s'])
+  expect(diffBody('')).toEqual([])
+  expect(diffBody('Binary files a/x and b/x differ')).toEqual([])
+})
+
+test('diffGutter: the widest line number plus two blanks; 0 without a body', () => {
+  expect(diffGutter(DIFF)).toBe(4) // line 11
+  expect(diffGutter('@@ -1,2 +1,2 @@\n a\n-b\n+c')).toBe(3)
+  expect(diffGutter('@@ -9,1 +1234,1 @@\n-x\n+y')).toBe(6)
+  expect(diffGutter('')).toBe(0)
+})
 
 test('sliceDiff: offset 0 is clipDiff, whole diff stays as is', () => {
   expect(sliceDiff(DIFF, 0, 100)).toBe(DIFF)

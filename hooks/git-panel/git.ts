@@ -351,6 +351,29 @@ type OpenHunk = {
 export const diffLines = (diff: string): string[] =>
   diff === '' ? [] : diff.replace(/\n+$/, '').split('\n')
 
+// The diff's hunk body lines, marker included: the lines `sliceDiffCols`
+// (`shared/hscroll.ts`) cuts, so the ones Diff Preview's horizontal bar measures.
+export const diffBody = (diff: string): string[] => {
+  const all = diffLines(diff)
+  const parsed = parseDiff(all)
+
+  return all.filter((_, i) => parsed[i]?.kind === 'body')
+}
+
+// Columns `Code format="diff"` draws before a body line's marker (probed live
+// on 2.1.289): a blank, the line number right-aligned to the widest one, a
+// blank; the `@@` lines take no row. Measured over the whole diff, so a window
+// of it may draw a column less. 0 with no body line.
+export const diffGutter = (diff: string): number => {
+  const all = diffLines(diff)
+  let most = -1
+  for (const p of parseDiff(all)) {
+    if (p.kind === 'body') most = Math.max(most, p.old, p.next)
+  }
+
+  return most < 0 ? 0 : String(most).length + 2
+}
+
 // `rows` lines of a unified diff from line `offset`, still a valid diff: a hunk
 // cut at either end gets its header start/counts rewritten (a hunk entered
 // mid-way gets a header of its own), and file header lines are kept only with a
