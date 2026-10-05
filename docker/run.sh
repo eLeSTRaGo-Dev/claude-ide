@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run Claude Code with --dangerously-skip-permissions inside a container.
 # Only the project dir is writable from the host; auth lives in a docker volume.
-# From the host ~/.claude only skills, agents and commands are mounted, read-only
+# From the host ~/.claude only CLAUDE.md, skills, agents and commands are mounted, read-only
 # at their host paths (so symlinked skills resolve). Everything else in the
 # sandbox's ~/.claude (login, settings, plugins) lives in its own docker volume.
 set -euo pipefail
@@ -32,6 +32,9 @@ for dir in skills agents commands; do
     [ -L "$entry" ] && ro "$(readlink -f "$entry")"
   done
 done
+
+# User instructions (a file mount; docker follows a symlinked source itself).
+ro "$CONF/CLAUDE.md"
 
 TTY=(-i); [ -t 0 ] && TTY=(-it)
 
