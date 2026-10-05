@@ -38,6 +38,9 @@ const FILES: Record<string, string> = {
   '/proj/app.bin': 'MZ\0\0binary',
 }
 
+// `grep` output per cwd, for the Unity GUID index.
+const GREP: Record<string, string> = {}
+
 // Answers fs, git, session and command plumbing beneath the plugin.
 const fake = (
   on: On,
@@ -58,6 +61,9 @@ const fake = (
       },
     }
   })
+  on('fs.exists', (_$, e) => ({
+    value: FILES[e.path] !== undefined || TREE[e.path] !== undefined,
+  }))
   on('fs.read', (_$, e) => {
     const text = FILES[e.path]
     if (text === undefined) throw new Error('ENOENT ' + e.path)
@@ -66,6 +72,17 @@ const fake = (
   })
   on('process.run', (_$, e) => {
     calls.push([...e.argv])
+    if (e.argv[0] === 'grep') {
+      return {
+        value: {
+          exitCode: 0,
+          stdout: GREP[e.init?.cwd ?? ''] ?? '',
+          stderr: '',
+          isStdoutTruncated: false,
+          isStderrTruncated: false,
+        },
+      }
+    }
     const stdin = e.init?.stdin ?? ''
     const hit = stdin.split('\0').filter(name => name === 'out.log')
 
@@ -193,7 +210,141 @@ for (const surface of ['terminal', 'desktop'] as const) {
     await $.session.start(start(surface))
     expect(await ui.find({ type: 'Text', text: /Unity/ })).toBeDefined()
   })
+
+  test(`${surface}: unity mode hints when the root is not a Unity project`, async ($, on) => {
+    TREE['/game'] = [entry('Assets', 'dir'), entry('ProjectSettings', 'dir')]
+    TREE['/game/ProjectSettings'] = [entry('ProjectVersion.txt', 'file')]
+    FILES['/game/ProjectSettings/ProjectVersion.txt'] = 'm_EditorVersion: 6000.0.0f1\n'
+    TREE['/plain'] = [entry('Assets', 'dir')]
+    const store = new Map<string, unknown>([
+      ['explorer.mode:/game', 'unity'],
+      ['explorer.mode:/plain', 'unity'],
+    ])
+    on('store.get', (_$, e) => ({ value: store.get(e.key) }))
+    on('store.set', (_$, e) => {
+      store.set(e.key, e.value)
+
+      return { value: undefined }
+    })
+    fake(on)
+    await $.session.start({ ...start(surface), cwd: '/plain' })
+    const ui = await $.ui.mount({
+      plugin: PLUGIN,
+      surface,
+      component: 'Pane',
+      props: PROPS,
+      requestId: 'ide-explorer',
+      viewport: VIEWPORT,
+    })
+
+    expect(await ui.find({ type: 'Text', text: /\[Unity\]/ })).toBeDefined()
+    expect(
+      await ui.find({ type: 'Text', text: /not a Unity project/ }),
+    ).toBeDefined()
+
+    await $.session.start({ ...start(surface), cwd: '/game' })
+    expect(await ui.find({ type: 'Text', text: /\[Unity\]/ })).toBeDefined()
+    expect(
+      await ui.find({ type: 'Text', text: /not a Unity project/ }),
+    ).toBeUndefined()
+  })
+
+  test(`${surface}: files mode shows no Unity hint`, async ($, on) => {
+    mock.store(on)
+    fake(on)
+    await $.session.start(start(surface))
+    const ui = await $.ui.mount({
+      plugin: PLUGIN,
+      surface,
+      component: 'Pane',
+      props: PROPS,
+      requestId: 'ide-explorer',
+      viewport: VIEWPORT,
+    })
+
+    expect(
+      await ui.find({ type: 'Text', text: /not a Unity project/ }),
+    ).toBeUndefined()
+  })
 }
+
+const GUID_A = 'a'.repeat(32)
+const GUID_B = 'b'.repeat(32)
+const BUILTIN = '0000000000000000e000000000000000'
+const GUID_X = 'c'.repeat(32)
+
+for (const surface of ['terminal', 'desktop'] as const) {
+  test(`${surface}: unity preview lists references and jumps to a resolved one`, async ($, on) => {
+    TREE['/uni'] = [entry('Assets', 'dir'), entry('ProjectSettings', 'dir')]
+    TREE['/uni/ProjectSettings'] = [entry('ProjectVersion.txt', 'file')]
+    TREE['/uni/Assets'] = [entry('Prefabs', 'dir'), entry('Art', 'dir')]
+    TREE['/uni/Assets/Prefabs'] = [entry('hero.prefab', 'file')]
+    TREE['/uni/Assets/Art'] = [entry('Mats', 'dir')]
+    TREE['/uni/Assets/Art/Mats'] = [entry('skin.mat', 'file')]
+    FILES['/uni/ProjectSettings/ProjectVersion.txt'] = 'm_EditorVersion: 6000.0.0f1\n'
+    FILES['/uni/Assets/Prefabs/hero.prefab'] = [
+      '--- !u!1 &1',
+      `  m_Material: {fileID: 2100000, guid: ${GUID_A}, type: 2}`,
+      `  m_Script: {fileID: 11500000, guid: ${GUID_A}, type: 3}`,
+      `  m_Mesh: {fileID: 10202, guid: ${BUILTIN}, type: 0}`,
+      `  m_Other: {fileID: 1, guid: ${GUID_X}, type: 3}`,
+    ].join('\n')
+    GREP['/uni'] = [
+      `Assets/Art/Mats/skin.mat.meta:guid: ${GUID_A}`,
+      `Assets/Prefabs/hero.prefab.meta:guid: ${GUID_B}`,
+    ].join('\n')
+    const store = new Map<string, unknown>([['explorer.mode:/uni', 'unity']])
+    on('store.get', (_$, e) => ({ value: store.get(e.key) }))
+    on('store.set', (_$, e) => {
+      store.set(e.key, e.value)
+
+      return { value: undefined }
+    })
+    fake(on)
+    await $.session.start({ ...start(surface), cwd: '/uni' })
+    const ui = await $.ui.mount({
+      plugin: PLUGIN,
+      surface,
+      component: 'Pane',
+      props: PROPS,
+      requestId: 'ide-explorer',
+      viewport: VIEWPORT,
+    })
+
+    await ui.press({ key: 'row:/uni/Assets' })
+    await ui.press({ key: 'row:/uni/Assets/Prefabs' })
+    await ui.press({ key: 'row:/uni/Assets/Prefabs/hero.prefab' })
+    expect(await ui.find({ type: 'Text', text: /References \(3\)/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /Unity built-in/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /package or missing/ })).toBeDefined()
+    expect(await ui.find({ key: 'row:/uni/Assets/Art/Mats/skin.mat' })).toBeUndefined()
+
+    await ui.press({ key: 'ref:/uni/Assets/Art/Mats/skin.mat' })
+    expect(await ui.find({ key: 'row:/uni/Assets/Art/Mats/skin.mat' })).toBeDefined()
+    expect(await ui.find({ key: 'row:/uni/Assets/Art/Mats' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /References/ })).toBeUndefined()
+  })
+}
+
+test('files mode shows no references', async ($, on) => {
+  mock.store(on)
+  fake(on)
+  TREE['/proj/src'] = [entry('a.prefab', 'file')]
+  FILES['/proj/src/a.prefab'] = `guid: ${GUID_A}\n`
+  await $.session.start(start('terminal'))
+  const ui = await $.ui.mount({
+    plugin: PLUGIN,
+    surface: 'terminal',
+    component: 'Pane',
+    props: PROPS,
+    requestId: 'ide-explorer',
+    viewport: VIEWPORT,
+  })
+  await ui.press({ key: 'row:/proj/src' })
+  await ui.press({ key: 'row:/proj/src/a.prefab' })
+  expect(await ui.find({ type: 'Text', text: /References/ })).toBeUndefined()
+  TREE['/proj/src'] = [entry('main.ts', 'file', 40)]
+})
 
 test('focus moving past the window edge scrolls the tree', async ($, on) => {
   mock.store(on)

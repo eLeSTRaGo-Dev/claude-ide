@@ -71,8 +71,81 @@ test('flatten applies a custom filter', () => {
 })
 
 test('filterFor returns a filter per mode', () => {
-  expect(filterFor('files')(dir('.git'), '/p', 'files')).toBe(false)
-  expect(filterFor('unity')(file('x'), '/p', 'unity')).toBe(true)
+  expect(filterFor('files')(dir('.git'), '/p', 'files', '/p')).toBe(false)
+  expect(filterFor('unity')(file('x'), '/p/Assets', 'unity', '/p')).toBe(true)
+  expect(filterFor('unity')(file('x'), '/p', 'unity', '/p')).toBe(false)
+})
+
+// Shaped like ../unity-playground.
+const unity = new Map<string, Entry[]>([
+  [
+    '/u',
+    [
+      dir('Assets'),
+      dir('Library'),
+      dir('Logs'),
+      dir('Packages'),
+      dir('ProjectSettings'),
+      dir('Temp'),
+      dir('UserSettings'),
+      dir('.git'),
+      file('Assembly-CSharp.csproj'),
+      file('unity-playground.slnx'),
+    ],
+  ],
+  [
+    '/u/Assets',
+    [
+      dir('Scenes'),
+      file('Scenes.meta'),
+      dir('Build'),
+      dir('BuildOutput'),
+      dir('obj'),
+      dir('Temp'),
+      dir('Library'),
+      dir('Logs'),
+      dir('UserSettings'),
+      dir('Builder2'),
+    ],
+  ],
+  ['/u/Assets/Scenes', [file('SampleScene.unity'), file('SampleScene.unity.meta')]],
+])
+const unityExpanded = new Set(['/u/Assets', '/u/Assets/Scenes'])
+
+test('unity mode shows only Assets, Packages and ProjectSettings at the top', () => {
+  const rows = flatten(unity, new Set(), '/u', { mode: 'unity' })
+  expect(rows.map(row => row.name)).toEqual(['Assets', 'Packages', 'ProjectSettings'])
+})
+
+test('unity mode hides .meta and noise dirs at any depth', () => {
+  const rows = flatten(unity, unityExpanded, '/u', { mode: 'unity' })
+  expect(rows.map(row => row.path)).toEqual([
+    '/u/Assets',
+    '/u/Assets/Scenes',
+    '/u/Assets/Scenes/SampleScene.unity',
+    '/u/Packages',
+    '/u/ProjectSettings',
+  ])
+  expect(rows.some(row => row.name.endsWith('.meta'))).toBe(false)
+})
+
+test('files mode on a Unity tree shows everything but .git', () => {
+  const rows = flatten(unity, unityExpanded, '/u', { mode: 'files' })
+  const top = rows.filter(row => row.depth === 0).map(row => row.name)
+  expect(top).toEqual([
+    'Assets',
+    'Library',
+    'Logs',
+    'Packages',
+    'ProjectSettings',
+    'Temp',
+    'UserSettings',
+    'Assembly-CSharp.csproj',
+    'unity-playground.slnx',
+  ])
+  expect(rows.map(row => row.name)).toContain('SampleScene.unity.meta')
+  expect(rows.map(row => row.name)).toContain('Scenes.meta')
+  expect(rows.map(row => row.name)).toContain('Build')
 })
 
 test('window shows everything when it fits', () => {

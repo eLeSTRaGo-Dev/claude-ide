@@ -10,9 +10,12 @@ import {
   isBinary,
   join,
   languageOf,
+  parentOf,
   window as windowOf,
 } from './tree'
 import type { Entry, Mode, Row } from './tree'
+import { classify, hasRefs, metaGuid, parseGrep, refsOf } from './unity'
+import type { GuidIndex, Ref } from './unity'
 
 type On = Parameters<Register>[0]
 
@@ -29,6 +32,9 @@ const explorer = atom<'ide-panes', 'explorer'>(
 // $.state should stay small. `refresh` and stage 4 invalidate them.
 const listings = new Map<string, Entry[]>()
 const ignored = new Set<string>()
+// Whether a root holds `ProjectSettings/ProjectVersion.txt`; checked in Unity
+// mode only.
+const unityRoots = new Map<string, boolean>()
 // Rows the tree window shows; set by render, read by the focus hook.
 let treeRows = 20
 
@@ -78,6 +84,103 @@ const markIgnored = async (
   }
 }
 
+const isUnityProject = async (
+  $: EngineInterface,
+  root: string,
+): Promise<boolean> => {
+  const known = unityRoots.get(root)
+  if (known !== undefined) return known
+  let found = false
+  try {
+    found = await $.fs.exists(join(root, 'ProjectSettings/ProjectVersion.txt'))
+  } catch {
+    found = false
+  }
+  unityRoots.set(root, found)
+
+  return found
+}
+
+const TOP = ['Assets', 'Packages']
+
+const walk = async (
+  $: EngineInterface,
+  dir: string,
+  index: Map<string, string>,
+): Promise<void> => {
+  let entries: Awaited<ReturnType<EngineInterface['fs']['list']>> = []
+  try {
+    entries = await $.fs.list(dir)
+  } catch {
+    return
+  }
+  for (const entry of entries) {
+    const path = join(dir, entry.name)
+    if (entry.kind === 'dir') {
+      await walk($, path, index)
+    } else if (entry.kind === 'file' && entry.name.endsWith('.meta')) {
+      try {
+        const text = await $.fs.read(path)
+        const guid = typeof text === 'string' ? metaGuid(text) : undefined
+        if (guid !== undefined && !index.has(guid)) {
+          index.set(guid, path.slice(0, -'.meta'.length))
+        }
+      } catch {
+        // unreadable .meta: skip
+      }
+    }
+  }
+}
+
+const buildIndex = async (
+  $: EngineInterface,
+  root: string,
+): Promise<Map<string, string>> => {
+  const dirs: string[] = []
+  for (const name of TOP) {
+    try {
+      if (await $.fs.exists(join(root, name))) dirs.push(name)
+    } catch {
+      // treat as missing
+    }
+  }
+  if (dirs.length === 0) return new Map()
+  try {
+    const ran = await $.process.run(
+      ['grep', '-r', '--include=*.meta', '-m1', '^guid:', ...dirs],
+      { cwd: root, timeoutMs: 20000 },
+    )
+    // exit 1: no matches; 0: matches. Anything else, or cut output, is not
+    // trusted: walk the tree instead.
+    if (ran.exitCode <= 1 && !ran.isStdoutTruncated) {
+      return parseGrep(ran.stdout, root)
+    }
+  } catch {
+    // grep missing or timed out
+  }
+  const index = new Map<string, string>()
+  for (const name of dirs) await walk($, join(root, name), index)
+
+  return index
+}
+
+// Module cache (not $.state): rebuilt lazily after a reload or `refresh`.
+const indexes = new Map<string, Promise<Map<string, string>>>()
+
+const guidIndex = (
+  $: EngineInterface,
+  root: string,
+): Promise<GuidIndex> => {
+  let built = indexes.get(root)
+  if (built === undefined) {
+    built = buildIndex($, root)
+    indexes.set(root, built)
+  }
+
+  return built
+}
+
+
 const rootOf = async (
   $: EngineInterface,
   state: ExplorerState,
@@ -104,8 +207,41 @@ const press = async ($: EngineInterface, row: Row): Promise<void> => {
 }
 
 type Preview =
-  | { type: 'code'; path: string; language?: string; source: string }
+  | {
+      type: 'code'
+      path: string
+      language?: string
+      source: string
+      refs: Ref[]
+    }
   | { type: 'text'; lines: string[] }
+
+// Select `path` and expand every dir between the root and it; the window
+// offset is recomputed so the row is visible.
+const jump = async ($: EngineInterface, path: string): Promise<void> => {
+  const state = await read($, explorer)
+  const root = await rootOf($, state)
+  const dirs: string[] = []
+  for (let dir = parentOf(path); dir.length > root.length; dir = parentOf(dir)) {
+    dirs.push(dir)
+  }
+  dirs.reverse()
+  const expanded = [...state.expanded, ...dirs.filter(d => !state.expanded.includes(d))]
+  await Promise.all([root, ...expanded].map(dir => ensureListed($, dir)))
+  const rows = flatten(listings, new Set(expanded), root, { mode: state.mode })
+  const win = windowOf(
+    rows,
+    rows.findIndex(row => row.path === path),
+    treeRows,
+    state.offset,
+  )
+  await update($, explorer, s => ({
+    ...s,
+    selected: path,
+    expanded,
+    offset: win.offset,
+  }))
+}
 
 const metadata = (name: string, size: number, mtimeMs: number): string[] => [
   name,
@@ -113,10 +249,14 @@ const metadata = (name: string, size: number, mtimeMs: number): string[] => [
   'modified ' + new Date(mtimeMs).toISOString(),
 ]
 
+const RANK = { resolved: 0, unresolved: 1, builtin: 2 } as const
+
 const loadPreview = async (
   $: EngineInterface,
   row: Row,
   lines: number,
+  isUnity: boolean,
+  root: string,
 ): Promise<Preview> => {
   if (row.kind === 'dir') {
     await ensureListed($, row.path)
@@ -143,11 +283,18 @@ const loadPreview = async (
       return { type: 'text', lines: metadata(row.name, stat.size, stat.mtimeMs) }
     }
 
+    const refs =
+      isUnity && hasRefs(row.name)
+        ? classify(refsOf(text), await guidIndex($, root))
+        : []
+    refs.sort((a, b) => RANK[a.kind] - RANK[b.kind])
+
     return {
       type: 'code',
       path: row.path,
       language: languageOf(row.name),
       source: clip(text, lines),
+      refs,
     }
   } catch {
     return { type: 'text', lines: [row.name, 'cannot read'] }
@@ -225,13 +372,27 @@ export const register = (on: On): void => {
     const expanded = new Set(state.expanded)
     await Promise.all([root, ...expanded].map(dir => ensureListed($, dir)))
     const rows = flatten(listings, expanded, root, { mode: state.mode })
+    const isNotUnity =
+      state.mode === 'unity' && !(await isUnityProject($, root))
     const index = rows.findIndex(row => row.path === state.selected)
     const bodyRows = e.props.scroll.bodyRows
     treeRows = Math.max(3, bodyRows - 2)
     const win = windowOf(rows, index, treeRows, state.offset)
     const current = index < 0 ? undefined : rows[index]
+    const isUnity = state.mode === 'unity' && !isNotUnity
     const preview =
-      current === undefined ? undefined : await loadPreview($, current, treeRows)
+      current === undefined
+        ? undefined
+        : await loadPreview($, current, treeRows, isUnity, root)
+    // Reference section: a header line, up to `shown` refs and a "+n more"
+    // line; Code gets the rest of the pane rows.
+    const refs = preview?.type === 'code' ? preview.refs : []
+    const shown =
+      refs.length === 0
+        ? 0
+        : Math.min(refs.length, Math.max(1, Math.floor((treeRows - 1) / 2)))
+    const hidden = refs.length - shown
+    const refLines = refs.length === 0 ? 0 : 1 + shown + (hidden > 0 ? 1 : 0)
     const focusKey = current?.path ?? rows[0]?.path
 
     return (
@@ -241,6 +402,11 @@ export const register = (on: On): void => {
           <Text dimColor wrap="truncate-start">
             {root}
           </Text>
+          {isNotUnity && (
+            <Text dimColor>
+              not a Unity project
+            </Text>
+          )}
           <Button
             key="mode"
             label={'mode: ' + state.mode}
@@ -254,6 +420,8 @@ export const register = (on: On): void => {
             onPress={() => {
               listings.clear()
               ignored.clear()
+              unityRoots.clear()
+              indexes.clear()
               $.ui.invalidate('ui.render')
             }}
           />
@@ -283,13 +451,29 @@ export const register = (on: On): void => {
               preview.lines.map(line => <Text>{line}</Text>)}
             {preview?.type === 'code' && (
               <Code
-                source={preview.source}
+                source={clip(preview.source, Math.max(1, treeRows - refLines))}
                 path={preview.path}
                 language={preview.language}
                 startLine={1}
                 wrap="truncate-end"
               />
             )}
+            {refs.length > 0 && <Text bold>References ({refs.length})</Text>}
+            {refs.slice(0, shown).map(ref =>
+              ref.kind === 'resolved' ? (
+                <Button
+                  key={'ref:' + ref.path}
+                  plain
+                  label={ref.path.startsWith(root + '/') ? ref.path.slice(root.length + 1) : ref.path}
+                  onPress={() => jump($, ref.path)}
+                />
+              ) : (
+                <Text dimColor wrap="truncate-end">
+                  {ref.guid} {ref.kind === 'builtin' ? 'Unity built-in' : 'package or missing'}
+                </Text>
+              ),
+            )}
+            {hidden > 0 && <Text dimColor>+{hidden} more</Text>}
           </Box>
         </Box>
       </Box>

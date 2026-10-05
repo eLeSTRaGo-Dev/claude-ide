@@ -15,22 +15,36 @@ export type Row = {
   isExpanded: boolean
 }
 
-// Decides whether an entry of `parentPath` is shown in `mode`.
+// Decides whether an entry of `parentPath` is shown in `mode`. `root` is the
+// tree's root, so a filter can tell the top level apart.
 export type EntryFilter = (
   entry: Entry,
   parentPath: string,
   mode: Mode,
+  root: string,
 ) => boolean
 
 // FileExplorer: everything but `.git`.
 export const hideGit: EntryFilter = entry => entry.name !== '.git'
 
-// Hook point for stage 2: Unity rules (hide `.meta`, noise dirs, root only
-// Assets/Packages/ProjectSettings) replace `unity` here. Until then both modes
-// show the same entries and only the label differs.
+const UNITY_TOP = new Set(['Assets', 'Packages', 'ProjectSettings'])
+const UNITY_NOISE = new Set(['Library', 'Temp', 'Logs', 'obj', 'UserSettings'])
+
+// Unity: no `.git` or `.meta`; the top level shows only Assets, Packages and
+// ProjectSettings; build and cache dirs are hidden at any depth.
+export const unityFilter: EntryFilter = (entry, parentPath, _mode, root) => {
+  if (entry.name === '.git' || entry.name.endsWith('.meta')) return false
+  if (parentPath === root) {
+    return entry.kind === 'dir' && UNITY_TOP.has(entry.name)
+  }
+  if (entry.kind !== 'dir') return true
+
+  return !UNITY_NOISE.has(entry.name) && !/^Build/.test(entry.name)
+}
+
 export const filters: Record<Mode, EntryFilter> = {
   files: hideGit,
-  unity: hideGit,
+  unity: unityFilter,
 }
 
 export const filterFor = (mode: Mode): EntryFilter => filters[mode]
@@ -75,7 +89,7 @@ export const flatten = (
   const rows: Row[] = []
   const walk = (dir: string, depth: number): void => {
     const entries = listings.get(dir) ?? []
-    const shown = entries.filter(entry => filter(entry, dir, mode))
+    const shown = entries.filter(entry => filter(entry, dir, mode, root))
     for (const entry of sortEntries(shown)) {
       const path = join(dir, entry.name)
       const isExpanded = entry.kind === 'dir' && expanded.has(path)
