@@ -1,0 +1,6 @@
+{
+  "name": "ui-kit",
+  "version": "0.1.0",
+  "description": "Web-like UI showcase: themed components, forms, overlays, widgets, pixel chrome, headless browser",
+  "types": "./types/index.d.ts"
+}
