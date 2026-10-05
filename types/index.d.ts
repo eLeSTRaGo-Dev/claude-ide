@@ -16,7 +16,7 @@ export type GitState = {
   branchOffset: number // first branch row shown
   detailOffset: number // first diff line shown
   collapsed?: string[] // branch folders closed (`l:fix`, `r:origin/team`)
-  tab?: 'graph' | 'changes' // the middle block; absent is `graph`
+  tab?: 'graph' | 'changes' // the middle section; absent is `graph`
   change?: string // path of the selected change
   changeOffset?: number // first change row shown
   changeView?: 'list' | 'tree' // absent is `list`

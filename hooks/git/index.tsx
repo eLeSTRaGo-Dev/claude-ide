@@ -310,7 +310,7 @@ const touched = ($: EngineInterface): void => {
   $.ui.invalidate('ui.render')
 }
 
-// A block's name, as the user can quote it in chat; pressing a title copies it.
+// A section's name, as the user can quote it in chat; pressing a title copies it.
 const copyName = async (
   $: EngineInterface,
   name: string,
@@ -702,7 +702,7 @@ export const register = (on: On): void => {
         }
       })
 
-    // The block's name sits on its top border; the middle block's name follows
+    // The section's name sits on its top border; the middle section's name follows
     // the active tab.
     const titled = (key: string, name: string) => (
       <Box position="absolute" top={-1} left={1}>

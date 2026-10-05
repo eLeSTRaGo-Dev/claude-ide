@@ -109,7 +109,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
       expect(remote?.props.dimColor).toBe(true)
     })
 
-    test(`${surface}/${columns}: blocks are titled, footer shows dir and counts`, async ($, on) => {
+    test(`${surface}/${columns}: sections are titled, footer shows dir and counts`, async ($, on) => {
       mock.store(on)
       fake(on, [])
       await $.session.start(start(surface))
@@ -516,7 +516,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
         .map(b => b.key ?? '')
         .filter(key => key.startsWith(prefix))
 
-    test(`${surface}/${columns}: tabs switch the middle block between commits and changes`, async ($, on) => {
+    test(`${surface}/${columns}: tabs switch the middle section between commits and changes`, async ($, on) => {
       const ui = await open($, on)
 
       expect((await ui.find({ key: 'tab:graph' }))?.props.hotkey).toBe('g')

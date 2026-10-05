@@ -48,6 +48,16 @@ There is no single-test flag; to run one test, narrow the test files or the `tes
 
 For any API detail, grep the generated `.claude-plugin/types/claude-code/index.d.ts` (or the skill's `claude-code.d.ts` before the first load) for the event or noun name, e.g. `'tool.call'`, `Pane: {`.
 
+## Glossary
+
+Use these names in code, comments, tests and chat.
+
+- **Panel**: one whole IDE view, Explorer or Git (engine term: pane, `$.ui.open`, `component: 'Pane'`).
+- **Main tabs**: the tab bar that switches between panels (Explorer, Git).
+- **Section**: a named, bordered area inside a panel, e.g. Git's Branches, Commits (Graph/Changes), Info. Its name sits on its top border.
+- **Panel tabs**: tabs on a section's top border that switch what that section shows (Git: `Graph` / `Changes`).
+- Not "block": in `git.ts`, `block` means a diff file's header block.
+
 ## Features
 
 - `/ide-panels` is the only command: it opens both panes as tabs (Explorer, Git), explorer in front.
@@ -56,7 +66,7 @@ For any API detail, grep the generated `.claude-plugin/types/claude-code/index.d
 - Caches are module-level in each `index.tsx` (not `$.state`): explorer `listings`, `ignored`, `unityRoots`, GUID `indexes`, `footers` (branch + change counts per root); git `repoRoot`, `branchCache`, `statusCache`, `graphCache`, `showCache`, `changeCache` (diff per path), `hasHead`.
 - Footer (both panes): `~/path (branch)` left, `+added ~modified -deleted` right (dim when clean; untracked count as added). Explorer: no counts outside a repo; its `footers` is cleared with the listings by every hook and `refresh`.
 - Cleared by: the `refresh` button (`r`) and each feature's `tool.call` hooks. Explorer: `Write`/`Edit`/`NotebookEdit` drop that file and its parent dir; `Bash` drops all listings (and the GUID index when the command matches `git|mv|rm|cp|unity`). Git: `Bash` clears all and re-reads the branch; `Write`/`Edit`/`NotebookEdit` drop the `git status` cache, `showCache` and `changeCache`. The hooks never deny or rewrite a call.
-- Hotkeys on header Buttons: `r` refresh (both), `m` mode (explorer), `a` all branches, `f` fetch, `p` pull, `g` graph tab, `c` changes tab, `v` list/tree view (changes) (git). The tab and view Buttons sit on the middle block's top border.
+- Hotkeys on header Buttons: `r` refresh (both), `m` mode (explorer), `a` all branches, `f` fetch, `p` pull, `g` graph tab, `c` changes tab, `v` list/tree view (changes) (git). The tab and view Buttons sit on the middle section's top border.
 - `$.state` atoms under `ide-panes`: `explorer` (`root`, `mode`, `expanded`, `selected`, `offset`, `previewOffset`) and `git` (`ref`, `selected`, `offset`, `limit`, `branchOffset`, `detailOffset`, `collapsed`, `tab`, `change`, `changeOffset`, `changeView`, `changeCollapsed`). `$.store` key `explorer.mode:<root>` holds the saved mode.
 - The explorer owns the plugin's only `session.start` hook and registers `/ide-panels`; git sets its status line on the first `prompt.submit` and after each `Bash` call.
 
