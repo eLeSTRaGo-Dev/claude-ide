@@ -662,19 +662,23 @@ export const register = (on: On): void => {
             <Box flexDirection="column" flexGrow={1}>
             {rows.length === 0 && <Text dimColor>(empty)</Text>}
             {win.rows.map(row => (
-              <Button
-                key={'row:' + row.path}
-                plain
-                dimColor={ignored.has(row.path)}
-                autoFocus={row.path === focusKey ? true : undefined}
-                label={
-                  (row.path === state.selected ? '>' : ' ') +
-                  '  '.repeat(row.depth) +
-                  (row.kind === 'dir' ? (row.isExpanded ? '▾ ' : '▸ ') : '  ') +
-                  row.name
-                }
-                onPress={() => press($, row)}
-              />
+              // Selection mark, a dim rail per depth level, then the row.
+              <Box key={'line:' + row.path} flexDirection="row">
+                <Text>{row.path === state.selected ? '>' : ' '}</Text>
+                {row.depth > 0 && <Text dimColor>{'│ '.repeat(row.depth)}</Text>}
+                <Button
+                  key={'row:' + row.path}
+                  plain
+                  dimColor={ignored.has(row.path)}
+                  autoFocus={row.path === focusKey ? true : undefined}
+                  label={
+                    (row.kind === 'dir'
+                      ? (row.isExpanded ? '▾ ' : '▸ ') + row.name + '/'
+                      : '  ' + row.name)
+                  }
+                  onPress={() => press($, row)}
+                />
+              </Box>
             ))}
             </Box>
             {dragBar('sb:tree', rows.length, treeRows, win.offset)}
