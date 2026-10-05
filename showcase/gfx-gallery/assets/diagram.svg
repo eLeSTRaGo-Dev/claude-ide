@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="480" viewBox="0 0 800 480">
+  <defs>
+    <marker id="a" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M0 0 L10 5 L0 10Z" fill="#8892b0"/>
+    </marker>
+  </defs>
+  <rect width="800" height="480" fill="#0f1220"/>
+  <g font-family="sans-serif" font-size="26" fill="#e6f1ff" text-anchor="middle">
+    <rect x="40" y="190" width="190" height="100" rx="14" fill="#1d2b53" stroke="#4cc9f0" stroke-width="4"/>
+    <text x="135" y="248">mod hook</text>
+    <rect x="305" y="190" width="190" height="100" rx="14" fill="#3a1d53" stroke="#f72585" stroke-width="4"/>
+    <text x="400" y="248">$.process</text>
+    <rect x="570" y="60" width="190" height="100" rx="14" fill="#1d533a" stroke="#80ed99" stroke-width="4"/>
+    <text x="665" y="118">rsvg-convert</text>
+    <rect x="570" y="320" width="190" height="100" rx="14" fill="#53431d" stroke="#ffd166" stroke-width="4"/>
+    <text x="665" y="378">magick</text>
+  </g>
+  <g stroke="#8892b0" stroke-width="4" fill="none" marker-end="url(#a)">
+    <path d="M230 240 H300"/>
+    <path d="M495 215 L565 135"/>
+    <path d="M495 265 L565 345"/>
+  </g>
+  <g font-family="sans-serif" font-size="18" fill="#8892b0" text-anchor="middle">
+    <text x="400" y="330">PNG in /dev/shm</text>
+    <text x="400" y="355">Image or Raster</text>
+  </g>
+</svg>

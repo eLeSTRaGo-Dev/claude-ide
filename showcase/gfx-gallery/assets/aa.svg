@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="480" viewBox="0 0 800 480">
+  <rect width="800" height="480" fill="#101010"/>
+  <g fill="none" stroke-width="3">
+    <g stroke="#ff595e">
+      <line x1="40" y1="40" x2="760" y2="60"/><line x1="40" y1="60" x2="760" y2="100"/>
+      <line x1="40" y1="80" x2="760" y2="140"/>
+    </g>
+    <g stroke="#8ac926">
+      <circle cx="400" cy="300" r="40"/><circle cx="400" cy="300" r="80"/>
+      <circle cx="400" cy="300" r="120"/><circle cx="400" cy="300" r="160"/>
+    </g>
+    <g stroke="#1982c4" stroke-width="1.2">
+      <path d="M40 440 C200 200 340 460 480 240 S720 440 760 200"/>
+      <path d="M40 420 C200 180 340 440 480 220 S720 420 760 180"/>
+    </g>
+  </g>
+  <g font-family="serif" fill="#fff">
+    <text x="60" y="230" font-size="64" font-style="italic">Anti-aliasing</text>
+    <text x="60" y="270" font-size="22">curves, hairlines and glyph edges</text>
+    <text x="60" y="296" font-size="12">tiny text: the quick brown fox jumps over the lazy dog</text>
+  </g>
+</svg>

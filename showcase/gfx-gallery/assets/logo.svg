@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="480" viewBox="0 0 800 480">
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1b1464"/>
+      <stop offset="0.55" stop-color="#c0392b"/>
+      <stop offset="1" stop-color="#f6b93b"/>
+    </linearGradient>
+    <radialGradient id="sun" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#fffbe0"/>
+      <stop offset="0.6" stop-color="#ffd166"/>
+      <stop offset="1" stop-color="#ff8c42"/>
+    </radialGradient>
+    <linearGradient id="hill" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2d1b4e"/>
+      <stop offset="1" stop-color="#0b3d3a"/>
+    </linearGradient>
+  </defs>
+  <rect width="800" height="480" fill="url(#sky)"/>
+  <circle cx="400" cy="250" r="120" fill="url(#sun)"/>
+  <path d="M0 360 Q160 250 320 330 T640 300 T800 340 V480 H0Z" fill="url(#hill)"/>
+  <path d="M0 420 Q200 350 400 410 T800 390 V480 H0Z" fill="#0a1f2e"/>
+  <g fill="#fff" opacity="0.85">
+    <circle cx="90" cy="60" r="3"/><circle cx="210" cy="110" r="2"/><circle cx="330" cy="50" r="2.5"/>
+    <circle cx="560" cy="80" r="3"/><circle cx="690" cy="130" r="2"/><circle cx="740" cy="40" r="2.5"/>
+  </g>
+  <text x="400" y="460" text-anchor="middle" font-family="sans-serif" font-size="42" font-weight="bold" fill="#fff">rsvg-convert</text>
+</svg>
