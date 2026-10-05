@@ -63,3 +63,7 @@ export const classify = (guids: readonly string[], index: GuidIndex): Ref[] =>
 // Line 2 of a `.meta` file: `guid: <32 hex>`.
 export const metaGuid = (text: string): string | undefined =>
   /^guid: ([0-9a-f]{32})\s*$/m.exec(text)?.[1]
+
+// Bash commands that can move, add or remove `.meta` files.
+export const isIndexCommand = (command: string): boolean =>
+  /\b(git|mv|rm|cp|unity)\b/.test(command)

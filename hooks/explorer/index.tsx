@@ -15,7 +15,14 @@ import {
 } from './tree'
 import type { Entry, Mode, Row } from './tree'
 import { GIT_COMMAND } from '../git/git'
-import { classify, hasRefs, metaGuid, parseGrep, refsOf } from './unity'
+import {
+  classify,
+  hasRefs,
+  isIndexCommand,
+  metaGuid,
+  parseGrep,
+  refsOf,
+} from './unity'
 import type { GuidIndex, Ref } from './unity'
 
 type On = Parameters<Register>[0]
@@ -30,7 +37,7 @@ const explorer = atom<'ide-panes', 'explorer'>(
 
 // Listings and git-ignore results are cached here, not in $.state: they are
 // cheap to rebuild (render re-lists every expanded dir after a reload) and
-// $.state should stay small. `refresh` and stage 4 invalidate them.
+// $.state should stay small. `refresh` and the tool.call hook invalidate them.
 const listings = new Map<string, Entry[]>()
 const ignored = new Set<string>()
 // Whether a root holds `ProjectSettings/ProjectVersion.txt`; checked in Unity
@@ -302,6 +309,15 @@ const loadPreview = async (
   }
 }
 
+// Drops the cached listing of the file's dir and of the file itself.
+const dropFile = (file: string): void => {
+  for (const path of [file, parentOf(file)]) {
+    listings.delete(path)
+    ignored.delete(path)
+  }
+  if (file.endsWith('.meta')) indexes.clear()
+}
+
 export const register = (on: On): void => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
@@ -326,6 +342,43 @@ export const register = (on: On): void => {
     })
 
     return next(e)
+  })
+
+  // Refresh after Claude changes files; never denies or rewrites the call.
+  // One hook per tool: the validator refuses two unmatched tool.call hooks.
+  on('tool.call', { tool: 'Write' }, async ($, e, next) => {
+    const ran = await next(e)
+    dropFile(e.file_path)
+    $.ui.invalidate('ui.render')
+
+    return ran
+  })
+
+  on('tool.call', { tool: 'Edit' }, async ($, e, next) => {
+    const ran = await next(e)
+    dropFile(e.file_path)
+    $.ui.invalidate('ui.render')
+
+    return ran
+  })
+
+  on('tool.call', { tool: 'NotebookEdit' }, async ($, e, next) => {
+    const ran = await next(e)
+    dropFile(e.notebook_path)
+    $.ui.invalidate('ui.render')
+
+    return ran
+  })
+
+  on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
+    const ran = await next(e)
+    listings.clear()
+    ignored.clear()
+    unityRoots.clear()
+    if (isIndexCommand(e.command)) indexes.clear()
+    $.ui.invalidate('ui.render')
+
+    return ran
   })
 
   on('command.run', { command: 'explorer' }, async ($, e) => {
@@ -412,14 +465,16 @@ export const register = (on: On): void => {
           )}
           <Button
             key="mode"
-            label={'mode: ' + state.mode}
+            hotkey="m"
+            label={'mode: ' + state.mode + ' (m)'}
             onPress={() =>
               setMode($, state.mode === 'files' ? 'unity' : 'files')
             }
           />
           <Button
             key="refresh"
-            label="refresh"
+            hotkey="r"
+            label="refresh (r)"
             onPress={() => {
               listings.clear()
               ignored.clear()

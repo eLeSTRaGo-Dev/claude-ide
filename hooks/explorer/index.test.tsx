@@ -1,4 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
+import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 const CWD = '/proj'
@@ -46,6 +47,7 @@ const fake = (
   on: On,
   calls: string[][] = [],
   opened: unknown[] = [],
+  names: string[] = [],
 ): void => {
   on('fs.list', (_$, e) => ({ value: TREE[e.path] ?? [] }))
   on('fs.stat', (_$, e) => {
@@ -98,7 +100,11 @@ const fake = (
   })
   on('session.cwd', () => ({ value: CWD }))
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
-  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('command.register', (_$, e) => {
+    names.push(e.name)
+
+    return { value: { command: e.name } }
+  })
   on('ui.open', (_$, e) => {
     opened.push({ id: e.id, focus: e.focus })
 
@@ -412,3 +418,73 @@ test('command opens the pane and sets the mode', async ($, on) => {
   })
   expect(bad.text).toContain('Usage')
 })
+
+test('session.start registers both /explorer and /git', async ($, on) => {
+  mock.store(on)
+  const names: string[] = []
+  fake(on, [], [], names)
+  await $.session.start(start('terminal'))
+
+  expect(names.sort()).toEqual(['explorer', 'git'])
+})
+
+for (const surface of ['terminal', 'desktop'] as const) {
+  const mount = ($: Engine) =>
+    $.ui.mount({
+      plugin: PLUGIN,
+      surface,
+      component: 'Pane',
+      props: PROPS,
+      requestId: 'ide-explorer',
+      viewport: VIEWPORT,
+    })
+
+  // The test's own bottom hook: the tool "runs" and reports success.
+  const done = () => ({ result: {}, text: '' }) as never
+
+  test(`${surface}: a Write of a new file shows its row without refresh`, async ($, on) => {
+    mock.store(on)
+    fake(on)
+    on('tool.call', done)
+    await $.session.start(start(surface))
+    const ui = await mount($)
+    await ui.press({ key: 'row:/proj/src' })
+    expect(await ui.find({ key: 'row:/proj/src/new.ts' })).toBeUndefined()
+
+    TREE['/proj/src'] = [...(TREE['/proj/src'] ?? []), entry('new.ts', 'file')]
+    await $.tool.call({
+      tool: 'Write',
+      file_path: '/proj/src/new.ts',
+      content: 'x',
+    })
+    expect(await ui.find({ key: 'row:/proj/src/new.ts' })).toBeDefined()
+    TREE['/proj/src'] = [entry('main.ts', 'file', 40)]
+  })
+
+  test(`${surface}: a Bash call re-lists the tree`, async ($, on) => {
+    mock.store(on)
+    fake(on)
+    on('tool.call', done)
+    await $.session.start(start(surface))
+    const ui = await mount($)
+    expect(await ui.find({ key: 'row:/proj/fresh.txt' })).toBeUndefined()
+
+    TREE['/proj'] = [...(TREE['/proj'] ?? []), entry('fresh.txt', 'file')]
+    await $.tool.call({ tool: 'Bash', command: 'touch fresh.txt' })
+    expect(await ui.find({ key: 'row:/proj/fresh.txt' })).toBeDefined()
+    TREE['/proj'] = (TREE['/proj'] ?? []).filter(x => x.name !== 'fresh.txt')
+  })
+
+  test(`${surface}: hotkeys m and r are set and work`, async ($, on) => {
+    mock.store(on)
+    fake(on)
+    await $.session.start(start(surface))
+    const ui = await mount($)
+
+    const mode = await ui.find({ key: 'mode' })
+    expect(mode?.props.hotkey).toBe('m')
+    expect((await ui.find({ key: 'refresh' }))?.props.hotkey).toBe('r')
+    await ui.press({ key: 'mode' })
+    expect(await ui.find({ type: 'Text', text: /Unity/ })).toBeDefined()
+  })
+}

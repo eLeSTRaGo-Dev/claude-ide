@@ -33,12 +33,18 @@ const fake = (
   calls: string[][],
   isRepo = true,
   log = GRAPH,
+  head: { name: string } = { name: 'main' },
 ): void => {
   on('process.run', (_$, e) => {
     calls.push([...e.argv])
     if (!isRepo) return result('', 128)
     const sub = e.argv[1]
-    if (sub === 'rev-parse') return result(CWD + '\n')
+    if (sub === 'rev-parse') {
+      if (e.argv.includes('--abbrev-ref')) return result(head.name + '\n')
+      if (e.argv.includes('--short')) return result('abc1234\n')
+
+      return result(CWD + '\n')
+    }
     if (sub === 'for-each-ref') return result(BRANCHES)
     if (sub === 'log') return result(log)
     if (sub === 'show') {
@@ -148,5 +154,102 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect(
       await ui.find({ type: 'Text', text: /Not a git repository/ }),
     ).toBeDefined()
+  })
+}
+
+for (const surface of ['terminal', 'desktop'] as const) {
+  const bash = (command: string) => ({ tool: 'Bash', command }) as const
+
+  test(`${surface}: status shows the branch, follows Bash, clears outside a repo`, async ($, on) => {
+    mock.store(on)
+    const head = { name: 'main' }
+    fake(on, [], true, GRAPH, head)
+    const statuses: unknown[] = []
+    on('ui.status', (_$, e) => {
+      statuses.push(e.text)
+
+      return { value: undefined }
+    })
+    on('prompt.submit', (_$, e) => e)
+    on('tool.call', () => ({ result: {}, text: '' }) as never)
+    await $.session.start(start(surface))
+    // the explorer owns session.start; the git view sets status on first prompt
+    await $.prompt.submit({ text: 'hi' } as never)
+    expect(statuses).toEqual(['⎇ main'])
+
+    head.name = 'feature'
+    await $.tool.call(bash('git switch feature'))
+    expect(statuses).toEqual(['⎇ main', '⎇ feature'])
+
+    await $.tool.call(bash('ls'))
+    expect(statuses.length).toBe(2)
+
+    head.name = 'HEAD'
+    await $.tool.call(bash('git checkout abc'))
+    expect(statuses[2]).toBe('⎇ abc1234')
+  })
+
+  test(`${surface}: status is cleared outside a repo`, async ($, on) => {
+    mock.store(on)
+    fake(on, [], false)
+    const statuses: unknown[] = []
+    on('ui.status', (_$, e) => {
+      statuses.push(e.text)
+
+      return { value: undefined }
+    })
+    on('prompt.submit', (_$, e) => e)
+    await $.session.start(start(surface))
+    await $.prompt.submit({ text: 'hi' } as never)
+
+    expect(statuses).toEqual([undefined])
+  })
+
+  test(`${surface}: a Bash call re-runs git log on the next render`, async ($, on) => {
+    mock.store(on)
+    const calls: string[][] = []
+    fake(on, calls)
+    on('tool.call', () => ({ result: {}, text: '' }) as never)
+    await $.session.start(start(surface))
+    const ui = await $.ui.mount({
+      plugin: PLUGIN,
+      surface,
+      component: 'Pane',
+      props: props(120),
+      requestId: 'ide-git',
+      viewport: VIEWPORT,
+    })
+    const logs = () => calls.filter(a => a[1] === 'log').length
+    expect(logs()).toBe(1)
+
+    await $.tool.call(bash('git commit -m x'))
+    await ui.find({ key: 'all' })
+    expect(logs()).toBe(2)
+  })
+
+  test(`${surface}: hotkeys a and r are set; r reloads`, async ($, on) => {
+    mock.store(on)
+    const calls: string[][] = []
+    fake(on, calls)
+    await $.session.start(start(surface))
+    const ui = await $.ui.mount({
+      plugin: PLUGIN,
+      surface,
+      component: 'Pane',
+      props: props(120),
+      requestId: 'ide-git',
+      viewport: VIEWPORT,
+    })
+
+    expect((await ui.find({ key: 'all' }))?.props.hotkey).toBe('a')
+    expect((await ui.find({ key: 'refresh' }))?.props.hotkey).toBe('r')
+    await ui.press({ key: 'branch:origin/main' })
+    const before = calls.filter(a => a[1] === 'log').length
+    await ui.press({ key: 'all' })
+    expect(
+      calls.filter(a => a[1] === 'log' && a.includes('--all')).length,
+    ).toBeGreaterThan(0)
+    await ui.press({ key: 'refresh' })
+    expect(calls.filter(a => a[1] === 'log').length).toBeGreaterThan(before)
   })
 }

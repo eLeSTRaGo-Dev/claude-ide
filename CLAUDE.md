@@ -47,3 +47,22 @@ There is no single-test flag; to run one test, narrow the test files or the `tes
 - Write UI tests once and loop them over `['terminal', 'desktop'] as const`.
 
 For any API detail, grep the generated `.claude-plugin/types/claude-code/index.d.ts` (or the skill's `claude-code.d.ts` before the first load) for the event or noun name, e.g. `'tool.call'`, `Pane: {`.
+
+## Features
+
+- `/explorer` (`hooks/explorer/`): file tree and preview pane; `files` and `unity` modes (Unity: `.meta` GUID references). Pure helpers in `tree.ts`, `unity.ts`.
+- `/git` (`hooks/git/`): read-only branches, commit graph and diff pane; the current branch also shows in the status line. Pure helpers in `git.ts`.
+- Caches are module-level in each `index.tsx` (not `$.state`): explorer `listings`, `ignored`, `unityRoots`, GUID `indexes`; git `repoRoot`, `branchCache`, `graphCache`, `showCache`.
+- Cleared by: the `refresh` button (`r`) and each feature's `tool.call` hooks. Explorer: `Write`/`Edit`/`NotebookEdit` drop that file and its parent dir; `Bash` drops all listings (and the GUID index when the command matches `git|mv|rm|cp|unity`). Git: `Bash` clears all and re-reads the branch. The hooks never deny or rewrite a call.
+- Hotkeys on header Buttons: `r` refresh (both), `m` mode (explorer), `a` all branches (git).
+- `$.state` atoms under `ide-panes`: `explorer` (`root`, `mode`, `expanded`, `selected`, `offset`) and `git` (`ref`, `selected`, `offset`, `limit`). `$.store` key `explorer.mode:<root>` holds the saved mode.
+- The explorer owns the plugin's only `session.start` hook and registers both commands; git sets its status line on the first `prompt.submit` and after each `Bash` call.
+
+## Validator constraints
+
+- `hooks.json` `modules` takes one entry; a second is refused.
+- One unmatched `session.start` hook per plugin; use a `{ tool }` matcher for each extra `tool.call` hook (one hook per tool per feature; the same `{ tool: 'Bash' }` in two features is accepted).
+- `$` is followed only into functions declared in the same file, never across an import: keep `$`-using code in each feature's `index.tsx`, pure helpers in `.ts` files.
+- Feature `register`s must be imported by name; no namespace import receiving `on`.
+- Every `$.state` key must be declared in `types/index.d.ts`.
+- Tests: the kit has no hotkey act; assert `props.hotkey` and press the Button by key.

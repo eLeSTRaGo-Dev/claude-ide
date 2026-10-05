@@ -29,7 +29,8 @@ const git = atom<'ide-panes', 'git'>(
   { ref: 'all', offset: 0, limit: PAGE } satisfies GitState,
 )
 
-// Git output is cached here, not in $.state; `refresh` clears it.
+// Git output is cached here, not in $.state; `refresh` and Bash tool calls
+// clear it.
 let repoRoot: string | null | undefined
 let branchCache: Branch[] | undefined
 const graphCache = new Map<string, GraphLine[]>()
@@ -123,11 +124,43 @@ const detailsOf = async (
 const fit = (text: string, width: number): string =>
   text.length > width ? text.slice(0, Math.max(1, width - 1)) + '…' : text
 
+// Last status text set; null: nothing set yet (always set the first time).
+let shown: string | undefined | null = null
+
+// Current branch (a short sha when detached) in the status line; cleared
+// outside a repo. Skips the update when the text is unchanged.
+const showBranch = async ($: EngineInterface, cwd: string): Promise<void> => {
+  let name = (await run($, cwd, ['git', 'rev-parse', '--abbrev-ref', 'HEAD']))?.trim()
+  if (name === 'HEAD') {
+    name = (await run($, cwd, ['git', 'rev-parse', '--short', 'HEAD']))?.trim()
+  }
+  const text = name === undefined || name === '' ? undefined : '⎇ ' + name
+  if (text === shown) return
+  shown = text
+  await $.ui.status(text)
+}
+
 const keyOf = (line: GraphLine): string => 'commit:' + (line.commit?.sha ?? '')
 
 export const register = (on: On): void => {
-  // The `git` command is registered by the explorer's session.start hook: the
-  // validator allows one unmatched session.start hook per plugin.
+  // The explorer owns the plugin's only session.start hook, so the status line
+  // is first set on the first prompt (or Bash call) of a session.
+  on('prompt.submit', async ($, e, next) => {
+    await showBranch($, await $.session.cwd())
+
+    return next(e)
+  })
+
+  // Refresh after Bash may have run git; never denies or rewrites the call.
+  on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
+    const ran = await next(e)
+    clear()
+    await showBranch($, await $.session.cwd())
+    $.ui.invalidate('ui.render')
+
+    return ran
+  })
+
   on('command.run', { command: 'git' }, async $ => {
     await $.ui.open({ id: PANE, title: 'Git', focus: true })
 
@@ -165,7 +198,7 @@ export const register = (on: On): void => {
         <Box flexDirection="column">
           <Text bold>Git</Text>
           <Text dimColor>Not a git repository</Text>
-          <Button key="refresh" label="refresh" onPress={() => {
+          <Button key="refresh" hotkey="r" label="refresh (r)" onPress={() => {
             clear()
             $.ui.invalidate('ui.render')
           }} />
@@ -220,8 +253,9 @@ export const register = (on: On): void => {
       <Box flexDirection="column" width={isWide ? '20%' : '30%'}>
         <Button
           key="all"
+          hotkey="a"
           plain
-          label={(state.ref === 'all' ? '>' : ' ') + ' all'}
+          label={(state.ref === 'all' ? '>' : ' ') + ' all (a)'}
           onPress={() => select('all')}
         />
         {branchRows.map(branch => (
@@ -309,7 +343,8 @@ export const register = (on: On): void => {
           <Text>{head0 === undefined ? '(detached)' : head0.name}</Text>
           <Button
             key="refresh"
-            label="refresh"
+            hotkey="r"
+            label="refresh (r)"
             onPress={() => {
               clear()
               $.ui.invalidate('ui.render')
