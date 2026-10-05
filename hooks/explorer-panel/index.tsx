@@ -571,11 +571,7 @@ const startEdit = async ($: EngineInterface, path: string): Promise<void> => {
       isNew: stat === undefined ? true : undefined,
     },
   }))
-  try {
-    await $.ui.focus({ requestId: PANE, key: 'editor' })
-  } catch {
-    // the person clicks into it
-  }
+  focusOn($, 'editor')
 }
 
 // Reads the text of `edit.version`: the draft when it is newer than the file
@@ -681,12 +677,26 @@ const closeEdit = async ($: EngineInterface): Promise<void> => {
 const relativeDir = (dir: string, root: string): string =>
   dir === root ? './' : dir.startsWith(root + '/') ? dir.slice(root.length + 1) + '/' : dir + '/'
 
-const focusOn = async ($: EngineInterface, key: string): Promise<void> => {
-  try {
-    await $.ui.focus({ requestId: PANE, key })
-  } catch {
-    // the person clicks into it
-  }
+// Moves the ring onto `key` once the press that drew it has returned: awaited
+// inside the press, the focus waits on a drawing that cannot come until the
+// press ends, and is denied. A click leaves the keyboard with the prompt, and
+// `$.ui.focus` moves only a ring the pane holds, so the pane asks for the keys
+// first (re-opening it with `focus`; the surface grants that only over an empty
+// composer). A deny (not drawn yet, a row's autoFocus first) retries a few
+// times; after that the person clicks into it.
+const focusOn = ($: EngineInterface, key: string, tries = 4): void => {
+  $.clock.after(50, async () => {
+    try {
+      const pane = (await $.ui.panes()).find(p => p.id === PANE)
+      if (pane !== undefined && !pane.isFocused) {
+        await $.ui.open({ id: PANE, title: 'Explorer', focus: true })
+      }
+      const moved = await $.ui.focus({ requestId: PANE, key })
+      if (moved.deny !== undefined && tries > 1) focusOn($, key, tries - 1)
+    } catch {
+      // the person clicks into it
+    }
+  })
 }
 
 // `new (n)`: the name field on the interactive line, for a file in `dir`. Unsaved
@@ -699,7 +709,7 @@ const openNaming = async ($: EngineInterface, dir: string): Promise<void> => {
     await update($, explorer, s => ({ ...s, deleting: undefined }))
   }
   $.ui.invalidate('ui.render')
-  await focusOn($, 'new-file')
+  focusOn($, 'new-file')
 }
 
 const closeNaming = ($: EngineInterface): void => {
