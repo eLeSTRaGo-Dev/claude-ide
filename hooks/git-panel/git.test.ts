@@ -5,6 +5,7 @@ import {
   branchTree,
   changeDiffArgv,
   changeGlyph,
+  containsArgv,
   changeRows,
   fileDiff,
   filesArgv,
@@ -26,6 +27,7 @@ import {
   layoutGraph,
   changeCounts,
   parseBranches,
+  parseContains,
   parseStatus,
   shortDir,
   parseLog,
@@ -190,6 +192,26 @@ test('cellRuns and infoHead', () => {
     'refs origin/main',
     'subject',
   ])
+  const m = { ...commit('m', '1234567890'), refs: [] }
+  expect(
+    infoHead(['sha', 'A', 'date', '', 'subject'], m, { local: ['fix', 'main'], remote: ['origin/main', 'up/x'] }, 'main'),
+  ).toEqual([
+    'sha',
+    'A',
+    'date',
+    'parents 1234567',
+    'local  fix, *main',
+    'remote origin/main, up/x',
+    'subject',
+  ])
+  expect(infoHead(['sha', 'A', 'date'], m, { local: ['main'], remote: [] })).toEqual([
+    'sha',
+    'A',
+    'date',
+    'parents 1234567',
+    'local  main',
+  ])
+  expect(infoHead(['sha', 'A', 'date'], m, { local: [], remote: [] })).toEqual(['sha', 'A', 'date', 'parents 1234567'])
 })
 
 test('helpers', () => {
@@ -315,18 +337,34 @@ test('branchTree groups branches by / with local first', () => {
     [b('main', false, true), b('fix/a'), b('fix/b'), b('origin/main', true), b('origin/team/x', true)],
     new Set(),
   )
-  expect(rows.map(r => '  '.repeat(r.depth) + (r.kind === 'folder' ? r.name + '/' : r.name))).toEqual([
-    'main',
-    'fix/',
-    '  a',
-    '  b',
-    'origin/',
+  const label = (r: (typeof rows)[number]) =>
+    '  '.repeat(r.depth) + (r.kind === 'folder' ? (r.isGroup === true ? `[${r.name} ${r.count}]` : r.name + '/') : r.name)
+  expect(rows.map(label)).toEqual([
+    '[Local 3]',
     '  main',
-    '  team/',
-    '    x',
+    '  fix/',
+    '    a',
+    '    b',
+    '[Remote 2]',
+    '  origin/',
+    '    main',
+    '    team/',
+    '      x',
   ])
+  expect(rows[0]).toMatchObject({ kind: 'folder', key: 'l:', isOpen: true, isGroup: true })
+  expect(rows[5]).toMatchObject({ kind: 'folder', key: 'r:', isOpen: true, isGroup: true })
   const shut = branchTree([b('fix/a'), b('origin/main', true)], new Set(['l:fix']))
-  expect(shut.map(r => r.name)).toEqual(['fix', 'origin', 'main'])
+  expect(shut.map(r => r.name)).toEqual(['Local', 'fix', 'Remote', 'origin', 'main'])
+  // Collapsing `r:` hides every remote row but keeps its category row.
+  const noRemote = branchTree(
+    [b('main'), b('origin/main', true), b('origin/team/x', true)],
+    new Set(['r:']),
+  )
+  expect(noRemote.map(label)).toEqual(['[Local 1]', '  main', '[Remote 2]'])
+  expect(noRemote[2]).toMatchObject({ isOpen: false })
+  // An empty group has no category row.
+  expect(branchTree([b('main')], new Set()).map(r => r.name)).toEqual(['Local', 'main'])
+  expect(branchTree([], new Set())).toEqual([])
 })
 
 test('remote actions: argv and summaries', () => {
@@ -486,4 +524,38 @@ test('fileDiff: the block of one path', () => {
   expect(fileDiff(MULTI_PATCH, 'src/b.ts')).toContain('rename to src/b.ts')
     expect(fileDiff(PATCH, 'CHANGELOG.md')).toBe(PATCH)
   expect(fileDiff(MERGE_PATCH, 'nope')).toBe('')
+})
+
+test('layoutGraph: each row carries its lane color', () => {
+  const rows = layoutGraph([commit('m', 'a', 'b'), commit('a', 'r'), commit('b', 'r'), commit('r')])
+  expect(rows.map(row => row.lane)).toEqual([0, 0, 1, 0])
+  expect(rows[1]?.color).toBe(rows[0]?.color)
+  expect(rows[3]?.color).toBe(rows[0]?.color)
+  expect(rows[2]?.color).not.toBe(rows[0]?.color)
+  expect(rows[2]?.color).toBe(rows[0]?.cells[2]?.color)
+})
+
+test('layoutGraph: a collapsed lane keeps its row color', () => {
+  const commits = [commit('m', 'a', 'b'), commit('a', 'r'), commit('b', 'r'), commit('r')]
+  const full = layoutGraph(commits)
+  const capped = layoutGraph(commits, 1)
+  expect(capped[2]?.lane).toBe(1)
+  expect(capped[2]?.color).toBe(full[2]?.color)
+  expect(capped[2]?.color).not.toBe(capped[0]?.color)
+})
+
+test('containsArgv and parseContains', () => {
+  expect(containsArgv('abc')).toEqual(['git', 'branch', '-a', '--contains', 'abc', '--format=%(refname)'])
+  const stdout = [
+    'refs/remotes/origin/HEAD',
+    'refs/remotes/origin/main',
+    'refs/heads/main',
+    '(HEAD detached at abc1234)',
+    'refs/remotes/upstream/fix/x',
+    'refs/heads/fix/y',
+    'refs/tags/v1',
+    '',
+  ].join('\n')
+  expect(parseContains(stdout)).toEqual({ local: ['main', 'fix/y'], remote: ['origin/main', 'upstream/fix/x'] })
+  expect(parseContains('')).toEqual({ local: [], remote: [] })
 })

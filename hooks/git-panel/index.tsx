@@ -31,8 +31,11 @@ import {
   diffGutter,
   diffLines,
   infoHead,
+  containsArgv,
+  LANE_COLORS,
   layoutGraph,
   logArgv,
+  parseContains,
   PALETTE_SIZE,
   parseBranches,
   parseLog,
@@ -45,7 +48,7 @@ import {
   statusArgv,
   trackLabel,
 } from './git'
-import type { Branch, BranchRow, Change, ChangeRow, Commit, GraphRow, RemoteAction } from './git'
+import type { Branch, BranchRow, Change, ChangeRow, Commit, Contains, GraphRow, RemoteAction } from './git'
 
 type On = Parameters<Register>[0]
 
@@ -70,18 +73,6 @@ const GLYPH_COLOR: Record<string, string> = {
   '?': 'green',
 }
 
-// Lane-run colors, readable on black.
-const LANE_COLORS = [
-  'ansi256(75)',
-  'ansi256(114)',
-  'ansi256(176)',
-  'ansi256(215)',
-  'ansi256(80)',
-  'ansi256(203)',
-  'ansi256(185)',
-  'ansi256(147)',
-]
-
 // Ref badges: tags yellow, remote branches dim red, the rest green.
 const refColor = (ref: string, remotes: ReadonlySet<string>): string =>
   ref.startsWith('tag: ') ? 'yellow' : remotes.has(ref) ? 'red' : 'green'
@@ -95,7 +86,7 @@ const WIDE = 140
 // Default split fractions: Branches' width (`sideWide` from WIDE columns, else
 // `sideNarrow`), Info's share of the Overview's right column, Files' width in
 // Change Log. Each is applied in one place in the render hook.
-const SPLIT = { sideWide: 0.2, sideNarrow: 0.3, info: 0.4, files: 0.3 } as const
+const SPLIT = { sideWide: 0.2, sideNarrow: 0.3, info: 0.4, files: 0.3, graph: 0.35 } as const
 
 type Tab = 'overview' | 'graph' | 'changelog'
 
@@ -126,6 +117,21 @@ const showCache = new Map<string, { head: string[]; diff: string }>()
 // `clear()` only: commits do not change on Write/Edit.
 const diffCache = new Map<string, { files: Change[]; patch: string }>()
 const changeCache = new Map<string, { head: string[]; diff: string }>()
+// The branches containing a commit (the Commits hover card, Info), per sha.
+const containsCache = new Map<string, Contains>()
+// The commit under the resting pointer (its card is up), and the shas of the
+// commit rows as last drawn, top to bottom (the hash Client's `y`), with the
+// key of the Client drawn for them: `dots` in Commits, `shas` in Graph.
+// Transient, so module variables, not `$.state`.
+let hovered: string | undefined
+let commitWindow: { element: string; shas: string[] } = { element: '', shas: [] }
+// How long the pointer rests on a dot or hash before its card shows.
+const HOVER_MS = 600
+// Branch names a card lists before `+N more`: half per group, all of it
+// when the other group is empty.
+const CARD_NAMES = 8
+// Columns of a Commits row's dot and the space after it.
+const DOT_COLS = 2
 let hasHead: boolean | undefined
 // Diff Preview's body width (Code's gutter + widest body line) for the last
 // diff measured: one entry keyed by the diff string, so a redraw of the same
@@ -169,6 +175,7 @@ const SEAMS = {
   'split:side': { key: 'side', axis: 'x', min: MIN_COLS },
   'split:info': { key: 'info', axis: 'y', min: MIN_ROWS },
   'split:files': { key: 'files', axis: 'x', min: MIN_COLS },
+  'split:graph': { key: 'graph', axis: 'y', min: MIN_ROWS },
 } as const
 
 // The section sizes, global (every repo): the whole `split` object, written
@@ -182,7 +189,7 @@ let layoutLoaded = false
 let storedLayout: GitState['split']
 
 const loadLayout = async ($: EngineInterface): Promise<void> => {
-  storedLayout = layoutOf(await $.store.get(LAYOUT_KEY), ['side', 'info', 'files']) as GitState['split']
+  storedLayout = layoutOf(await $.store.get(LAYOUT_KEY), ['side', 'info', 'files', 'graph']) as GitState['split']
   layoutLoaded = true
 }
 
@@ -197,6 +204,7 @@ const clear = (): void => {
   showCache.clear()
   diffCache.clear()
   changeCache.clear()
+  containsCache.clear()
   hasHead = undefined
 }
 
@@ -298,6 +306,23 @@ const detailsOf = async (
   }
 
   return shown
+}
+
+// Every branch containing the commit, local and remote apart.
+const containsOf = async (
+  $: EngineInterface,
+  cwd: string,
+  sha: string,
+): Promise<Contains> => {
+  let names = containsCache.get(sha)
+  if (names === undefined) {
+    const before = threw
+    names = parseContains((await run($, cwd, containsArgv(sha))) ?? '')
+    if (threw !== before) return names
+    containsCache.set(sha, names)
+  }
+
+  return names
 }
 
 // The files a commit changed and its whole patch (a merge against its first
@@ -560,10 +585,12 @@ export const register = (on: On): void => {
     const filesPart = isDiff ? 'diffFileOffset' : 'changeOffset'
     const pointer = e.pointer
     if (pointer !== undefined) {
-      // Change Log and the diff view: Files | Diff Preview. Graph: one list.
-      // Overview: Branches | Commits over Info.
+      // Change Log and the diff view: Files | Diff Preview. Graph: the list
+      // over Info. Overview: Branches | Commits over Info.
       const part = isGraph
-        ? 'offset'
+        ? pointer.row < view.infoTop
+          ? 'offset'
+          : 'infoOffset'
         : isFiles
         ? pointer.column < view.filesEnd
           ? filesPart
@@ -650,6 +677,41 @@ export const register = (on: On): void => {
   // A scrollbar dragged: the window moves, the selection stays (as the wheel).
   on('ui.message', { requestId: PANE }, async ($, e) => {
     const data = e.data as { offset?: unknown; start?: unknown; delta?: unknown; done?: unknown } | null
+    if (e.element === 'dots' || e.element === 'shas') {
+      // Only the window drawn for this Client maps its rows.
+      const shaAt = (y: unknown): string | undefined =>
+        e.element === commitWindow.element && typeof y === 'number' && Number.isInteger(y)
+          ? commitWindow.shas[y]
+          : undefined
+      const message = e.data as { hover?: unknown; press?: unknown } | null
+      if (message !== null && 'press' in message) {
+        // A click on a row's dot or hash: that commit is selected, as a press
+        // on its subject, and the keyboard moves to the subject Button.
+        const sha = shaAt(message.press)
+        if (sha === undefined) return {}
+        await update($, git, s => ({
+          ...s,
+          selected: sha,
+          infoOffset: s.selected === sha ? s.infoOffset : 0,
+          infoLeft: s.selected === sha ? s.infoLeft : 0,
+        }))
+        $.ui.invalidate('ui.render')
+        await $.ui.focus({ requestId: PANE, key: 'commit:' + sha })
+
+        return {}
+      }
+      // The pointer rested on a row's dot or hash (`hover: y`) or left it
+      // (`null`): the card shows that row's commit, its branches fetched once.
+      const sha = shaAt(message?.hover)
+      hovered = sha
+      $.ui.invalidate('ui.render')
+      if (sha !== undefined && !containsCache.has(sha)) {
+        await containsOf($, await $.session.root(), sha)
+        $.ui.invalidate('ui.render')
+      }
+
+      return {}
+    }
     const seam = SEAMS[e.element as keyof typeof SEAMS]
     if (seam !== undefined) {
       // A splitter dragged: the section's new size is where it started plus
@@ -660,9 +722,11 @@ export const register = (on: On): void => {
       const total = seam.axis === 'x' ? view.columns : view.area
       if (total <= 0) return {}
       const fraction = dragTo(total, start, delta, seam.min)
+      // Info's seams keep Info's share (the section below), not the top one's.
+      const isBelow = seam.key === 'info' || seam.key === 'graph'
       const after = await update($, git, s => ({
         ...s,
-        split: { ...(s.split ?? storedLayout), [seam.key]: seam.key === 'info' ? 1 - fraction : fraction },
+        split: { ...(s.split ?? storedLayout), [seam.key]: isBelow ? 1 - fraction : fraction },
       }))
       // The drag ended: the sizes outlive the session (mid-drag moves don't write).
       if (data?.done === true) await $.store.set(LAYOUT_KEY, after.split ?? {})
@@ -695,6 +759,9 @@ export const register = (on: On): void => {
     const elements = $.ui.resolve(e)
     const { Box, Text, Button, Code } = elements
     const Client = 'Client' in elements ? elements.Client : undefined
+    // The hash Client (dots and hashes, and so the hover card and the hash
+    // press) where a Client is drawn; elsewhere the hash is a Button.
+    const hasDots = Client !== undefined && (e.surface === 'terminal' || e.surface === 'desktop')
     const state = await read($, git)
     if (state.split === undefined && !layoutLoaded) await loadLayout($)
     const cwd = await $.session.root()
@@ -746,17 +813,22 @@ export const register = (on: On): void => {
     const topRows = Math.max(3, splitAt(area, 1 - (split.info ?? SPLIT.info), MIN_ROWS))
     // Files' width (Change Log).
     const filesCols = splitAt(columns, split.files ?? SPLIT.files, MIN_COLS)
+    // Graph's height; Info takes the rest of the panel (Graph).
+    const graphTop = Math.max(3, splitAt(area, 1 - (split.graph ?? SPLIT.graph), MIN_ROWS))
 
-    const infoRows = Math.max(3, area - topRows)
     const rightCols = columns - sideCols
+    // Graph: Graph over Info across the panel; Overview: Commits over Info in
+    // the right column. Info's size is the active tab's.
+    const isGraph = !isDiff && tab === 'graph'
+    const infoRows = Math.max(3, area - (isGraph ? graphTop : topRows))
+    const infoWidth = isGraph ? columns : rightCols
     // Each section is framed: 2 rows and 2 columns go to the border.
     const topInner = Math.max(3, topRows - 2)
+    const graphInner = Math.max(3, graphTop - 2)
     const infoInner = Math.max(3, infoRows - 2)
     const fullInner = Math.max(3, area - 2)
-    // Graph: one section across the panel; Overview: Commits in the right column.
-    const isGraph = !isDiff && tab === 'graph'
-    graphRows = Math.max(2, (isGraph ? fullInner : topInner) - 1)
-    tabRows.graph = Math.max(2, fullInner - 1)
+    graphRows = Math.max(2, (isGraph ? graphInner : topInner) - 1)
+    tabRows.graph = Math.max(2, graphInner - 1)
     tabRows.overview = Math.max(2, topInner - 1)
     const graphWidth = (isGraph ? columns : rightCols) - 5
     // the scrollbar takes one more column in each section
@@ -764,9 +836,9 @@ export const register = (on: On): void => {
 
     const branches = await branchesOf($, cwd)
     const lines = isChanges ? [] : await graphOf($, cwd, state)
-    // Lanes take what the row's other columns leave (Graph is wide, Overview compact).
-    const maxLanes = maxLanesFor(graphWidth, isGraph)
-    const laid = layoutGraph(lines, maxLanes)
+    // Graph's lanes take what the row's other columns leave; Commits draws one
+    // dot per row, so its lanes are never collapsed.
+    const laid = isGraph ? layoutGraph(lines, maxLanesFor(graphWidth, true)) : layoutGraph(lines)
     const index = lines.findIndex(commit => commit.sha === state.selected)
     const selected = index >= 0 ? lines[index] : lines[0]
     // The wheel moves the window off the selection, so it only clamps here.
@@ -774,6 +846,18 @@ export const register = (on: On): void => {
     // Rows are padded to the widest lanes in view, so the text lines up
     // without leaving room for lanes scrolled out of it.
     const laneCols = win.rows.reduce((max, row) => Math.max(max, row.cells.length), 0)
+    // Commits (Overview) or Graph, no diff view open: the rows as drawn, for
+    // the hash Client's `y`; a card whose commit left them, or another tab, goes.
+    const isCommits = !isDiff && !isChanges && !isGraph
+    const hashKey = isCommits ? 'dots' : 'shas'
+    const prevElement = commitWindow.element
+    commitWindow =
+      hasDots && (isCommits || isGraph)
+        ? { element: hashKey, shas: win.rows.map(row => row.commit.sha) }
+        : { element: '', shas: [] }
+    if (hovered !== undefined && (prevElement !== commitWindow.element || !commitWindow.shas.includes(hovered))) {
+      hovered = undefined
+    }
     const isMore = lines.length >= state.limit
     // A commit scrolled out of the window is not focused: autoFocus would move
     // the selection to whatever row the wheel brought in.
@@ -804,20 +888,23 @@ export const register = (on: On): void => {
         ? chosen === undefined
           ? undefined
           : await changeDetailsOf($, root, chosen)
-        : selected === undefined || isGraph
+        : selected === undefined
           ? undefined
           : await detailsOf($, cwd, selected.sha)
     const opened = lines.find(commit => commit.sha === state.diff)
+    // Info's `local` / `remote` lines: every branch containing the selected
+    // commit, fetched once per sha.
+    const contains = isFiles || selected === undefined ? undefined : await containsOf($, cwd, selected.sha)
     // Info: every head line, windowed by `infoOffset`.
     const infoAll =
       details === undefined || isFiles || selected === undefined
         ? []
-        : infoHead(details.head, selected)
+        : infoHead(details.head, selected, contains, branches.find(branch => branch.isHead)?.name)
     const infoMax = Math.max(0, infoAll.length - infoInner)
     const infoOffset = clamp(state.infoOffset ?? 0, infoMax)
     const infoShown = infoAll.slice(infoOffset, infoOffset + infoInner)
     // Info's columns, past the frame and the vertical bar, scrolled by `infoLeft`.
-    const infoCols = Math.max(1, rightCols - 3)
+    const infoCols = Math.max(1, infoWidth - 3)
     const infoWide = widest(infoAll)
     const infoLeftMax = Math.max(0, infoWide - infoCols)
     const infoLeft = clamp(state.infoLeft ?? 0, infoLeftMax)
@@ -847,7 +934,7 @@ export const register = (on: On): void => {
     view.area = area
     view.branchEnd = sideCols
     view.filesEnd = filesCols
-    view.infoTop = topRows + headerRows // the header lines sit above Commits
+    view.infoTop = (isGraph ? graphTop : topRows) + headerRows // the header lines sit above Commits or Graph
     view.branchMax = Math.max(0, tree.length - branchRoom)
     view.graphMax = Math.max(0, lines.length - graphRows)
     view.infoMax = infoMax
@@ -1082,6 +1169,25 @@ export const register = (on: On): void => {
           // Rails per depth as in the explorer; a folder opens or closes.
           const rails = '│ '.repeat(row.depth)
           const room = Math.max(4, sideWidth - 1 - rails.length)
+          if (row.kind === 'folder' && row.isGroup === true) {
+            // A category row: `▾ Local (N)` / `▸ Remote (N)`, the whole label a
+            // Button that opens or closes the group. A Button has no `bold`, so
+            // bold Text is drawn over it, as on the section titles; the press
+            // still lands on the Button.
+            const label = fit((row.isOpen ? '▾ ' : '▸ ') + row.name + ' (' + String(row.count ?? 0) + ')', room)
+
+            return (
+              <Box key={'bline:' + row.key} flexDirection="row">
+                <Text> </Text>
+                <Box>
+                  <Button key={'bdir:' + row.key} plain label={label} onPress={() => toggle(row.key)} />
+                  <Box position="absolute" top={0} left={0}>
+                    <Text bold>{label}</Text>
+                  </Box>
+                </Box>
+              </Box>
+            )
+          }
           if (row.kind === 'folder') {
             return (
               <Box key={'bline:' + row.key} flexDirection="row">
@@ -1130,8 +1236,28 @@ export const register = (on: On): void => {
       </Box>
     )
 
-    // One commit row: lanes, short sha, refs, subject; `wide` adds the dim author
-    // and date columns.
+    // A Commits row's dot: the commit's lane color, `○` for a merge.
+    const dotOf = (row: GraphRow) => ({
+      glyph: row.commit.parents.length > 1 ? '○' : '●',
+      color: LANE_COLORS[row.color % PALETTE_SIZE] ?? 'white',
+    })
+    // The short shas' columns (git may lengthen one to keep it unique).
+    const shortCols = win.rows.reduce((max, row) => Math.max(max, row.commit.short.length), 7)
+    // Columns before the hash: Graph's lanes and their space, or Commits' dot and space.
+    const leadCols = (wide: boolean) => (wide ? laneCols + 1 : DOT_COLS)
+
+    // A Graph row's lanes, padded to the widest lanes in view plus a space.
+    const lanesOf = (row: GraphRow) =>
+      cellRuns(row.cells, laneCols + 1).map((seg, i) => (
+        <Text key={'lane:' + i} color={LANE_COLORS[seg.color % PALETTE_SIZE]}>
+          {seg.text}
+        </Text>
+      ))
+
+    // One commit row: lanes (Graph) or a dot (Commits), marked short sha, refs,
+    // subject; `wide` adds the dim author and date columns. Where the hash
+    // Client is drawn, the lanes, dot and hash are columns of their own and the
+    // row starts at the refs; its subject Button then holds `commit:<sha>`.
     const commitRow = (row: GraphRow, width: number, wide: boolean) => {
       const { commit } = row
       const isSelected = commit.sha === selected?.sha
@@ -1142,7 +1268,9 @@ export const register = (on: On): void => {
           infoOffset: s.selected === commit.sha ? s.infoOffset : 0,
           infoLeft: s.selected === commit.sha ? s.infoLeft : 0,
         }))
-      const cols = graphColumns(width, laneCols, wide)
+      // Commits: a dot and a space instead of the lanes (`graphColumns` adds
+      // the lanes' trailing space itself).
+      const cols = graphColumns(width, wide ? laneCols : DOT_COLS - 1, wide)
       // refs that fit ~40% of the subject's room, the rest as `…`
       const refs: string[] = []
       let used = 0
@@ -1155,6 +1283,7 @@ export const register = (on: On): void => {
         used += ref.length + 1
       }
       const subjectCols = Math.max(1, cols.subject - used)
+      const autoFocus = keyOf(commit) === focusKey ? true : undefined
 
       return (
         <Box
@@ -1162,28 +1291,34 @@ export const register = (on: On): void => {
           flexDirection="row"
           backgroundColor={isSelected ? SELECTED : undefined}
         >
-          {cellRuns(row.cells, laneCols + 1).map((seg, i) => (
-            <Text key={'lane:' + i} color={LANE_COLORS[seg.color % PALETTE_SIZE]}>
-              {seg.text}
-            </Text>
-          ))}
-          <Button
-            key={keyOf(commit)}
-            plain
-            dimColor
-            autoFocus={keyOf(commit) === focusKey ? true : undefined}
-            label={(isSelected ? '>' : ' ') + commit.short}
-            onPress={pick}
-          />
-          <Text> </Text>
+          {!hasDots &&
+            (wide ? (
+              lanesOf(row)
+            ) : (
+              <Text key="dot" color={dotOf(row).color}>
+                {dotOf(row).glyph + ' '}
+              </Text>
+            ))}
+          {!hasDots && (
+            <Button
+              key={keyOf(commit)}
+              plain
+              dimColor
+              autoFocus={autoFocus}
+              label={(isSelected ? '>' : ' ') + commit.short}
+              onPress={pick}
+            />
+          )}
+          {!hasDots && <Text> </Text>}
           {refs.map((ref, i) => (
             <Text key={'ref:' + i} color={refColor(ref, remotes)} dimColor={remotes.has(ref) ? true : undefined}>
               {ref + ' '}
             </Text>
           ))}
           <Button
-            key={'subject:' + commit.sha}
+            key={hasDots ? keyOf(commit) : 'subject:' + commit.sha}
             plain
+            autoFocus={hasDots ? autoFocus : undefined}
             label={fit(commit.subject, subjectCols).padEnd(subjectCols)}
             onPress={pick}
           />
@@ -1211,12 +1346,51 @@ export const register = (on: On): void => {
     }
 
     // The windowed commit list with `more` and its scrollbar, as drawn in Commits
-    // (compact) and Graph (wide).
+    // (compact) and Graph (wide). Where a `Client` is drawn, the rows are three
+    // parallel columns: Graph's lanes, the hash Client (Commits' dot, the marker
+    // and the hash; it reports a resting pointer and a press), and the rest of
+    // each row. Each column paints the selected row's background.
     const commitList = (width: number, wide: boolean) => (
       <Box {...border} flexDirection="row" height="100%">
         <Box flexDirection="column" flexGrow={1}>
           {lines.length === 0 && <Text dimColor>(no commits)</Text>}
-          {win.rows.map(row => commitRow(row, width, wide))}
+          {hasDots && Client !== undefined && win.rows.length > 0 ? (
+            <Box flexDirection="row">
+              {wide && (
+                <Box flexDirection="column" flexShrink={0} width={leadCols(true)}>
+                  {win.rows.map(row => (
+                    <Box
+                      key={'lanes:' + row.commit.sha}
+                      flexDirection="row"
+                      backgroundColor={row.commit.sha === selected?.sha ? SELECTED : undefined}
+                    >
+                      {lanesOf(row)}
+                    </Box>
+                  ))}
+                </Box>
+              )}
+              <Client
+                key={wide ? 'shas' : 'dots'}
+                module="./dots-client.tsx"
+                props={{
+                  rows: win.rows.map(row => ({
+                    ...(wide ? {} : dotOf(row)),
+                    mark: row.commit.sha === selected?.sha ? '>' : ' ',
+                    short: row.commit.short.padEnd(shortCols),
+                  })),
+                  background: SELECTED,
+                  delayMs: HOVER_MS,
+                }}
+                width={(wide ? 0 : DOT_COLS) + 1 + shortCols + 1}
+                height={win.rows.length}
+              />
+              <Box flexDirection="column" flexGrow={1}>
+                {win.rows.map(row => commitRow(row, width, wide))}
+              </Box>
+            </Box>
+          ) : (
+            win.rows.map(row => commitRow(row, width, wide))
+          )}
           {isMore && (
             <Button
               key="more"
@@ -1230,22 +1404,91 @@ export const register = (on: On): void => {
       </Box>
     )
 
+    // The hovered commit's branches: a framed card over Commits or Graph
+    // (`wide`), `cols` × `rows`, its top on the row's line just past the hash;
+    // flipped to end on that line when it would pass the section's bottom
+    // border (the seam above Info), and kept inside the section's width.
+    const hoverCard = (wide: boolean, cols: number, rows: number) => {
+      if (hovered === undefined || !hasDots) return null
+      const at = commitWindow.shas.indexOf(hovered)
+      const commit = win.rows[at]?.commit
+      if (commit === undefined) return null
+      const names = containsCache.get(commit.sha)
+      const title = 'Branches · ' + commit.short
+      type Item = { text: string; isDim?: boolean; isBold?: boolean }
+      // One group: its bold heading, its first `cap` names and `+N more`;
+      // nothing when empty.
+      const group = (heading: string, all: readonly string[], cap: number, isDim: boolean): Item[] => {
+        if (all.length === 0) return []
+        const shown = all.slice(0, cap)
+
+        return [
+          { text: heading, isBold: true },
+          ...shown.map(name => ({ text: (name === head0?.name ? '* ' : '  ') + name, isDim })),
+          ...(all.length > shown.length ? [{ text: `  +${all.length - shown.length} more`, isDim: true }] : []),
+        ]
+      }
+      const items: Item[] =
+        names === undefined
+          ? [{ text: '…', isDim: true }]
+          : names.local.length === 0 && names.remote.length === 0
+            ? [{ text: '(none)', isDim: true }]
+            : [
+                ...group('Local', names.local, names.remote.length === 0 ? CARD_NAMES : CARD_NAMES / 2, false),
+                ...group('Remote', names.remote, names.local.length === 0 ? CARD_NAMES : CARD_NAMES / 2, true),
+              ]
+      // frame and one column of padding a side
+      const width = Math.min(cols, Math.max(title.length, ...items.map(item => item.text.length)) + 4)
+      const height = items.length + 3
+      const row = 1 + at // the section's top border is line 0
+      const bottom = rows - 1 // the bottom border's line
+      const top = row + height <= bottom ? row : Math.max(0, row + 1 - height)
+      const left = Math.max(0, Math.min(1 + leadCols(wide) + 1 + shortCols + 1, cols - width))
+      const room = Math.max(1, width - 4)
+
+      return (
+        <Box
+          key="card"
+          position="absolute"
+          top={top}
+          left={left}
+          width={width}
+          flexDirection="column"
+          borderStyle="round"
+          borderColor={border.borderColor}
+          backgroundColor={BACKGROUND}
+          paddingX={1}
+        >
+          <Text bold>{fit(title, room)}</Text>
+          {items.map((item, i) => (
+            <Text key={'card:' + i} dimColor={item.isDim === true ? true : undefined} bold={item.isBold === true ? true : undefined}>
+              {fit(item.text, room)}
+            </Text>
+          ))}
+        </Box>
+      )
+    }
+
     const commitsSection = (
       <Box flexDirection="column" width={rightCols} flexShrink={0} height={topRows}>
         {commitList(graphWidth, false)}
         {titled('title:commits', 'Commits')}
+        {hoverCard(false, rightCols, topRows)}
       </Box>
     )
 
     const graphSection = (
-      <Box flexDirection="column" width={columns} flexShrink={0} height={area}>
+      <Box flexDirection="column" width={columns} flexShrink={0} height={graphTop}>
         {commitList(graphWidth, true)}
         {titled('title:graph', 'Graph')}
+        {hoverCard(true, columns, graphTop)}
       </Box>
     )
 
-    const infoSection = (
-      <Box flexDirection="column" width={rightCols} flexShrink={0} height={infoRows}>
+    // Info, `width` × `rows`: Overview's right column under Commits, or the
+    // panel under Graph.
+    const infoSection = (width: number, rows: number) => (
+      <Box flexDirection="column" width={width} flexShrink={0} height={rows}>
       <Box {...border} flexDirection="row" height="100%">
         <Box flexDirection="column" flexGrow={1}>
         {details === undefined && <Text dimColor>Select a commit.</Text>}
@@ -1257,7 +1500,7 @@ export const register = (on: On): void => {
         </Box>
         {dragBar('sb:info', infoAll.length, infoInner, infoOffset)}
       </Box>
-      {hbar('hb:info', infoWide, infoCols, infoLeft, infoRows - 1, infoCols)}
+      {hbar('hb:info', infoWide, infoCols, infoLeft, rows - 1, infoCols)}
       </Box>
     )
 
@@ -1480,13 +1723,21 @@ export const register = (on: On): void => {
             onToggle: toggleChange,
           })
         ) : isGraph ? (
-          graphSection
+          <Box flexDirection="column">
+            {graphSection}
+            {infoSection(columns, infoRows)}
+            {splitter('split:graph', 'y', 1, graphTop - 1, columns - 2, graphTop)}
+            {/* Info's title sits on the row the seam covers: drawn after it */}
+            <Box position="absolute" top={graphTop} left={0}>
+              {titled('title:info', 'Info')}
+            </Box>
+          </Box>
         ) : (
           <Box flexDirection="row">
             {branchColumn}
             <Box flexDirection="column">
               {commitsSection}
-              {infoSection}
+              {infoSection(rightCols, infoRows)}
               {splitter('split:info', 'y', 1, topRows - 1, rightCols - 2, topRows)}
               {/* Info's title sits on the row the seam covers: drawn after it */}
               <Box position="absolute" top={topRows} left={0}>

@@ -3,6 +3,7 @@ import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 import { sliceCols } from '../shared/hscroll'
+import { LANE_COLORS, PALETTE_SIZE, layoutGraph, parseLog } from './git'
 import { BRANCHES, LOG, MERGE_NAME_STATUS, MERGE_PATCH, MULTI_PATCH, NAME_STATUS, STAT } from './fixtures'
 
 const CWD = '/repo'
@@ -92,6 +93,26 @@ const fake = (
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('command.register', (_$, e) => ({ value: { command: e.name } }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
+}
+
+// The marker before a drawn commit's hash: a row of the hash Client (`dots` in
+// Commits, `shas` in Graph) on terminal and desktop, else the hash Button's label.
+type Mounted = Pick<Awaited<ReturnType<Engine['ui']['mount']>>, 'find' | 'findAll'>
+type HashRow = { glyph?: string; color?: string; mark: string; short: string }
+const hashRows = async (ui: Mounted, key: 'dots' | 'shas') =>
+  ((await ui.find({ key }))?.props.props as { rows?: HashRow[] } | undefined)?.rows
+const markOf = async (ui: Mounted, sha: string): Promise<string | undefined> => {
+  // the Client's rows line up with the drawn `row:<sha>` Boxes
+  const at = (await ui.findAll({ type: 'Box' }))
+    .filter(box => box.key?.startsWith('row:'))
+    .findIndex(box => box.key === 'row:' + sha)
+  for (const key of ['dots', 'shas'] as const) {
+    const row = (await hashRows(ui, key))?.[at]
+    if (row !== undefined) return row.mark
+  }
+  const label = (await ui.find({ key: 'commit:' + sha }))?.props.label
+
+  return typeof label === 'string' ? label[0] : undefined
 }
 
 const start = (surface: 'terminal' | 'desktop') => ({
@@ -209,7 +230,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
       expect(await ui.find({ type: 'Text', text: /eLeSTRaGo/ })).toBeDefined()
     })
 
-    test(`${surface}/${columns}: each commit row draws a lane glyph before its button`, async ($, on) => {
+    test(`${surface}/${columns}: Commits rows draw a colored dot, no lanes`, async ($, on) => {
       mock.store(on)
       fake(on, [])
       await $.session.start(start(surface))
@@ -219,24 +240,68 @@ for (const surface of ['terminal', 'desktop'] as const) {
       const rows = await ui.findAll({ type: 'Box' })
       const row = rows.find(box => box.key === 'row:' + sha)
       expect(row).toBeDefined()
-      const kids = (row?.children ?? []) as {
-        type: string
-        props?: { key?: string }
-        children?: string[]
-      }[]
-      const glyph = kids.findIndex(
-        kid => kid.type === 'Text' && (kid.children ?? []).join('').includes('●'),
+      // the rows hold no lane glyphs and no hash: dot, marker and hash are the
+      // dots Client's column
+      const drawn = rows.filter(box => box.key?.startsWith('row:')).map(box => box.text)
+      expect(drawn.length).toBe(9)
+      for (const text of drawn) {
+        expect(text).not.toMatch(/^[ >][0-9a-f]{7} /)
+        expect(text).not.toMatch(/[│╮╯┤├●○]/)
+      }
+      const laid = layoutGraph(parseLog(LOG))
+      const dots = await hashRows(ui, 'dots')
+      expect(dots).toEqual(
+        laid.map((r, i) => ({
+          glyph: r.commit.parents.length > 1 ? '○' : '●',
+          color: LANE_COLORS[r.color % PALETTE_SIZE],
+          mark: i === 0 ? '>' : ' ',
+          short: r.commit.short,
+        })),
       )
-      const button = kids.findIndex(kid => kid.props?.key === 'commit:' + sha)
-      expect(glyph).toBeGreaterThanOrEqual(0)
-      expect(glyph).toBeLessThan(button)
-      // the merge is drawn as ○, and one row exists per commit
-      expect(await ui.find({ type: 'Text', text: /○/ })).toBeDefined()
-      expect((await ui.findAll({ type: 'Button' })).filter(b => b.key?.startsWith('commit:')).length).toBe(9)
+      // the lanes differ, so do the dots
+      expect(dots?.[0]?.color).not.toBe(dots?.[1]?.color)
+      const cells = (await ui.findAll({ type: 'Text', in: 'dots' })).map(t => t.text)
+      expect(cells).toContain('○ ')
+      expect(cells).toContain(' ' + sha.slice(0, 7) + ' ')
+      // the hash is no Button: the subject holds commit:<sha>
+      const commitButtons = (await ui.findAll({ type: 'Button' })).filter(b => b.key?.startsWith('commit:'))
+      expect(commitButtons.length).toBe(9)
+      expect(commitButtons.some(b => /^[ >][0-9a-f]{7}$/.test(String(b.props.label)))).toBe(false)
+      expect(await ui.find({ key: 'subject:' + sha })).toBeUndefined()
       // info head: author, date, parents
       await ui.press({ key: 'commit:' + sha })
       expect(await ui.find({ type: 'Text', text: /eLeSTRaGo/ })).toBeDefined()
       expect(await ui.find({ type: 'Text', text: /^parents 06615e2/ })).toBeDefined()
+    })
+
+    test(`${surface}/${columns}: Graph draws lanes, then the shas Client, then the rows`, async ($, on) => {
+      mock.store(on)
+      fake(on, [])
+      await $.session.start(start(surface))
+      const ui = await mount($)
+      await ui.press({ key: 'tab:graph' })
+
+      expect(await ui.find({ key: 'dots' })).toBeUndefined()
+      const sha = '908022ab43fb9bc599342842219a42dfd653f899'
+      // three parallel columns: lanes, the hash Client, the rest of each row
+      const lanes = (await ui.findAll({ type: 'Box' })).find(box => box.key === 'lanes:' + sha)
+      expect(lanes?.text).toContain('●')
+      const shas = await hashRows(ui, 'shas')
+      expect(shas?.length).toBe(9)
+      expect(shas?.every(r => r.glyph === undefined)).toBe(true)
+      expect(shas?.map(r => r.short)).toContain(sha.slice(0, 7))
+      const row = (await ui.findAll({ type: 'Box' })).find(box => box.key === 'row:' + sha)
+      expect(row?.text).not.toMatch(/[│●○]/)
+      expect(row?.text).not.toContain(sha.slice(0, 7))
+      expect(await ui.find({ key: 'commit:' + sha })).toBeDefined()
+      expect(await ui.find({ type: 'Text', text: /│/ })).toBeDefined()
+      // the selected row reads as one: its lanes, hash and rest are painted
+      const first = (await ui.findAll({ type: 'Box' })).find(box => box.key?.startsWith('lanes:'))
+      const firstSha = first?.key?.slice('lanes:'.length) ?? ''
+      expect(first?.props.backgroundColor).toBe('ansi256(238)')
+      expect((await ui.find({ key: 'row:' + firstSha }))?.props.backgroundColor).toBe('ansi256(238)')
+      expect((await ui.find({ key: 'shas' }))?.props.props).toMatchObject({ background: 'ansi256(238)' })
+      expect(await markOf(ui, firstSha)).toBe('>')
     })
 
     test(`${surface}/${columns}: more raises the limit`, async ($, on) => {
@@ -536,8 +601,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     // an arrow key selects the next commit
     await ui.press({ key: after[0] ?? '' })
     await scroll(1)
-    const next = await ui.find({ key: 'commit:' + String(7).padStart(40, '0') })
-    expect(next?.props.label).toMatch(/^>/)
+    expect(await markOf(ui, String(7).padStart(40, '0'))).toBe('>')
   })
 
   test(`${surface}: wheel over Info scrolls its lines, over Commits the list`, async ($, on) => {
@@ -628,7 +692,8 @@ for (const surface of ['terminal', 'desktop'] as const) {
       await ui.press({ key: 'tab:graph' })
       expect((await ui.find({ key: 'title:graph' }))?.props.label).toBe(' Graph ')
       expect(await ui.find({ key: 'title:commits' })).toBeUndefined()
-      expect(await ui.find({ key: 'title:info' })).toBeUndefined()
+      // Graph over Info
+      expect((await ui.find({ key: 'title:info' }))?.props.label).toBe(' Info ')
       expect(await ui.find({ key: 'title:branches' })).toBeUndefined()
       expect((await keys(ui, 'commit:')).length).toBeGreaterThan(0)
 
@@ -780,9 +845,9 @@ for (const surface of ['terminal', 'desktop'] as const) {
       expect(await ui.find({ type: 'Text', text: /2026-07-09/ })).toBeDefined()
 
       await ui.press({ key: 'commit:' + sha })
-      expect((await ui.find({ key: 'commit:' + sha }))?.props.label).toMatch(/^>/)
+      expect(await markOf(ui, sha)).toBe('>')
       await ui.press({ key: 'tab:overview' })
-      expect((await ui.find({ key: 'commit:' + sha }))?.props.label).toMatch(/^>/)
+      expect(await markOf(ui, sha)).toBe('>')
       expect(await ui.find({ type: 'Text', text: /^parents 06615e2/ })).toBeDefined()
     })
   }
@@ -884,7 +949,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
       await ui.press({ key: 'back' })
       expect(await ui.find({ key: 'back' })).toBeUndefined()
       expect((await ui.find({ key: 'title:graph' }))?.props.label).toBe(' Graph ')
-      expect((await ui.find({ key: 'commit:' + HEAD_SHA }))?.props.label).toMatch(/^>/)
+      expect(await markOf(ui, HEAD_SHA)).toBe('>')
       expect(await keys(ui, 'dfile:')).toEqual([])
 
       // from Overview, and a tab press closes the view too
@@ -893,7 +958,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
       expect(await keys(ui, 'dfile:')).toEqual(['dfile:from-develop.txt'])
       await ui.press({ key: 'back' })
       expect((await ui.find({ key: 'title:info' }))?.props.label).toBe(' Info ')
-      expect((await ui.find({ key: 'commit:' + MERGE_SHA }))?.props.label).toMatch(/^>/)
+      expect(await markOf(ui, MERGE_SHA)).toBe('>')
       await ui.press({ key: 'diff:' + MERGE_SHA })
       await ui.press({ key: 'tab:graph' })
       expect(await ui.find({ key: 'back' })).toBeUndefined()
@@ -1106,6 +1171,60 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect(await ui.find({ key: 'title:info' })).toBeDefined()
   })
 
+  test(`${surface}: Graph draws Graph over Info, the selected commit's head in Info`, async ($, on) => {
+    const ui = await open($, on, 160, 30)
+    await ui.press({ key: 'tab:graph' })
+    await ui.press({ key: 'commit:' + HEAD_SHA })
+    expect(await ui.find({ key: 'title:graph' })).toBeDefined()
+    expect(await ui.find({ key: 'title:info' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^908022ab43fb/ })).toBeDefined()
+    // area 27: Graph takes 65%, Info the rest
+    expect(await cellsOf(ui, 'split:graph')).toBe(Math.floor(27 * 0.65))
+    expect(await ui.find({ key: 'split:info' })).toBeUndefined()
+  })
+
+  test(`${surface}: dragging the Graph/Info seam resizes and saves layout:git.graph; Overview keeps its own`, async ($, on) => {
+    const store = new Map<string, unknown>()
+    const ui = await open($, on, 160, 30, store)
+    const info = (await cellsOf(ui, 'split:info')) ?? 0
+    await ui.press({ key: 'tab:graph' })
+    const before = (await cellsOf(ui, 'split:graph')) ?? 0
+
+    await ui.pointer({ type: 'down', button: 'left', x: 3, y: 0, in: 'split:graph' })
+    await ui.pointer({ type: 'move', button: 'left', x: 3, y: -4, in: 'split:graph' })
+    expect(store.get('layout:git')).toBeUndefined()
+    await ui.pointer({ type: 'up', button: 'left', x: 3, y: 0, in: 'split:graph' })
+    expect(await cellsOf(ui, 'split:graph')).toBe(before - 4)
+    // stored as Info's share, as `info` is
+    const saved = store.get('layout:git') as { graph?: number; info?: number }
+    expect(Math.round((1 - (saved.graph ?? 0)) * 27)).toBe(before - 4)
+    expect(saved.info).toBeUndefined()
+    expect(await ui.find({ key: 'title:info' })).toBeDefined()
+
+    await ui.press({ key: 'tab:overview' })
+    expect(await cellsOf(ui, 'split:info')).toBe(info)
+    expect(await ui.find({ key: 'split:graph' })).toBeUndefined()
+  })
+
+  test(`${surface}: in Graph the wheel over Info scrolls Info, over the list the list`, async ($, on) => {
+    const ui = await open($, on, 160, 14)
+    await ui.press({ key: 'tab:graph' })
+    await ui.press({ key: 'commit:' + HEAD_SHA })
+    const commits = async () =>
+      (await ui.findAll({ type: 'Button' }))
+        .map(b => b.key ?? '')
+        .filter(key => key.startsWith('commit:'))
+    const subject = () => ui.find({ type: 'Text', text: /^908022ab43fb/ })
+    expect(await subject()).toBeDefined()
+    // bodyRows 14: area 11, Graph rows 2-8, Info from row 9
+    const first = (await commits())[0]
+    await scrollAt($, 14, 1, 60, 12)
+    expect(await subject()).toBeUndefined()
+    expect((await commits())[0]).toBe(first)
+    await scrollAt($, 14, 2, 60, 3)
+    expect((await commits())[0]).not.toBe(first)
+  })
+
   test(`${surface}: dragging the Files seam resizes Files in Change Log`, async ($, on) => {
     const ui = await open($, on, 100, 30)
     await ui.press({ key: 'tab:changelog' })
@@ -1196,6 +1315,19 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect((await barOf(ui, 'hb:info'))?.offset).toBe(0)
   })
 
+  test(`${surface}: in Graph, hb:info spans the panel's width`, async ($, on) => {
+    const ui = await open($, on)
+    await ui.press({ key: 'commit:' + HEAD_SHA })
+    const overview = (await barOf(ui, 'hb:info'))?.visible ?? 0
+    await ui.press({ key: 'tab:graph' })
+    // 100 columns past the frame and the vertical bar
+    expect((await barOf(ui, 'hb:info'))?.visible).toBe(97)
+    expect(overview).toBeLessThan(97)
+    await drag(ui, 'hb:info', 20)
+    expect((await barOf(ui, 'hb:info'))?.offset).toBeGreaterThan(0)
+    expect(await texts(ui)).not.toContain(WIDE_LINE)
+  })
+
   test(`${surface}: Info scrolled past its short lines keeps one Text row per line`, async ($, on) => {
     const ui = await open($, on)
     await ui.press({ key: 'commit:' + HEAD_SHA })
@@ -1274,3 +1406,264 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect((await barOf(ui, 'hb:details'))?.offset).toBe(0)
   })
 }
+
+// The Commits hover card: the pointer resting on a dot for 600 ms lists the
+// branches containing that row's commit (`git branch -a --contains`).
+const CONTAINS =
+  'refs/heads/develop\nrefs/heads/fix/delivery-readiness\nrefs/remotes/origin/HEAD\nrefs/remotes/origin/develop\nrefs/remotes/origin/main\n'
+
+for (const surface of ['terminal', 'desktop'] as const) {
+  const open = async ($: Engine, on: On, calls: string[][] = [], contains = CONTAINS) => {
+    mock.store(on)
+    fake(on, calls, true, LOG, { name: 'main' }, STATUS, 0, argv =>
+      argv[1] === 'branch' && argv.includes('--contains') ? result(contains) : undefined,
+    )
+    on('ui.focus', () => ({}))
+    on('ui.scroll', () => ({}))
+    await $.session.start(start(surface))
+
+    return $.ui.mount({
+      plugin: PLUGIN,
+      surface,
+      component: 'Pane',
+      props: props(100),
+      requestId: 'ide-git',
+      viewport: VIEWPORT,
+    })
+  }
+  type Ui = Awaited<ReturnType<typeof open>>
+  const cardLines = async (ui: Ui) => {
+    const card = await ui.find({ key: 'card' })
+    if (card === undefined) return undefined
+
+    return (await ui.findAll({ type: 'Text' })).map(text => text.text)
+  }
+
+  test(`${surface}: resting on a dot shows the commit's branches under Local and Remote`, async ($, on) => {
+    const calls: string[][] = []
+    const ui = await open($, on, calls)
+    await ui.pointer({ type: 'move', x: 0, y: 2, in: 'dots' })
+    await ui.advance(600)
+
+    const lines = (await cardLines(ui)) ?? []
+    const order = [
+      'Branches · 908022a',
+      'Local',
+      '* develop',
+      '  fix/delivery-readiness',
+      'Remote',
+      '  origin/develop',
+      '  origin/main',
+    ].map(line => lines.indexOf(line))
+    expect(order.every(at => at >= 0)).toBe(true)
+    expect([...order].sort((a, b) => a - b)).toEqual(order)
+    expect(lines).not.toContain('  origin/HEAD')
+    // the hovered commit's branches are fetched once (Info fetched the selected one's)
+    expect(
+      calls.filter(a => a[1] === 'branch' && a.includes('--contains') && a.includes(HEAD_SHA)),
+    ).toEqual([['git', 'branch', '-a', '--contains', HEAD_SHA, '--format=%(refname)']])
+    expect((await ui.find({ type: 'Text', text: /^Local$/ }))?.props.bold).toBe(true)
+    expect((await ui.find({ type: 'Text', text: /^Remote$/ }))?.props.bold).toBe(true)
+    const remote = await ui.find({ type: 'Text', text: '  origin/main' })
+    expect(remote?.props.dimColor).toBe(true)
+  })
+
+  test(`${surface}: a local-only card has no Remote heading`, async ($, on) => {
+    const ui = await open($, on, [], 'refs/heads/develop\n')
+    await ui.pointer({ type: 'move', x: 0, y: 2, in: 'dots' })
+    await ui.advance(600)
+    const lines = (await cardLines(ui)) ?? []
+    expect(lines).toContain('Local')
+    expect(lines).toContain('* develop')
+    expect(lines).not.toContain('Remote')
+  })
+
+  test(`${surface}: the card caps each group at 4, a lone group at 8`, async ($, on) => {
+    const names = (pre: string, n: number) =>
+      Array.from({ length: n }, (_, i) => pre + (i + 1)).join('\n') + '\n'
+    const both = names('refs/heads/b', 6) + names('refs/remotes/o/r', 6)
+    const ui = await open($, on, [], both)
+    await ui.pointer({ type: 'move', x: 0, y: 2, in: 'dots' })
+    await ui.advance(600)
+    const lines = (await cardLines(ui)) ?? []
+    expect(lines).toContain('  b4')
+    expect(lines).not.toContain('  b5')
+    expect(lines).toContain('  o/r4')
+    expect(lines).not.toContain('  o/r5')
+    expect(lines.filter(line => line === '  +2 more')).toHaveLength(2)
+    // Info holds the whole list
+    expect(await ui.find({ type: 'Text', text: /^local {2}b1, b2, b3, b4, b5, b6$/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^remote o\/r1, o\/r2, o\/r3, o\/r4, o\/r5, o\/r6$/ })).toBeDefined()
+  })
+
+  test(`${surface}: a lone group lists 8 names`, async ($, on) => {
+    const ten = Array.from({ length: 10 }, (_, i) => 'refs/heads/b' + (i + 1)).join('\n') + '\n'
+    const ui = await open($, on, [], ten)
+    await ui.pointer({ type: 'move', x: 0, y: 2, in: 'dots' })
+    await ui.advance(600)
+    const lines = (await cardLines(ui)) ?? []
+    expect(lines).toContain('  b8')
+    expect(lines).not.toContain('  b9')
+    expect(lines).toContain('  +2 more')
+    expect(lines).not.toContain('Remote')
+    // the flipped or not, the card's bottom border stays inside Commits
+    const card = await ui.find({ key: 'card' })
+    const rows = ((await ui.find({ key: 'dots' }))?.props.height as number | undefined) ?? 0
+    expect(card?.props.top).toBeLessThan(rows)
+  })
+
+  test(`${surface}: Info lists the selected commit's local and remote branches`, async ($, on) => {
+    const ui = await open($, on)
+    expect(await ui.find({ type: 'Text', text: /^local {2}\*develop, fix\/delivery-readiness$/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^remote origin\/develop, origin\/main$/ })).toBeDefined()
+    await ui.press({ key: 'tab:graph' })
+    expect(await ui.find({ type: 'Text', text: /^local {2}\*develop/ })).toBeDefined()
+  })
+
+  test(`${surface}: Branches groups rows under Local and Remote; pressing Remote hides its rows`, async ($, on) => {
+    const ui = await open($, on)
+    expect((await ui.find({ type: 'Text', text: '▾ Local (2)' }))?.props.bold).toBe(true)
+    expect((await ui.find({ key: 'bdir:l:' }))?.props.label).toBe('▾ Local (2)')
+    expect(await ui.find({ type: 'Text', text: '▾ Remote (6)' })).toBeDefined()
+    expect(await ui.find({ key: 'branch:origin/main' })).toBeDefined()
+    expect(await ui.find({ key: 'branch:develop' })).toBeDefined()
+    await ui.press({ key: 'bdir:r:' })
+    expect(await ui.find({ key: 'branch:origin/main' })).toBeUndefined()
+    expect(await ui.find({ key: 'bdir:r:origin' })).toBeUndefined()
+    expect((await ui.find({ key: 'bdir:r:' }))?.props.label).toBe('▸ Remote (6)')
+    expect(await ui.find({ key: 'branch:develop' })).toBeDefined()
+  })
+
+  test(`${surface}: a move rested only 200 ms shows no card`, async ($, on) => {
+    const ui = await open($, on)
+    await ui.pointer({ type: 'move', x: 0, y: 2, in: 'dots' })
+    await ui.advance(200)
+    expect(await ui.find({ key: 'card' })).toBeUndefined()
+    // moving to another row starts the wait over
+    await ui.pointer({ type: 'move', x: 0, y: 3, in: 'dots' })
+    await ui.advance(500)
+    expect(await ui.find({ key: 'card' })).toBeUndefined()
+    await ui.advance(100)
+    expect(await ui.find({ type: 'Text', text: 'Branches · 06615e2' })).toBeDefined()
+  })
+
+  test(`${surface}: leaving the dots removes the card`, async ($, on) => {
+    const ui = await open($, on)
+    await ui.pointer({ type: 'move', x: 0, y: 2, in: 'dots' })
+    await ui.advance(600)
+    expect(await ui.find({ key: 'card' })).toBeDefined()
+    await ui.pointer({ type: 'leave', x: 0, y: 2, in: 'dots' })
+    expect(await ui.find({ key: 'card' })).toBeUndefined()
+  })
+
+  test(`${surface}: a card near Commits' bottom flips above its row; a tab switch drops it`, async ($, on) => {
+    const ui = await open($, on)
+    const rows = ((await ui.find({ key: 'dots' }))?.props.height as number | undefined) ?? 0
+    await ui.pointer({ type: 'move', x: 0, y: rows - 1, in: 'dots' })
+    await ui.advance(600)
+    const card = await ui.find({ key: 'card' })
+    expect(card).toBeDefined()
+    // the card ends on the row's line (Commits' top border is line 0)
+    expect(card?.props.top).toBeLessThan(rows)
+    await ui.press({ key: 'tab:graph' })
+    await ui.press({ key: 'tab:overview' })
+    expect(await ui.find({ key: 'card' })).toBeUndefined()
+  })
+
+  test(`${surface}: resting on a Commits hash shows the card, past the hash`, async ($, on) => {
+    const ui = await open($, on)
+    const client = await ui.find({ key: 'dots' })
+    // dot, space, marker, 7 hex, space
+    expect(client?.props.width).toBe(11)
+    await ui.pointer({ type: 'move', x: 6, y: 2, in: 'dots' })
+    await ui.advance(600)
+    const card = await ui.find({ key: 'card' })
+    expect(await ui.find({ type: 'Text', text: 'Branches · 908022a' })).toBeDefined()
+    expect(card?.props.left).toBe(12)
+  })
+
+  test(`${surface}: a click on a Commits hash selects its row, Info follows`, async ($, on) => {
+    const ui = await open($, on)
+    expect(await markOf(ui, HEAD_SHA)).toBe(' ')
+    // a down on one row and an up on another is no press
+    await ui.pointer({ type: 'down', x: 5, y: 1, button: 'left', in: 'dots' })
+    await ui.pointer({ type: 'up', x: 5, y: 2, button: 'left', in: 'dots' })
+    expect(await markOf(ui, HEAD_SHA)).toBe(' ')
+    await ui.pointer({ type: 'down', x: 5, y: 2, button: 'left', in: 'dots' })
+    await ui.pointer({ type: 'up', x: 5, y: 2, button: 'left', in: 'dots' })
+    expect(await markOf(ui, HEAD_SHA)).toBe('>')
+    expect(await ui.find({ type: 'Text', text: /^parents 06615e2/ })).toBeDefined()
+    expect((await ui.find({ key: 'commit:' + HEAD_SHA }))?.props.label).not.toMatch(/^[ >][0-9a-f]{7}$/)
+    // the selected row's background spans the Client and the rest of the row
+    expect((await ui.find({ key: 'row:' + HEAD_SHA }))?.props.backgroundColor).toBe('ansi256(238)')
+  })
+
+  test(`${surface}: resting on a Graph hash shows the card inside Graph; leaving drops it`, async ($, on) => {
+    const ui = await open($, on)
+    await ui.press({ key: 'tab:graph' })
+    expect(await ui.find({ key: 'dots' })).toBeUndefined()
+    await ui.pointer({ type: 'move', x: 3, y: 2, in: 'shas' })
+    await ui.advance(600)
+    const card = await ui.find({ key: 'card' })
+    expect(await ui.find({ type: 'Text', text: 'Branches · 908022a' })).toBeDefined()
+    // top on the row's line (Graph's top border is line 0), past lanes and hash
+    expect(card?.props.top).toBe(3)
+    const lanes = (await ui.findAll({ type: 'Box' })).find(box => box.key?.startsWith('lanes:'))
+    expect(card?.props.left).toBe(1 + (lanes?.text.length ?? 0) + 9)
+    await ui.pointer({ type: 'leave', x: 3, y: 2, in: 'shas' })
+    expect(await ui.find({ key: 'card' })).toBeUndefined()
+  })
+
+  test(`${surface}: a Graph card near the seam flips above its row; Overview drops it`, async ($, on) => {
+    const ui = await open($, on)
+    await ui.press({ key: 'tab:graph' })
+    const rows = ((await ui.find({ key: 'shas' }))?.props.height as number | undefined) ?? 0
+    await ui.pointer({ type: 'move', x: 3, y: rows - 1, in: 'shas' })
+    await ui.advance(600)
+    const card = await ui.find({ key: 'card' })
+    expect(card).toBeDefined()
+    expect(card?.props.top).toBeLessThan(rows)
+    await ui.press({ key: 'tab:overview' })
+    expect(await ui.find({ key: 'card' })).toBeUndefined()
+  })
+
+  test(`${surface}: a click on a Graph hash selects its row`, async ($, on) => {
+    const ui = await open($, on)
+    await ui.press({ key: 'tab:graph' })
+    await ui.pointer({ type: 'down', x: 2, y: 2, button: 'left', in: 'shas' })
+    await ui.pointer({ type: 'up', x: 2, y: 2, button: 'left', in: 'shas' })
+    expect(await markOf(ui, HEAD_SHA)).toBe('>')
+    expect((await ui.find({ key: 'lanes:' + HEAD_SHA }))?.props.backgroundColor).toBe('ansi256(238)')
+    expect((await ui.find({ key: 'row:' + HEAD_SHA }))?.props.backgroundColor).toBe('ansi256(238)')
+    // a right click is no press
+    await ui.pointer({ type: 'down', x: 2, y: 3, button: 'right', in: 'shas' })
+    await ui.pointer({ type: 'up', x: 2, y: 3, button: 'right', in: 'shas' })
+    expect(await markOf(ui, HEAD_SHA)).toBe('>')
+  })
+}
+
+test('vscode: Commits rows draw plain dots, no Client and no card', async ($, on) => {
+  mock.store(on)
+  fake(on, [])
+  await $.session.start(start('terminal'))
+  const ui = await $.ui.mount({
+    plugin: PLUGIN,
+    surface: 'vscode',
+    component: 'Pane',
+    props: props(100),
+    requestId: 'ide-git',
+    viewport: VIEWPORT,
+  })
+
+  expect(await ui.find({ key: 'dots' })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: '○ ' })).toBeDefined()
+  const drawn = (await ui.findAll({ type: 'Box' })).filter(box => box.key?.startsWith('row:'))
+  expect(drawn.length).toBe(9)
+  for (const row of drawn) expect(row.text).toMatch(/^[●○] [ >][0-9a-f]{7} /)
+  // the hash is the commit Button there, the subject its own
+  expect((await ui.find({ key: 'commit:908022ab43fb9bc599342842219a42dfd653f899' }))?.props.label).toBe(' 908022a')
+  expect(await ui.find({ key: 'subject:908022ab43fb9bc599342842219a42dfd653f899' })).toBeDefined()
+  await ui.press({ key: 'tab:graph' })
+  expect(await ui.find({ key: 'shas' })).toBeUndefined()
+  expect(await ui.find({ key: 'subject:908022ab43fb9bc599342842219a42dfd653f899' })).toBeDefined()
+})

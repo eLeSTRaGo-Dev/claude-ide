@@ -95,11 +95,24 @@ export const parseLog = (stdout: string): Commit[] => {
 }
 
 // Where a commit sits in the graph: `cells` are the glyphs of every lane
-// (2 characters per lane), each with the color index of its lane-run.
+// (2 characters per lane), each with the color index of its lane-run; `color`
+// is the commit's own lane color, kept even when its lane collapses into `…`.
 export type GraphCell = { glyph: string; color: number }
-export type GraphRow = { commit: Commit; lane: number; cells: GraphCell[] }
+export type GraphRow = { commit: Commit; lane: number; color: number; cells: GraphCell[] }
 
 export const PALETTE_SIZE = 8
+
+// Lane-run colors, one per palette index, readable on black.
+export const LANE_COLORS: readonly string[] = [
+  'ansi256(75)',
+  'ansi256(114)',
+  'ansi256(176)',
+  'ansi256(215)',
+  'ansi256(80)',
+  'ansi256(203)',
+  'ansi256(185)',
+  'ansi256(147)',
+]
 
 // Lanes from parent hashes, one row per commit (`commits` newest first, parents
 // after their children, as `--topo-order`). A lane expects the sha of the next
@@ -166,12 +179,13 @@ export const layoutGraph = (
       }
     }
     for (const span of spans) at(span.to * 2, span.glyph, span.color)
-    at(lane * 2, commit.parents.length > 1 ? '○' : '●', colors[lane] ?? 0)
+    const color = colors[lane] ?? 0
+    at(lane * 2, commit.parents.length > 1 ? '○' : '●', color)
     while (lanes.length > 0 && lanes[lanes.length - 1] === null) {
       lanes.pop()
       colors.pop()
     }
-    rows.push({ commit, lane, cells: collapse(cells, lane, maxLanes) })
+    rows.push({ commit, lane, color, cells: collapse(cells, lane, maxLanes) })
   }
 
   return rows
@@ -209,11 +223,24 @@ export const cellRuns = (
 }
 
 // The commit's info head: the `git show` head lines with parents and refs
-// after the author and date lines.
-export const infoHead = (shown: readonly string[], commit: Commit): string[] => [
+// after the author and date lines, then the branches containing it (when
+// known): `local` and `remote` lines, each left out when empty, the HEAD
+// branch `head` marked `*`.
+export const infoHead = (
+  shown: readonly string[],
+  commit: Commit,
+  branches?: Contains,
+  head?: string,
+): string[] => [
   ...shown.slice(0, 3),
   'parents ' + (commit.parents.length === 0 ? '(none)' : commit.parents.map(p => p.slice(0, 7)).join(' ')),
   ...(commit.refs.length === 0 ? [] : ['refs ' + commit.refs.join(', ')]),
+  ...(branches === undefined || branches.local.length === 0
+    ? []
+    : ['local  ' + branches.local.map(name => (name === head ? '*' + name : name)).join(', ')]),
+  ...(branches === undefined || branches.remote.length === 0
+    ? []
+    : ['remote ' + branches.remote.join(', ')]),
   ...shown.slice(3).filter((line, i) => i > 0 || line !== ''),
 ]
 
@@ -513,30 +540,40 @@ export const pathTree = <T>(
 
 // One row of the branch list grouped by `/`: a folder or a branch, with its
 // depth under the root. Local branches come first, then each remote.
+// A category row (`isGroup`: `Local` / `Remote`, keys `l:` / `r:`) heads each
+// non-empty group; `count` is its branch count.
 export type BranchRow =
-  | { kind: 'folder'; key: string; name: string; depth: number; isOpen: boolean }
+  | { kind: 'folder'; key: string; name: string; depth: number; isOpen: boolean; isGroup?: boolean; count?: number }
   | { kind: 'branch'; branch: Branch; name: string; depth: number }
 
-// `collapsed` holds folder keys (`l:fix` / `r:origin/feature`) the person closed.
+// `collapsed` holds folder keys (`l:fix` / `r:origin/feature`) the person
+// closed, and the category keys `l:` / `r:` (the `pathTree` roots, so they
+// never clash with a folder key).
 export const branchTree = (
   branches: readonly Branch[],
   collapsed: ReadonlySet<string>,
 ): BranchRow[] => {
-  const of = (isRemote: boolean, root: string) =>
-    pathTree(
-      branches
-        .filter(branch => branch.isRemote === isRemote)
-        .map(branch => ({ path: branch.name, item: branch })),
+  const of = (isRemote: boolean, root: string, name: string): BranchRow[] => {
+    const group = branches.filter(branch => branch.isRemote === isRemote)
+    if (group.length === 0) return []
+    const isOpen = !collapsed.has(root)
+    const head: BranchRow = { kind: 'folder', key: root, name, depth: 0, isOpen, isGroup: true, count: group.length }
+    if (!isOpen) return [head]
+    const rows = pathTree(
+      group.map(branch => ({ path: branch.name, item: branch })),
       collapsed,
       root,
+    ).map(
+      (row): BranchRow =>
+        row.kind === 'folder'
+          ? { ...row, depth: row.depth + 1 }
+          : { kind: 'branch', branch: row.item, name: row.name, depth: row.depth + 1 },
     )
 
-  return [...of(false, 'l:'), ...of(true, 'r:')].map(
-    (row): BranchRow =>
-      row.kind === 'folder'
-        ? row
-        : { kind: 'branch', branch: row.item, name: row.name, depth: row.depth },
-  )
+    return [head, ...rows]
+  }
+
+  return [...of(false, 'l:', 'Local'), ...of(true, 'r:', 'Remote')]
 }
 
 // The two calls that touch the repo: fetch every remote, and a pull that
@@ -729,6 +766,37 @@ export const filesArgv = (sha: string): string[] => [
   '--format=',
   sha,
 ]
+
+// The local and remote branches that contain a commit, as full refnames.
+export const containsArgv = (sha: string): string[] => [
+  'git',
+  'branch',
+  '-a',
+  '--contains',
+  sha,
+  '--format=%(refname)',
+]
+
+// The branches containing a commit, by kind, as short names.
+export type Contains = { local: string[]; remote: string[] }
+
+// `containsArgv` output as short names (`main`, `origin/main`), local and
+// remote apart, each in input order; remote `HEAD`s and anything else are dropped.
+export const parseContains = (stdout: string): Contains => {
+  const local: string[] = []
+  const remote: string[] = []
+  for (const line of lines(stdout)) {
+    const ref = line.trim()
+    if (ref.startsWith('refs/heads/')) {
+      local.push(ref.slice('refs/heads/'.length))
+    } else if (ref.startsWith('refs/remotes/')) {
+      const name = ref.slice('refs/remotes/'.length)
+      if (!name.endsWith('/HEAD')) remote.push(name)
+    }
+  }
+
+  return { local, remote }
+}
 
 // `--name-status` lines (`M\tpath`, `R100\told\tnew`) as `Change`s, so
 // `changeRows` and `changeGlyph` draw them: the status letter is `x`, a rename

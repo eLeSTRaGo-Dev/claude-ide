@@ -39,7 +39,7 @@ export type GitState = {
   changeCollapsed?: string[] // change folders closed (`c:src/ui`)
   diff?: string // sha open in the commit diff view; clearing it closes the view
   diffFile?: string // path of the selected file in the diff view
-  split?: { side?: number; info?: number; files?: number } // dragged sizes as fractions: Branches' width, Info's height share (Overview), Files' width; absent is the default
+  split?: { side?: number; info?: number; files?: number; graph?: number } // dragged sizes as fractions: Branches' width, Info's height share (Overview), Files' width, Info's height share (Graph); absent is the default
   diffFileOffset?: number // first file row shown in the diff view
 }
 
