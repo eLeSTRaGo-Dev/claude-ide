@@ -213,12 +213,17 @@ for (const surface of ['terminal', 'desktop'] as const) {
       await $.session.start(start(surface))
       const ui = await mount($)
 
-      const current = await ui.find({ key: 'branch:develop' })
-      expect(current?.props.label).toContain('*')
+      const rowOf = async (key: string) =>
+        (await ui.find({ key: 'bitem:' + key }))?.props.props as
+          | { label?: string; isHead?: boolean; isRemote?: boolean }
+          | undefined
+      expect((await rowOf('b:develop'))?.isHead).toBe(true)
+      expect((await rowOf('b:develop'))?.label).toContain('develop')
+      expect(await ui.find({ key: 'branch:develop' })).toBeDefined()
       expect(await ui.find({ key: 'branch:origin/main' })).toBeDefined()
       expect(await ui.find({ key: 'branch:origin/HEAD' })).toBeUndefined()
-      const remote = await ui.find({ key: 'branch:origin/main' })
-      expect(remote?.props.dimColor).toBe(true)
+      expect((await rowOf('b:origin/main'))?.isRemote).toBe(true)
+      expect((await rowOf('b:develop'))?.isRemote).toBe(false)
     })
 
     test(`${surface}/${columns}: sections are titled, footer shows dir and counts`, async ($, on) => {
@@ -1496,6 +1501,9 @@ for (const surface of ['terminal', 'desktop'] as const) {
     })
   }
   type Ui = Awaited<ReturnType<typeof open>>
+  // A Branches row Client's props (`k`: a folder key or `b:<branch>`).
+  const rowOf = async (ui: Ui, k: string) =>
+    (await ui.find({ key: 'bitem:' + k }))?.props.props as Record<string, unknown> | undefined
   const cardLines = async (ui: Ui) => {
     const card = await ui.find({ key: 'card' })
     if (card === undefined) return undefined
@@ -1586,17 +1594,72 @@ for (const surface of ['terminal', 'desktop'] as const) {
 
   test(`${surface}: Branches groups rows under Local and Remote; pressing Remote hides its rows`, async ($, on) => {
     const ui = await open($, on)
-    expect((await ui.find({ type: 'Text', text: '▾ ' }))?.props.bold).toBe(true)
-    expect((await ui.find({ key: 'bdir:l:' }))?.props.label).toBe('Local (2)')
+    expect(await rowOf(ui, 'l:')).toMatchObject({ label: 'Local (2)', isGroup: true, isOpen: true, isRemote: false })
     expect(await ui.find({ key: 'bdir:r:' })).toBeDefined()
     expect(await ui.find({ key: 'branch:origin/main' })).toBeDefined()
     expect(await ui.find({ key: 'branch:develop' })).toBeDefined()
     await ui.press({ key: 'bdir:r:' })
     expect(await ui.find({ key: 'branch:origin/main' })).toBeUndefined()
     expect(await ui.find({ key: 'bdir:r:origin' })).toBeUndefined()
-    expect((await ui.find({ key: 'bdir:r:' }))?.props.label).toBe('Remote (6)')
-    expect(await ui.find({ type: 'Text', text: '▸ ' })).toBeDefined()
+    expect(await rowOf(ui, 'r:')).toMatchObject({ label: 'Remote (6)', isOpen: false })
     expect(await ui.find({ key: 'branch:develop' })).toBeDefined()
+  })
+
+  test(`${surface}: a Branches row's arrow opens and closes a category or folder`, async ($, on) => {
+    const ui = await open($, on)
+    expect(await rowOf(ui, 'r:origin')).toMatchObject({ label: 'origin/', isFolder: true, isRemote: true })
+    await ui.post({ hit: 'arrow' }, { in: 'bitem:r:origin' })
+    expect(await rowOf(ui, 'r:origin')).toMatchObject({ isOpen: false })
+    expect(await ui.find({ key: 'bitem:b:origin/main' })).toBeUndefined()
+    await ui.post({ hit: 'arrow' }, { in: 'bitem:r:origin' })
+    expect(await ui.find({ key: 'bitem:b:origin/main' })).toBeDefined()
+    await ui.post({ hit: 'arrow' }, { in: 'bitem:r:' })
+    expect(await ui.find({ key: 'bitem:r:origin' })).toBeUndefined()
+    expect(await rowOf(ui, 'r:')).toMatchObject({ isOpen: false })
+  })
+
+  test(`${surface}: a click on a Branches arrow (pointer) toggles the folder`, async ($, on) => {
+    const ui = await open($, on)
+    // depth 1: bar (x 0), one rail (x 1-2), the arrow at x 3-4
+    await ui.pointer({ type: 'down', x: 3, y: 0, button: 'left', in: 'bitem:r:origin' })
+    await ui.pointer({ type: 'up', x: 3, y: 0, button: 'left', in: 'bitem:r:origin' })
+    expect(await rowOf(ui, 'r:origin')).toMatchObject({ isOpen: false })
+  })
+
+  test(`${surface}: a name click selects a branch and does nothing on a folder`, async ($, on) => {
+    const calls: string[][] = []
+    const ui = await open($, on, calls)
+    await ui.post({ hit: 'name' }, { in: 'bitem:b:origin/main' })
+    expect(await rowOf(ui, 'b:origin/main')).toMatchObject({ isSelected: true })
+    expect(calls.some(a => a[1] === 'log' && a.at(-1) === 'origin/main')).toBe(true)
+    await ui.post({ hit: 'name' }, { in: 'bitem:r:origin' })
+    expect(await rowOf(ui, 'r:origin')).toMatchObject({ isOpen: true })
+    expect(await rowOf(ui, 'b:origin/main')).toMatchObject({ isSelected: true })
+  })
+
+  test(`${surface}: a double-click copies the full ref, a folder's prefix, nothing on a category`, async ($, on) => {
+    const copied: string[] = []
+    const toasts: string[] = []
+    on('ui.copy', (_$, e) => {
+      copied.push(e.text)
+
+      return { value: { isCopied: true } }
+    })
+    on('ui.toast', (_$, e) => {
+      toasts.push(e.text)
+
+      return { value: undefined }
+    })
+    const ui = await open($, on)
+    await ui.post({ hit: 'double' }, { in: 'bitem:b:origin/main' })
+    expect(copied).toEqual(['origin/main'])
+    expect(toasts.at(-1)).toBe('Copied: origin/main')
+    await ui.post({ hit: 'double' }, { in: 'bitem:r:origin' })
+    expect(copied).toEqual(['origin/main', 'origin/'])
+    expect(toasts.at(-1)).toBe('Copied: origin/')
+    await ui.post({ hit: 'double' }, { in: 'bitem:r:' })
+    expect(copied).toEqual(['origin/main', 'origin/'])
+    expect(await rowOf(ui, 'r:')).toMatchObject({ isOpen: true })
   })
 
   test(`${surface}: a move rested only 200 ms shows no card`, async ($, on) => {

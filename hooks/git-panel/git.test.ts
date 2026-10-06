@@ -2,7 +2,9 @@ import { expect, test } from 'claude-code/testing'
 
 import { BRANCHES, LOG, MERGE_NAME_STATUS, MERGE_PATCH, MULTI_PATCH, NAME_STATUS, PATCH } from './fixtures'
 import {
+  branchHit,
   branchTree,
+  copyTextOf,
   changeDiffArgv,
   changeGlyph,
   containsArgv,
@@ -365,6 +367,37 @@ test('branchTree groups branches by / with local first', () => {
   // An empty group has no category row.
   expect(branchTree([b('main')], new Set()).map(r => r.name)).toEqual(['Local', 'main'])
   expect(branchTree([], new Set())).toEqual([])
+})
+
+test('branchHit: bar, rails, a folder\'s arrow, then the name', () => {
+  // Cell 0 is the selection bar, counted as the name.
+  expect(branchHit(0, true, 0)).toBe('name')
+  // A category row (depth 0): the arrow at 1-2.
+  expect([1, 2, 3].map(x => branchHit(0, true, x))).toEqual(['arrow', 'arrow', 'name'])
+  // Depth 2: rails at 1-4, the arrow at 5-6.
+  expect([4, 5, 6, 7].map(x => branchHit(2, true, x))).toEqual(['name', 'arrow', 'arrow', 'name'])
+  // A branch has no arrow.
+  expect([0, 1, 2, 5, 6].map(x => branchHit(2, false, x))).toEqual(['name', 'name', 'name', 'name', 'name'])
+})
+
+test('copyTextOf: branch name, folder path with /, nothing for a category', () => {
+  const b = (name: string, isRemote = false) => ({ name, sha: 'x', isHead: false, isRemote }) as const
+  const rows = branchTree(
+    [b('main'), b('feature/ui/a'), b('origin/main', true), b('origin/team/x', true)],
+    new Set(),
+  )
+  expect(rows.map(r => [r.kind === 'folder' ? r.key : r.name, copyTextOf(r)])).toEqual([
+    ['l:', undefined],
+    ['main', 'main'],
+    ['l:feature', 'feature/'],
+    ['l:feature/ui', 'feature/ui/'],
+    ['a', 'feature/ui/a'],
+    ['r:', undefined],
+    ['r:origin', 'origin/'],
+    ['main', 'origin/main'],
+    ['r:origin/team', 'origin/team/'],
+    ['x', 'origin/team/x'],
+  ])
 })
 
 test('remote actions: argv and summaries', () => {

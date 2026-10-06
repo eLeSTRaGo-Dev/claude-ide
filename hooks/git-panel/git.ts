@@ -564,6 +564,25 @@ export const branchTree = (
   return [...of(false, 'l:', 'Local'), ...of(true, 'r:', 'Remote')]
 }
 
+// What column `x` of a Branches row is: cell 0 the selection bar (the name's),
+// then a rail (`│ `) per depth level and, on a folder (category rows
+// included), the arrow's 2 cells; the rest is the name.
+export const branchHit = (depth: number, isFolder: boolean, x: number): 'arrow' | 'name' => {
+  const arrow = 1 + 2 * Math.max(0, depth)
+
+  return isFolder && x >= arrow && x < arrow + 2 ? 'arrow' : 'name'
+}
+
+// The text a Branches row copies: a branch its full name (`origin/main`),
+// a folder its path with a trailing `/` (`r:origin` → `origin/`); a category
+// row nothing.
+export const copyTextOf = (row: BranchRow): string | undefined => {
+  if (row.kind === 'branch') return row.branch.name
+  if (row.isGroup === true) return undefined
+
+  return row.key.replace(/^[lr]:/, '') + '/'
+}
+
 // The two calls that touch the repo: fetch every remote, and a pull that
 // only fast-forwards (it fails rather than merging).
 export type RemoteAction = 'fetch' | 'pull'

@@ -13,6 +13,7 @@ import { glyphColor, lanePalette } from './git-theme'
 import {
   GIT_PANE,
   branchTree,
+  copyTextOf,
   remoteArgv,
   remoteSummary,
   shortDir,
@@ -533,6 +534,39 @@ const copyName = async (
   )
 }
 
+// A full ref (or a folder's prefix) copied by a double-click on a Branches row.
+const copyRef = async (
+  $: EngineInterface,
+  text: string,
+  surface: Parameters<EngineInterface['ui']['copy']>[0]['surface'],
+): Promise<void> => {
+  const copied = await $.ui.copy({ text, surface })
+  await $.ui.toast(copied.isCopied ? `Copied: ${text}` : `Copy failed: ${copied.reason}`)
+}
+
+// The commits of `ref` (a branch name or `all`), from the top, a page at a time.
+const selectRef = ($: EngineInterface, ref: string) =>
+  update($, git, s => ({
+    ...s,
+    ref,
+    offset: 0,
+    infoOffset: 0,
+    infoLeft: 0,
+    selected: undefined,
+    limit: undefined, // the page size again
+  }))
+
+// Opens or closes a Branches folder or category (`l:`, `r:origin`, ...).
+const toggleFolder = ($: EngineInterface, key: string) =>
+  update($, git, s => {
+    const shut = s.collapsed ?? []
+
+    return {
+      ...s,
+      collapsed: shut.includes(key) ? shut.filter(k => k !== key) : [...shut, key],
+    }
+  })
+
 const keyOf = (commit: Commit): string => 'commit:' + commit.sha
 
 export const register = (on: On, options?: PluginOptions): void => {
@@ -781,6 +815,28 @@ export const register = (on: On, options?: PluginOptions): void => {
         await containsOf($, await $.session.root(), sha)
         $.ui.invalidate('ui.render')
       }
+
+      return {}
+    }
+    if (e.element.startsWith('bitem:')) {
+      // A Branches row's Client (branch-client.tsx): the arrow opens or closes
+      // a folder, the name selects a branch (a folder's name does nothing), a
+      // double-click copies the full ref or the folder's prefix.
+      const key = e.element.slice('bitem:'.length)
+      const hit = (e.data as { hit?: unknown } | null)?.hit
+      const state = await read($, git)
+      const branches = await branchesOf($, await $.session.root())
+      const row = branchTree(branches, new Set(state.collapsed ?? [])).find(r =>
+        r.kind === 'branch' ? 'b:' + r.branch.name === key : r.key === key,
+      )
+      if (row === undefined) return {}
+      if (hit === 'arrow' && row.kind === 'folder') await toggleFolder($, row.key)
+      else if (hit === 'name' && row.kind === 'branch') await selectRef($, row.branch.name)
+      else if (hit === 'double') {
+        const text = copyTextOf(row)
+        if (text !== undefined) await copyRef($, text, e.surface)
+      }
+      $.ui.invalidate('ui.render')
 
       return {}
     }
@@ -1153,26 +1209,8 @@ export const register = (on: On, options?: PluginOptions): void => {
         </Box>
       )
 
-    const select = (ref: string) =>
-      update($, git, s => ({
-        ...s,
-        ref,
-        offset: 0,
-        infoOffset: 0,
-        infoLeft: 0,
-        selected: undefined,
-        limit: undefined, // the page size again
-      }))
-
-    const toggle = (key: string) =>
-      update($, git, s => {
-        const shut = s.collapsed ?? []
-
-        return {
-          ...s,
-          collapsed: shut.includes(key) ? shut.filter(k => k !== key) : [...shut, key],
-        }
-      })
+    const select = (ref: string) => selectRef($, ref)
+    const toggle = (key: string) => toggleFolder($, key)
 
     // The offset that keeps the selected commit in view; 0 with no selection.
     const offsetFor = (s: GitState, to: Tab): number => {
@@ -1292,6 +1330,47 @@ export const register = (on: On, options?: PluginOptions): void => {
           // Rails per depth as in the explorer; a folder opens or closes.
           const rails = '│ '.repeat(row.depth)
           const room = Math.max(4, sideWidth - 1 - rails.length)
+          if (hasDots) {
+            // A row Client (bar, rails, arrow or `*` slot, label), then a blank
+            // 1-cell Button holding the keyboard ring: Enter selects a branch
+            // or opens or closes a folder.
+            const k = row.kind === 'branch' ? 'b:' + row.branch.name : row.key
+            const isSelected = row.kind === 'branch' && state.ref === row.branch.name
+            const cols = Math.max(1, sideWidth - 1)
+            const text =
+              row.kind === 'branch'
+                ? row.name + (trackLabel(row.branch.track) === '' ? '' : ' ' + trackLabel(row.branch.track))
+                : row.isGroup === true
+                  ? row.name + ' (' + String(row.count ?? 0) + ')'
+                  : row.name + '/'
+
+            return (
+              <Box key={'bline:' + k} flexDirection="row" backgroundColor={isSelected ? sel : undefined}>
+                <Client
+                  key={'bitem:' + k}
+                  module="./branch-client.tsx"
+                  props={{
+                    depth: row.depth,
+                    isFolder: row.kind === 'folder',
+                    isGroup: row.kind === 'folder' && row.isGroup === true,
+                    isOpen: row.kind === 'folder' && row.isOpen,
+                    isSelected,
+                    isRemote: row.kind === 'branch' ? row.branch.isRemote : row.key.startsWith('r:') && row.isGroup !== true,
+                    isHead: row.kind === 'branch' && row.branch.isHead,
+                    label: fit(text, Math.max(3, cols - 1 - rails.length - 2)),
+                    colors: { accent: t.accent, muted: t.muted, selection: sel },
+                  }}
+                  width={cols}
+                  height={1}
+                />
+                {row.kind === 'branch' ? (
+                  <Button key={'branch:' + row.branch.name} plain label=" " onPress={() => select(row.branch.name)} />
+                ) : (
+                  <Button key={'bdir:' + row.key} plain label=" " onPress={() => toggle(row.key)} />
+                )}
+              </Box>
+            )
+          }
           if (row.kind === 'folder' && row.isGroup === true) {
             // A category row: `▾ Local (N)` / `▸ Remote (N)`, the whole label a
             // Button that opens or closes the group; the arrow is an accent Text
