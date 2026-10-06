@@ -16,6 +16,12 @@
       "title": "Editor key overrides",
       "description": "JSON of action to chord, e.g. {\"duplicateLines\":\"ctrl+shift+d\",\"deleteLines\":[\"ctrl+y\"]}",
       "default": ""
+    },
+    "previewEngines": {
+      "type": "string",
+      "title": "Preview engines",
+      "description": "JSON of file extension to an external command previewing it ({path}, {out} substituted; as: text, code, markdown or png), e.g. {\"pdf\":{\"cmd\":[\"pdftotext\",\"{path}\",\"-\"],\"as\":\"text\"},\"psd\":{\"cmd\":[\"magick\",\"{path}[0]\",\"{out}\"],\"as\":\"png\"}}",
+      "default": ""
     }
   }
 }

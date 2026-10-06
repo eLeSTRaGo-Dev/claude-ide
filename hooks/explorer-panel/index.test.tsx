@@ -3,6 +3,11 @@ import type { Engine, Mounted } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 import { draftFile } from './edit'
+import { convertedPath } from './preview'
+import { languageOf } from './tree'
+import { layout, plainRow } from './markdown/layout'
+import { parse } from './markdown/parse'
+import type { MdRow } from './markdown/rows'
 import { KEYMAPS } from './editor'
 import { sessionHex } from '../shared/color'
 import { THEMES } from '../shared/theme'
@@ -74,6 +79,23 @@ const descendants = (dir: string): number =>
     0,
   )
 
+// Base64 bytes per path, what `fs.read(path, { as: 'bytes' })` answers.
+const BYTES: Record<string, string> = {}
+
+// Image converters the fake machine has; a missing one exits 127.
+const TOOLS = new Set<string>()
+
+// A 200x100 PNG's header, written by the fake converters.
+const PNG_200x100 = 'iVBORw0KGgoAAAANSUhEUgAAAMgAAABkCAYAAAA='
+
+const ran = (exitCode: number, stdout = '', stderr = '') => ({
+  value: { exitCode, stdout, stderr, isStdoutTruncated: false, isStderrTruncated: false },
+})
+
+// Custom preview engine commands the fake machine has, by argv[0]: each gets
+// the argv and the run's timeout.
+const COMMANDS: Record<string, (argv: readonly string[], timeoutMs?: number) => ReturnType<typeof ran>> = {}
+
 // Answers fs, git, session and command plumbing beneath the plugin.
 const fake = (
   on: On,
@@ -114,6 +136,7 @@ const fake = (
     value: FILES[e.path] !== undefined || TREE[e.path] !== undefined,
   }))
   on('fs.read', (_$, e) => {
+    if (e.as === 'bytes' && BYTES[e.path] !== undefined) return { value: { base64: BYTES[e.path]! } }
     const text = FILES[e.path]
     if (text === undefined) throw new Error('ENOENT ' + e.path)
 
@@ -121,6 +144,20 @@ const fake = (
   })
   on('process.run', (_$, e) => {
     calls.push([...e.argv])
+    const tool = e.argv[0] ?? ''
+    const custom = COMMANDS[tool]
+    if (custom !== undefined) return custom(e.argv, e.init?.timeoutMs)
+    if (tool === 'magick' || tool === 'convert' || tool === 'rsvg-convert') {
+      if (!TOOLS.has(tool)) return ran(127, '', tool + ': not found\n')
+      if (e.argv[1] === '-version' || e.argv[1] === '--version') return ran(0, tool + ' 7\n')
+      // a conversion: writes a 200x100 PNG at the last operand
+      const out = (e.argv.at(-1) ?? '').replace(/^png:/, '')
+      FILES[out] = 'P'.repeat(300)
+      BYTES[out] = PNG_200x100
+
+      return ran(0)
+    }
+    if (tool === 'mkdir') return ran(0)
     if (e.argv[0] === 'rm') {
       // The operands: after `--`, else every non-flag argument.
       const dash = e.argv.indexOf('--')
@@ -2206,6 +2243,112 @@ for (const surface of ['terminal', 'desktop'] as const) {
   })
 }
 
+// ------------------------------------------------- A new session (/clear)
+
+// `$.state` as the plugin writes it, and a new session's empty state on
+// demand: the kit keeps `$.state` across `$.session.end`, the engine does not.
+// After `empty()` a key reads as never written until the plugin writes it;
+// `held` answers for keys the plugin has not written yet.
+const sessionState = (on: On, held: Record<string, unknown> = {}) => {
+  const written = new Map<string, unknown>()
+  const fresh = new Set<string>()
+  on('state.set', (_$, e, next) => {
+    if (e.plugin === PLUGIN) {
+      written.set(e.key, e.value)
+      fresh.delete(e.key)
+    }
+
+    return next(e)
+  })
+  on('state.get', (_$, e, next) => {
+    if (e.plugin !== PLUGIN || written.has(e.key)) return next(e)
+    if (fresh.has(e.key)) return { value: { value: undefined, version: 0 } }
+
+    return e.key in held ? { value: { value: held[e.key], version: 1 } } : next(e)
+  })
+  // Nothing beneath the plugins answers these here.
+  on('session.end', () => ({ sessionId: 's' }))
+  on('classic.SessionStart', () => ({}))
+
+  return {
+    value: (key: 'explorer' | 'git' | 'settings') => written.get(key) as Record<string, any> | undefined,
+    empty: () => {
+      for (const key of ['explorer', 'git', 'settings', 'sessionColor', 'settingsUi']) fresh.add(key)
+      written.clear()
+    },
+  }
+}
+
+
+for (const surface of ['terminal', 'desktop'] as const) {
+  const mountPane = ($: Engine, requestId: 'ide-explorer' | 'ide-git') =>
+    $.ui.mount({ plugin: PLUGIN, surface, component: 'Pane', props: PROPS, requestId, viewport: VIEWPORT })
+  const paints = async (pane: Pane, bg: string) => (await pane.findAll({ type: 'Box' })).some(box => box.props.backgroundColor === bg)
+  const PRESETS = { settings: { theme: 'nord', explorerMode: 'unity' }, 'layout:explorer': { tree: 0.5 } }
+
+  test(`${surface}: a /clear with nothing carried takes the presets from the store`, async ($, on) => {
+    const state = sessionState(on)
+    mock.store(on, PRESETS)
+    fake(on)
+    await $.classic.SessionStart({ source: 'clear' })
+
+    expect(state.value('settings')).toEqual(PRESETS.settings)
+    expect(state.value('explorer')?.mode).toBe('unity')
+    expect(state.value('explorer')?.split).toEqual({ tree: 0.5 })
+    const ui = await mountPane($, 'ide-explorer')
+    expect(await paints(ui, THEMES.nord.bg)).toBe(true)
+  })
+
+  test(`${surface}: a compact seeds nothing`, async ($, on) => {
+    const state = sessionState(on)
+    mock.store(on, PRESETS)
+    fake(on)
+    await $.classic.SessionStart({ source: 'compact' })
+
+    expect(state.value('settings')).toBeUndefined()
+    expect(state.value('explorer')).toBeUndefined()
+  })
+
+  for (const [source, reason] of [['clear', 'clear'], ['resume', 'resume'], ['fork', 'other']] as const) {
+    test(`${surface}: a ${source} keeps the view: dirs, selection, editor, git tab and Settings`, async ($, on) => {
+      // git on its Graph tab (no git beneath this kit to press it there)
+      const state = sessionState(on, { git: { ref: 'all', offset: 0, branchOffset: 0, detailOffset: 0, tab: 'graph' } })
+      mock.store(on)
+      fake(on)
+      await $.session.start(start(surface))
+      const ui = await mountPane($, 'ide-explorer')
+      await ui.press({ key: 'row:/proj/src' })
+      await ui.press({ key: 'row:/proj/src' })
+      await ui.press({ key: 'row:/proj/src/main.ts' })
+      await ui.press({ key: 'edit' })
+      // a theme picked, not saved: kept too
+      await ui.press({ key: 'settings' })
+      await ui.press({ key: 'settings:theme:nord' })
+      const before = state.value('explorer')!
+      expect(before.expanded).toEqual(['/proj/src'])
+      expect(before.edit?.path).toBe('/proj/src/main.ts')
+
+      await $.session.end({ reason, sessionId: 's1', resume: { id: 's1' } })
+      state.empty()
+      await $.classic.SessionStart({ source })
+
+      const after = state.value('explorer')!
+      expect(after.expanded).toEqual(['/proj/src'])
+      expect(after.selected).toBe('/proj/src/main.ts')
+      expect(after.mode).toBe('files')
+      // the editor asks for its text again
+      expect(after.edit?.path).toBe('/proj/src/main.ts')
+      expect(after.edit?.version).toBe(before.edit.version + 1)
+      expect(state.value('git')?.tab).toBe('graph')
+      expect(state.value('settings')?.theme).toBe('nord')
+      expect(await paints(ui, THEMES.nord.bg)).toBe(true)
+      expect(await ui.find({ key: 'editor' })).toBeDefined()
+      // the sheet is session only
+      expect(await ui.find({ key: 'settings:sheet' })).toBeUndefined()
+    })
+  }
+}
+
 // ---------------------------------------------------------- Multi-selection
 
 // Mounts `/proj` with copies and toasts recorded.
@@ -2432,5 +2575,689 @@ for (const surface of ['terminal', 'desktop', 'vscode'] as const) {
     await ui.press({ key: 'mark' })
     expect((await ui.find({ key: 'copy' }))?.props.label).toBe('copy path')
     expect((await ui.find({ type: 'Code' }))?.text).toContain('hello notes')
+  })
+}
+
+// ------------------------------------------------------------------ Images
+
+const IMG = '/img'
+const MTIME = 1_700_000_000_000
+const SVG = '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="32"><rect width="64" height="32"/></svg>'
+
+// A root of pictures: a PNG, a JPG and an SVG; no converter until a test adds one.
+const images = async (
+  $: Engine,
+  on: On,
+  surface: 'terminal' | 'desktop',
+  tools: readonly string[] = [],
+) => {
+  TREE[IMG] = [entry('pic.png', 'file', 300), entry('photo.jpg', 'file', 300), entry('logo.svg', 'file', SVG.length)]
+  TREE['/dev/shm'] = []
+  FILES['/img/pic.png'] = 'P'.repeat(300)
+  BYTES['/img/pic.png'] = PNG_200x100
+  FILES['/img/photo.jpg'] = 'J'.repeat(300)
+  FILES['/img/logo.svg'] = SVG
+  TOOLS.clear()
+  for (const tool of tools) TOOLS.add(tool)
+  const calls: string[][] = []
+  mock.store(on)
+  const clock = mock.clock(on)
+  fake(on, calls, [], [], () => IMG)
+  await $.session.start({ cwd: IMG, surface, isInteractive: true })
+  const ui = await $.ui.mount({
+    plugin: PLUGIN,
+    surface,
+    component: 'Pane',
+    props: PROPS,
+    requestId: 'ide-explorer',
+    viewport: VIEWPORT,
+  })
+
+  return { ui, calls, clock }
+}
+
+const converts = (calls: string[][]) => calls.filter(argv => argv.some(arg => arg.startsWith('png:')))
+
+test('terminal: a PNG draws as an Image of the file itself, fitted to Preview, with its info row', async ($, on) => {
+  const { ui, calls, clock } = await images($, on, 'terminal', ['magick'])
+  await ui.press({ key: 'row:/img/pic.png' })
+  const image = await ui.find({ type: 'Image' })
+  expect(image?.props.key).toBe('preview:image')
+  expect(image?.props.source).toEqual({ file: '/img/pic.png', format: 'png', generation: MTIME })
+  // 200x100 px (aspect 2) in Preview's 75x13 room left under the info row
+  expect(image?.props.columns).toBe(52)
+  expect(image?.props.rows).toBe(13)
+  expect(await ui.find({ type: 'Text', text: /200×100 px · 300 B/ })).toBeDefined()
+  expect(converts(calls)).toEqual([])
+  // no scrollbars, no source toggle, no edit for a raster image
+  expect(await ui.find({ key: 'sb:preview' })).toBeUndefined()
+  expect(await ui.find({ key: 'hb:preview' })).toBeUndefined()
+  expect(await ui.find({ key: 'preview:view' })).toBeUndefined()
+  expect(await ui.find({ key: 'edit' })).toBeUndefined()
+  // the probe's blit is taken: the picture stays
+  await clock.advance(300)
+  expect(await ui.find({ type: 'Image' })).toBeDefined()
+})
+
+test('terminal: a JPG is converted once to /dev/shm, then drawn from there', async ($, on) => {
+  const { ui, calls } = await images($, on, 'terminal', ['magick'])
+  const out = convertedPath('/dev/shm', '/img/photo.jpg', MTIME)
+  await ui.press({ key: 'row:/img/photo.jpg' })
+  expect(converts(calls)).toEqual([['magick', 'jpeg:/img/photo.jpg[0]', '-thumbnail', '2048x2048>', 'png:' + out]])
+  const image = await ui.find({ type: 'Image' })
+  expect(image?.props.source).toEqual({ file: out, format: 'png', generation: MTIME })
+  expect(await ui.find({ type: 'Text', text: /200×100 px · 300 B/ })).toBeDefined()
+  // drawn again (another file and back): the cache answers
+  await ui.press({ key: 'row:/img/pic.png' })
+  await ui.press({ key: 'row:/img/photo.jpg' })
+  expect(converts(calls)).toHaveLength(1)
+  expect(calls.filter(argv => argv[0] === 'magick' && argv[1] === '-version')).toHaveLength(1)
+})
+
+test('terminal: an SVG is converted by rsvg-convert when present', async ($, on) => {
+  const { ui, calls } = await images($, on, 'terminal', ['magick', 'rsvg-convert'])
+  await ui.press({ key: 'row:/img/logo.svg' })
+  const out = convertedPath('/dev/shm', '/img/logo.svg', MTIME)
+  expect(converts(calls)).toEqual([])
+  expect(calls).toContainEqual(['rsvg-convert', '-f', 'png', '-o', out, '/img/logo.svg'])
+  expect((await ui.find({ type: 'Image' }))?.props.source).toEqual({ file: out, format: 'png', generation: MTIME })
+})
+
+test('terminal: no converter: metadata and an install hint', async ($, on) => {
+  const { ui } = await images($, on, 'terminal')
+  await ui.press({ key: 'row:/img/photo.jpg' })
+  expect(await ui.find({ type: 'Image' })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: 'photo.jpg' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'install ImageMagick to preview jpg' })).toBeDefined()
+})
+
+test('desktop: an SVG draws as Svg, a PNG as metadata', async ($, on) => {
+  const { ui, calls } = await images($, on, 'desktop', ['magick'])
+  await ui.press({ key: 'row:/img/logo.svg' })
+  const svg = await ui.find({ type: 'Svg' })
+  expect(svg?.props.source).toBe(SVG)
+  expect(await ui.find({ type: 'Text', text: /64×32 px/ })).toBeDefined()
+  await ui.press({ key: 'row:/img/pic.png' })
+  expect(await ui.find({ type: 'Svg' })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /200×100 px · 300 B/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'image preview needs a kitty-graphics terminal' })).toBeDefined()
+  expect(converts(calls)).toEqual([])
+})
+
+for (const surface of ['terminal', 'desktop'] as const) {
+  test(`${surface}: v flips an SVG to its source in the code preview and back`, async ($, on) => {
+    const { ui } = await images($, on, surface, ['magick'])
+    await ui.press({ key: 'row:/img/logo.svg' })
+    const view = await ui.find({ key: 'preview:view' })
+    expect(view?.props.hotkey).toBe('v')
+    expect(view?.props.label).toBe(' source ')
+    expect(await ui.find({ type: 'Code' })).toBeUndefined()
+    expect(await ui.find({ key: 'edit' })).toBeUndefined()
+
+    await ui.press({ key: 'preview:view' })
+    expect((await ui.find({ type: 'Code' }))?.text).toContain('<svg')
+    expect(await ui.find({ type: surface === 'terminal' ? 'Image' : 'Svg' })).toBeUndefined()
+    expect((await ui.find({ key: 'preview:view' }))?.props.label).toBe(' rendered ')
+    // raw svg is code: it can be edited
+    expect(await ui.find({ key: 'edit' })).toBeDefined()
+
+    await ui.press({ key: 'preview:view' })
+    expect(await ui.find({ type: 'Code' })).toBeUndefined()
+    expect(await ui.find({ type: surface === 'terminal' ? 'Image' : 'Svg' })).toBeDefined()
+
+    // another file starts rendered
+    await ui.press({ key: 'preview:view' })
+    await ui.press({ key: 'row:/img/pic.png' })
+    await ui.press({ key: 'row:/img/logo.svg' })
+    expect((await ui.find({ key: 'preview:view' }))?.props.label).toBe(' source ')
+  })
+}
+
+const imageCloser = {
+  name: 'closer',
+  register: (on: On) => {
+    on('command.run', { command: 'close-explorer' }, async $ => {
+      await $.ui.close({ id: 'ide-explorer' })
+
+      return { text: '' }
+    })
+  },
+}
+
+test('terminal: closing the pane removes converted pictures', { plugins: [imageCloser] }, async ($, on) => {
+  on('ui.panes', () => ({ value: [{ id: 'ide-explorer', isFocused: true }] as never }))
+  on('ui.close', () => ({ value: undefined }))
+  const { ui, calls } = await images($, on, 'terminal', ['magick'])
+  await ui.press({ key: 'row:/img/photo.jpg' })
+  const out = convertedPath('/dev/shm', '/img/photo.jpg', MTIME)
+  await $.command.run({ command: 'close-explorer', args: '', origin: { kind: 'composer' }, presentation: PRESENTATION })
+  expect(calls).toContainEqual(['rm', '-f', '--', out])
+})
+
+// ---------------------------------------------------------- Custom engines
+
+const CUST = '/cust'
+const ENGINES_JSON = JSON.stringify({
+  pdf: { cmd: ['pdftotext', '{path}', '-'], as: 'text' },
+  js: { cmd: ['prettier', '{path}'], as: 'code' },
+  rst: { cmd: ['pandoc', '{path}', '-t', 'gfm'], as: 'markdown' },
+  psd: { cmd: ['magick-psd', '{path}[0]', '{out}'], as: 'png' },
+  bad: { cmd: ['failer', '{path}'], as: 'text' },
+  slow: { cmd: ['sleeper', '{path}'], as: 'text' },
+})
+
+// A root with one file per custom engine; the fake commands answer each.
+const customs = async ($: Engine, on: On, surface: 'terminal' | 'desktop' = 'terminal') => {
+  const names = ['doc.pdf', 'app.js', 'guide.rst', 'art.psd', 'x.bad', 'y.slow']
+  TREE[CUST] = names.map(name => entry(name, 'file', 4))
+  TREE['/dev/shm'] = []
+  for (const name of names) FILES[`${CUST}/${name}`] = 'data'
+  const timeouts: (number | undefined)[] = []
+  COMMANDS.pdftotext = (argv, timeoutMs) => (timeouts.push(timeoutMs), ran(0, `text of ${argv[1]}\npage 2\n`))
+  COMMANDS.prettier = () => ran(0, 'const a = 1\n')
+  COMMANDS.pandoc = () => ran(0, '# Guide\n\nbody\n')
+  COMMANDS['magick-psd'] = argv => {
+    const out = argv.at(-1)!
+    FILES[out] = 'P'.repeat(300)
+    BYTES[out] = PNG_200x100
+
+    return ran(0)
+  }
+  COMMANDS.failer = () => ran(1, '', '\nfailer: Syntax Error: no pages\nmore\n')
+  COMMANDS.sleeper = () => {
+    throw new Error('process timed out after 10000 ms')
+  }
+  const calls: string[][] = []
+  const toasts: string[] = []
+  on('ui.toast', (_$, e) => {
+    toasts.push(e.text)
+
+    return { value: undefined }
+  })
+  mock.store(on)
+  mock.clock(on)
+  fake(on, calls, [], [], () => CUST)
+  await $.session.start({ cwd: CUST, surface, isInteractive: true })
+  const ui = await $.ui.mount({
+    plugin: PLUGIN,
+    surface,
+    component: 'Pane',
+    props: PROPS,
+    requestId: 'ide-explorer',
+    viewport: VIEWPORT,
+  })
+  const ranOf = (tool: string) => calls.filter(argv => argv[0] === tool)
+
+  return { ui, calls, toasts, timeouts, ranOf }
+}
+
+const engineOptions = { options: { previewEngines: ENGINES_JSON } }
+
+test('custom engine as text: stdout in the plain code preview, run once per path + mtime, no edit or v', engineOptions, async ($, on) => {
+  const { ui, ranOf, timeouts, toasts } = await customs($, on)
+  await ui.press({ key: 'row:/cust/doc.pdf' })
+  expect(ranOf('pdftotext')).toEqual([['pdftotext', '/cust/doc.pdf', '-']])
+  expect(timeouts).toEqual([10000])
+  const code = await ui.find({ type: 'Code' })
+  expect(code?.text).toContain('text of /cust/doc.pdf')
+  expect(code?.text).toContain('page 2')
+  expect(code?.props.language).toBeUndefined()
+  expect(await ui.find({ key: 'edit' })).toBeUndefined()
+  expect(await ui.find({ key: 'preview:view' })).toBeUndefined()
+  // drawn again (another file and back): the cache answers
+  await ui.press({ key: 'row:/cust/app.js' })
+  await ui.press({ key: 'row:/cust/doc.pdf' })
+  expect(ranOf('pdftotext')).toHaveLength(1)
+  // a good config toasts nothing
+  expect(toasts.filter(text => text.includes('previewEngines'))).toEqual([])
+})
+
+test('custom engine as code: stdout highlighted by the file name', engineOptions, async ($, on) => {
+  const { ui } = await customs($, on)
+  await ui.press({ key: 'row:/cust/app.js' })
+  const code = await ui.find({ type: 'Code' })
+  expect(code?.text).toContain('const a = 1')
+  expect(code?.props.language).toBe(languageOf('app.js'))
+  expect(await ui.find({ key: 'edit' })).toBeUndefined()
+})
+
+test('custom engine as markdown: stdout rendered, no edit or v', engineOptions, async ($, on) => {
+  const { ui } = await customs($, on)
+  await ui.press({ key: 'row:/cust/guide.rst' })
+  expect(await ui.find({ type: 'Code' })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: 'Guide' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^═+$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '# Guide' })).toBeUndefined()
+  expect(await ui.find({ key: 'edit' })).toBeUndefined()
+  expect(await ui.find({ key: 'preview:view' })).toBeUndefined()
+})
+
+test('terminal: custom engine as png: the PNG it wrote at {out} draws as an Image', engineOptions, async ($, on) => {
+  const { ui, ranOf } = await customs($, on)
+  const out = convertedPath('/dev/shm', '/cust/art.psd', MTIME)
+  await ui.press({ key: 'row:/cust/art.psd' })
+  expect(ranOf('magick-psd')).toEqual([['magick-psd', '/cust/art.psd[0]', out]])
+  const image = await ui.find({ type: 'Image' })
+  expect(image?.props.source).toEqual({ file: out, format: 'png', generation: MTIME })
+  expect(await ui.find({ type: 'Text', text: /200×100 px · 4 B/ })).toBeDefined()
+  expect(await ui.find({ key: 'preview:view' })).toBeUndefined()
+})
+
+test('desktop: custom engine as png: metadata and a note, the command not run', engineOptions, async ($, on) => {
+  const { ui, ranOf } = await customs($, on, 'desktop')
+  await ui.press({ key: 'row:/cust/art.psd' })
+  expect(ranOf('magick-psd')).toEqual([])
+  expect(await ui.find({ type: 'Text', text: 'image preview needs a kitty-graphics terminal' })).toBeDefined()
+})
+
+test('custom engine exiting non-zero: metadata and stderr first line', engineOptions, async ($, on) => {
+  const { ui } = await customs($, on)
+  await ui.press({ key: 'row:/cust/x.bad' })
+  expect(await ui.find({ type: 'Code' })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: 'x.bad' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'failer: failer: Syntax Error: no pages' })).toBeDefined()
+})
+
+// A test hook can't make the run reject with the engine's timeout (a throwing
+// hook is skipped, the bottom hook rejects instead), so this covers the
+// rejected path; runFailure (preview.test.ts) maps the timeout's message.
+test('custom engine whose run rejects (timeout, missing binary): metadata and why', engineOptions, async ($, on) => {
+  const { ui, ranOf } = await customs($, on)
+  await ui.press({ key: 'row:/cust/y.slow' })
+  expect(ranOf('sleeper')).toHaveLength(1)
+  expect(await ui.find({ type: 'Code' })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: 'y.slow' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^sleeper: \S/ })).toBeDefined()
+})
+
+test(
+  'a bad previewEngines config toasts once per load; good entries still apply',
+  { options: { previewEngines: '{"pdf":{"cmd":["pdftotext","{path}","-"],"as":"text"},"psd":{"cmd":[],"as":"png"}}' } },
+  async ($, on) => {
+    const { ui, toasts } = await customs($, on)
+    await ui.press({ key: 'row:/cust/doc.pdf' })
+    await ui.press({ key: 'row:/cust/art.psd' })
+    await ui.press({ key: 'row:/cust/doc.pdf' })
+    expect(toasts.filter(text => text.includes('previewEngines'))).toEqual([
+      'previewEngines.psd: cmd must be a non-empty array of strings',
+    ])
+    expect((await ui.find({ type: 'Code' }))?.text).toContain('text of /cust/doc.pdf')
+  },
+)
+
+test('custom engine as text: ANSI escapes and form feeds in stdout are cleaned, so Code draws it', engineOptions, async ($, on) => {
+  const { ui } = await customs($, on)
+  COMMANDS.pdftotext = () => ran(0, '\x1b[31mred\x1b[0m page 1\r\n\fpage 2\n')
+  await ui.press({ key: 'row:/cust/doc.pdf' })
+  const code = await ui.find({ type: 'Code' })
+  expect(code?.props.source).toBe('red page 1\n page 2')
+})
+
+test('terminal: a Bash call keeps converted pictures (keyed by version); refresh converts again', async ($, on) => {
+  const done = () => ({ result: {}, text: '' }) as never
+  on('tool.call', done)
+  const { ui, calls } = await images($, on, 'terminal', ['magick'])
+  await ui.press({ key: 'row:/img/photo.jpg' })
+  expect(converts(calls)).toHaveLength(1)
+  await $.tool.call({ tool: 'Bash', command: 'ls' })
+  await ui.press({ key: 'row:/img/pic.png' })
+  await ui.press({ key: 'row:/img/photo.jpg' })
+  expect(converts(calls)).toHaveLength(1)
+  expect((await ui.find({ type: 'Image' }))?.props.source).toMatchObject({ file: convertedPath('/dev/shm', '/img/photo.jpg', MTIME) })
+  // nothing removed: a cached markdown view may still draw it
+  expect(calls.filter(argv => argv[0] === 'rm')).toEqual([])
+  await ui.press({ key: 'refresh' })
+  expect(converts(calls)).toHaveLength(2)
+})
+
+test('terminal: a changed picture is converted again, the older PNG kept until the session ends', async ($, on) => {
+  on('session.end', () => ({ sessionId: 's' }))
+  const { ui, calls } = await images($, on, 'terminal', ['magick'])
+  await ui.press({ key: 'row:/img/photo.jpg' })
+  const first = convertedPath('/dev/shm', '/img/photo.jpg', MTIME)
+  MTIMES['/img/photo.jpg'] = MTIME + 5000
+  await ui.press({ key: 'row:/img/pic.png' })
+  await ui.press({ key: 'row:/img/photo.jpg' })
+  const second = convertedPath('/dev/shm', '/img/photo.jpg', MTIME + 5000)
+  expect(converts(calls).map(argv => argv.at(-1))).toEqual(['png:' + first, 'png:' + second])
+  expect(calls.filter(argv => argv[0] === 'rm')).toEqual([])
+  await $.session.end({ reason: 'other', sessionId: 's', resume: { id: 's' } })
+  const rm = calls.find(argv => argv[0] === 'rm')
+  expect(rm?.slice(0, 3)).toEqual(['rm', '-f', '--'])
+  expect(new Set(rm?.slice(3))).toEqual(new Set([first, second]))
+  delete MTIMES['/img/photo.jpg']
+})
+
+test('session.start sweeps day-old converted PNGs once per load', async ($, on) => {
+  const { calls } = await images($, on, 'terminal', ['magick'])
+  const sweep = [
+    'find',
+    '/dev/shm',
+    '/home/u/.claude/ide-panes/previews',
+    '-maxdepth',
+    '1',
+    '-name',
+    'ide-panes-preview-*.png',
+    '-mmin',
+    '+1440',
+    '-delete',
+  ]
+  expect(calls.filter(argv => argv[0] === 'find')).toEqual([sweep])
+  await $.session.start({ cwd: IMG, surface: 'terminal', isInteractive: true })
+  expect(calls.filter(argv => argv[0] === 'find')).toHaveLength(1)
+})
+
+test('terminal: a PNG past the read cap is sized from its header through od', async ($, on) => {
+  COMMANDS.od = argv =>
+    argv.at(-1) === '/img/pic.png' ? ran(0, ' 89 50 4e 47 0d 0a 1a 0a 00 00 00 0d 49 48 44 52\n 00 00 00 c8 00 00 00 64\n') : ran(1)
+  try {
+    const { ui, calls } = await images($, on, 'terminal', ['magick'])
+    FILES['/img/pic.png'] = 'P'.repeat(5 * 1024 * 1024)
+    delete BYTES['/img/pic.png']
+    await ui.press({ key: 'row:/img/pic.png' })
+    expect(calls).toContainEqual(['od', '-An', '-tx1', '-N24', '--', '/img/pic.png'])
+    expect((await ui.find({ type: 'Image' }))?.props.source).toMatchObject({ file: '/img/pic.png' })
+    expect(await ui.find({ type: 'Text', text: /^200×100 px · / })).toBeDefined()
+    expect(converts(calls)).toEqual([])
+  } finally {
+    delete COMMANDS.od
+  }
+})
+
+test('desktop: an Svg is no taller than the room under its info row', async ($, on) => {
+  const { ui } = await images($, on, 'desktop', ['magick'])
+  await ui.press({ key: 'row:/img/logo.svg' })
+  // its own 32 px fits
+  expect((await ui.find({ type: 'Svg' }))?.props.height).toBe(32)
+  FILES['/img/tall.svg'] = '<svg xmlns="http://www.w3.org/2000/svg" width="40" height="4000"><rect width="40" height="4000"/></svg>'
+  TREE[IMG] = [...TREE[IMG]!, entry('tall.svg', 'file', FILES['/img/tall.svg'].length)]
+  await ui.press({ key: 'refresh' })
+  await ui.press({ key: 'row:/img/tall.svg' })
+  const height = (await ui.find({ type: 'Svg' }))?.props.height as number
+  expect(height).toBeLessThan(4000)
+  expect(height % 18).toBe(0)
+})
+
+test('terminal: new starts the new file rendered (previewRaw reset as on any selection change)', async ($, on) => {
+  const { ui } = await images($, on, 'terminal', ['magick'])
+  await ui.press({ key: 'row:/img/logo.svg' })
+  await ui.press({ key: 'preview:view' })
+  expect((await ui.find({ key: 'preview:view' }))?.props.label).toBe(' rendered ')
+  await ui.press({ key: 'new' })
+  await ui.input({ key: 'new-file', text: 'x.svg' })
+  expect(await ui.find({ key: 'editor' })).toBeDefined()
+  // discarded unsaved: x.svg stays selected, never written, so metadata;
+  // a kept previewRaw would still offer ` rendered ` over it
+  await ui.press({ key: 'edit:close' })
+  await ui.press({ key: 'ask:discard' })
+  expect(await ui.find({ key: 'editor' })).toBeUndefined()
+  expect(await ui.find({ key: 'preview:view' })).toBeUndefined()
+})
+// Last: the probe's answer holds for the rest of the load.
+test('terminal: a blit probe answering with the alt draws metadata and a note instead', async ($, on) => {
+  let blits = 0
+  on('ui.blit', () => (blits++, { value: { deny: 'the Image draws its alt here: the terminal draws no placeholder images (env: inside tmux or screen)' } }))
+  const { ui, clock } = await images($, on, 'terminal', ['magick'])
+  await ui.press({ key: 'row:/img/pic.png' })
+  expect(await ui.find({ type: 'Image' })).toBeDefined()
+  await clock.advance(300)
+  expect(blits).toBe(1)
+  expect(await ui.find({ type: 'Image' })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: "terminal can't draw images" })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /200×100 px/ })).toBeUndefined()
+})
+
+
+// ---------------------------------------------------------------- Markdown
+
+const MD = '/md'
+const filler = (word: string) => Array.from({ length: 20 }, (_, i) => `${word} ${i + 1}`).join('\n\n')
+const README = [
+  '# Title',
+  '',
+  'See [guide](docs/guide.md) and [jump](#details) and [site](https://example.com).',
+  '',
+  '| A | B |',
+  '|---|---|',
+  '| [x](https://t.example) | 2 |',
+  '',
+  filler('para'),
+  '',
+  '## Details',
+  '',
+  filler('more'),
+  '',
+].join('\n')
+// Preview's rendered width at PROPS: 75 inner columns less the vertical bar.
+const MD_WIDTH = 74
+const MD_ROWS = 14 // Preview's rows at bodyRows 20
+const readmeRows = () => layout(parse(README), MD_WIDTH)
+
+const markdowns = async <S extends 'terminal' | 'desktop' | 'vscode'>(
+  $: Engine,
+  on: On,
+  surface: S,
+  readme = README,
+  size: { bodyColumns: number; bodyRows: number } = { bodyColumns: PROPS.bodyColumns, bodyRows: PROPS.scroll.bodyRows },
+  calls: string[][] = [],
+) => {
+  TREE[MD] = [entry('docs', 'dir'), entry('README.md', 'file', readme.length), entry('pic.png', 'file', 300)]
+  TREE[MD + '/docs'] = [entry('guide.md', 'file', 20)]
+  TREE['/dev/shm'] = []
+  FILES[MD + '/README.md'] = readme
+  FILES[MD + '/docs/guide.md'] = '# Guide\n\nbody\n'
+  FILES[MD + '/pic.png'] = 'P'.repeat(300)
+  BYTES[MD + '/pic.png'] = PNG_200x100
+  const toasts: string[] = []
+  on('ui.toast', (_$, e) => {
+    toasts.push(e.text)
+
+    return { value: undefined }
+  })
+  on('ui.focus', () => ({}))
+  mock.store(on)
+  mock.clock(on)
+  fake(on, calls, [], [], () => MD)
+  await $.session.start({ cwd: MD, surface, isInteractive: true })
+  const ui = (await $.ui.mount({
+    plugin: PLUGIN,
+    surface,
+    component: 'Pane',
+    props: { ...PROPS, bodyColumns: size.bodyColumns, scroll: { offset: 0, bodyRows: size.bodyRows } },
+    requestId: 'ide-explorer',
+    viewport: { columns: size.bodyColumns + 2, rows: size.bodyRows + 10 },
+  })) as Mounted<S, 'Pane'>
+  await ui.press({ key: 'row:/md/README.md' })
+
+  return { ui, toasts }
+}
+
+// Rows are Texts with no key, so a row is told by its text: the rows whose
+// text is not blank and appears once in the document (and holds no link: a
+// Link's text there carries its href).
+const uniqueRows = (rows: readonly MdRow[]): (string | undefined)[] => {
+  const texts = rows.map(row => plainRow(row))
+
+  const hasLink = (row: MdRow) => row.kind === 'text' && row.spans.some(span => span.style?.href !== undefined)
+
+  return texts.map((text, i) =>
+    text.trim() !== '' && texts.indexOf(text) === texts.lastIndexOf(text) && !hasLink(rows[i]!) ? text : undefined,
+  )
+}
+// The indexes of the document's unique rows drawn now.
+const shownRows = async (ui: { findAll: Mounted['findAll'] }, rows: readonly MdRow[]): Promise<number[]> => {
+  const drawn = new Set((await ui.findAll({ type: 'Text' })).map(text => text.text))
+
+  return uniqueRows(rows).flatMap((text, i) => (text !== undefined && drawn.has(text) ? [i] : []))
+}
+// The indexes of the unique rows in the window from `offset`.
+const windowRows = (rows: readonly MdRow[], offset: number): number[] =>
+  uniqueRows(rows).flatMap((text, i) => (text !== undefined && i >= offset && i < offset + MD_ROWS ? [i] : []))
+
+for (const surface of ['terminal', 'desktop'] as const) {
+  test(`${surface}: a .md previews rendered: heading, rule, table borders, links`, async ($, on) => {
+    const { ui } = await markdowns($, on, surface)
+    const rows = readmeRows().rows
+    expect(await ui.find({ type: 'Code' })).toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: 'Title' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: '═'.repeat(MD_WIDTH) })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^┌─+┬─+┐$/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^└─+┴─+┘$/ })).toBeDefined()
+    // only the first page of rows is drawn
+    expect(await shownRows(ui, rows)).toEqual(windowRows(rows, 0))
+    // an https link outside a table is a Link; the table's is not
+    expect((await ui.findAll({ type: 'Link' })).map(link => link.props.href)).toEqual(['https://example.com'])
+    // the relative, #anchor and table links are pressable through Clients
+    expect((await ui.find({ key: 'md:link:0' }))?.props.props).toMatchObject({ i: 0, segments: [{ text: 'guide' }] })
+    expect((await ui.find({ key: 'md:link:1' }))?.props.props).toMatchObject({ segments: [{ text: 'jump' }] })
+    expect((await ui.find({ key: 'md:link:2' }))?.props.props).toMatchObject({ segments: [{ text: 'x' }] })
+    expect(await ui.find({ key: 'md:link:3' })).toBeUndefined()
+    const drawnLink = (await ui.findAll({ type: 'Text', text: 'guide', in: 'md:link:0' })).find(text => text.text === 'guide' && text.props.underline !== undefined)
+    expect(drawnLink?.props).toMatchObject({ underline: true, color: THEMES.claude.accent })
+    // edit is the raw text; no horizontal bar for wrapped rows
+    expect(await ui.find({ key: 'edit' })).toBeDefined()
+    expect(await ui.find({ key: 'hb:preview' })).toBeUndefined()
+  })
+
+  test(`${surface}: rendered rows scroll by pages and the wheel; the total drives sb:preview`, async ($, on) => {
+    const { ui } = await markdowns($, on, surface)
+    const rows = readmeRows().rows
+    expect((await ui.find({ key: 'sb:preview' }))?.props.props).toMatchObject({ total: rows.length, visible: MD_ROWS, offset: 0 })
+    // a page key
+    await scroll($, 'ide-explorer', 20)
+    expect(await shownRows(ui, rows)).toEqual(windowRows(rows, MD_ROWS))
+    expect((await ui.find({ key: 'sb:preview' }))?.props.props).toMatchObject({ offset: MD_ROWS })
+    // the wheel over Preview moves by rows
+    await scroll($, 'ide-explorer', 3, { column: 80, row: 3 })
+    expect(await shownRows(ui, rows)).toEqual(windowRows(rows, MD_ROWS + 3))
+    // the end clamps to the last page
+    await scroll($, 'ide-explorer', 1000, { column: 80, row: 3 })
+    expect(await shownRows(ui, rows)).toEqual(windowRows(rows, rows.length - MD_ROWS))
+  })
+
+  test(`${surface}: v flips rendered markdown to its source as Code and back`, async ($, on) => {
+    const { ui } = await markdowns($, on, surface)
+    const view = await ui.find({ key: 'preview:view' })
+    expect(view?.props.hotkey).toBe('v')
+    expect(view?.props.label).toBe(' source ')
+    await ui.press({ key: 'preview:view' })
+    const code = await ui.find({ type: 'Code' })
+    expect(code?.text).toContain('# Title')
+    expect(code?.props.language).toBe(languageOf('README.md'))
+    expect(await ui.find({ type: 'Text', text: 'Title' })).toBeUndefined()
+    expect(await ui.find({ key: 'md:link:0' })).toBeUndefined()
+    await ui.press({ key: 'preview:view' })
+    expect(await ui.find({ type: 'Code' })).toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: 'Title' })).toBeDefined()
+  })
+
+  test(`${surface}: a relative link pressed selects the file it names`, async ($, on) => {
+    const { ui } = await markdowns($, on, surface)
+    await ui.pointer({ type: 'down', x: 1, y: 0, button: 'left', in: 'md:link:0' })
+    await ui.pointer({ type: 'up', x: 1, y: 0, button: 'left', in: 'md:link:0' })
+    expect(await ui.find({ key: 'row:/md/docs/guide.md' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'Guide' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'Title' })).toBeUndefined()
+  })
+
+  test(`${surface}: an #anchor link scrolls Preview to its heading; a table URL toasts; a stale press is ignored`, async ($, on) => {
+    const { ui, toasts } = await markdowns($, on, surface)
+    const L = readmeRows()
+    const at = L.anchors.get('details')!
+    expect(at).toBeGreaterThan(MD_ROWS)
+    expect((await ui.find({ key: 'md:link:1' }))?.props.props).toMatchObject({ i: 1, path: '/md/README.md', offset: 0 })
+    await ui.post({ link: 1, path: '/md/README.md', offset: 0 }, { in: 'md:link:1' })
+    expect(await shownRows(ui, L.rows)).toEqual(windowRows(L.rows, at))
+    expect((await ui.find({ key: 'sb:preview' }))?.props.props).toMatchObject({ offset: at })
+    await scroll($, 'ide-explorer', -1000, { column: 80, row: 3 })
+    // a press without the drawing's names, or naming another file, does nothing
+    await ui.post({ link: 2 }, { in: 'md:link:2' })
+    await ui.post({ link: 2, path: '/md/docs/guide.md', offset: 0 }, { in: 'md:link:2' })
+    expect(toasts).not.toContain('Link: https://t.example')
+    // nor one from the drawing before a scroll (its run i is another link now)
+    await scroll($, 'ide-explorer', 1, { column: 80, row: 3 })
+    expect((await ui.find({ key: 'md:link:2' }))?.props.props).toMatchObject({ offset: 1 })
+    await ui.post({ link: 2, path: '/md/README.md', offset: 0 }, { in: 'md:link:2' })
+    expect(toasts).not.toContain('Link: https://t.example')
+    await ui.post({ link: 2, path: '/md/README.md', offset: 1 }, { in: 'md:link:2' })
+    expect(toasts).toContain('Link: https://t.example')
+  })
+}
+
+test('vscode: our renderer draws the rows; links underlined, no Clients', async ($, on) => {
+  const { ui } = await markdowns($, on, 'vscode')
+  expect(await ui.find({ type: 'Text', text: 'Title' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^┌─+┬─+┐$/ })).toBeDefined()
+  expect(await ui.find({ key: 'md:link:0' })).toBeUndefined()
+  const guide = (await ui.findAll({ type: 'Text', text: 'guide' })).find(text => text.text === 'guide')
+  expect(guide?.props).toMatchObject({ underline: true, color: THEMES.claude.accent })
+  expect((await ui.findAll({ type: 'Link' })).map(link => link.props.href)).toEqual(['https://example.com'])
+})
+
+const PICTURED = '![logo](pic.png)\n\n' + filler('para')
+
+test('terminal: a local image in markdown draws as an Image over the rows it reserves', async ($, on) => {
+  const { ui } = await markdowns($, on, 'terminal', PICTURED)
+  const image = await ui.find({ type: 'Image' })
+  expect(image?.props.key).toBe('md:image:0')
+  expect(image?.props.source).toEqual({ file: '/md/pic.png', format: 'png', generation: MTIME })
+  // 200x100 px fitted into 74 columns and at most 12 rows
+  expect(image?.props.columns).toBe(48)
+  expect(image?.props.rows).toBe(12)
+  // the image row became 12: the total grows by 11 and the text starts after them
+  const laid = layout(parse(PICTURED), MD_WIDTH).rows
+  expect((await ui.find({ key: 'sb:preview' }))?.props.props).toMatchObject({ total: laid.length + 11 })
+  expect(await ui.find({ type: 'Text', text: 'para 1' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'para 2' })).toBeUndefined()
+  // scrolled into the picture: its placeholder row, the text below moves up
+  await scroll($, 'ide-explorer', 2, { column: 80, row: 3 })
+  expect(await ui.find({ type: 'Image' })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: '🖼 logo' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'para 2' })).toBeDefined()
+})
+
+test('desktop: a markdown image is its placeholder row', async ($, on) => {
+  const { ui } = await markdowns($, on, 'desktop', PICTURED)
+  expect(await ui.find({ type: 'Image' })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: '🖼 logo' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'para 6' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'para 7' })).toBeUndefined()
+})
+
+test('terminal: a wide code block in a tall Preview draws as several Codes, each under 10000 chars, one row per line', async ($, on) => {
+  const body = Array.from({ length: 120 }, (_, i) => String(i % 10).repeat(180)).join('\n')
+  const readme = '```\n' + body + '\n```\n'
+  const { ui } = await markdowns($, on, 'terminal', readme, { bodyColumns: 300, bodyRows: 100 })
+  const codes = await ui.findAll({ type: 'Code' })
+  expect(codes.length).toBeGreaterThan(1)
+  for (const code of codes) expect(String(code.props.source).length).toBeLessThan(10000)
+  const rows = codes.reduce((sum, code) => sum + String(code.props.source).split('\n').length, 0)
+  const shown = (await ui.find({ key: 'sb:preview' }))?.props.props as { total: number; visible: number }
+  // the window's code rows, every one drawn once
+  expect(rows).toBe(Math.min(shown.visible, 120))
+})
+
+test('terminal: a markdown image is converted only for a picture type, through its coder', async ($, on) => {
+  TOOLS.clear()
+  TOOLS.add('magick')
+  FILES[MD + '/doc.pdf'] = '%PDF-1.4'
+  FILES[MD + '/photo.jpg'] = 'J'.repeat(300)
+  FILES[MD + '/evil.png.txt'] = 'push graphic-context'
+  const calls: string[][] = []
+  const readme = '![p](doc.pdf)\n\n![e](evil.png.txt)\n\n![j](photo.jpg)\n\n' + filler('para')
+  const { ui } = await markdowns($, on, 'terminal', readme, undefined, calls)
+  const magick = calls.filter(argv => argv[0] === 'magick' && argv[1] !== '-version')
+  expect(magick).toEqual([
+    ['magick', 'jpeg:/md/photo.jpg[0]', '-thumbnail', '2048x2048>', 'png:' + convertedPath('/dev/shm', '/md/photo.jpg', MTIME)],
+  ])
+  expect(await ui.find({ type: 'Text', text: '🖼 p' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '🖼 e' })).toBeDefined()
+})
+
+for (const surface of ['terminal', 'desktop'] as const) {
+  test(`${surface}: a binary .md is metadata, with no v`, async ($, on) => {
+    const { ui } = await markdowns($, on, surface, '# x\0\0binary')
+    expect(await ui.find({ type: 'Text', text: 'README.md' })).toBeDefined()
+    expect(await ui.find({ key: 'preview:view' })).toBeUndefined()
   })
 }

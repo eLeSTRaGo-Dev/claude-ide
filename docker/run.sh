@@ -36,6 +36,20 @@ done
 # User instructions (a file mount; docker follows a symlinked source itself).
 ro "$CONF/CLAUDE.md"
 
+# The image has no terminfo for newer terminals (xterm-ghostty, xterm-kitty):
+# mount the host's entry into ~/.terminfo, else fall back to xterm-256color.
+TERM="${TERM:-xterm-256color}"
+TI=""
+for dir in "$HOME/.terminfo" /etc/terminfo /usr/share/terminfo /lib/terminfo; do
+  [ -f "$dir/${TERM:0:1}/$TERM" ] && { TI="$dir/${TERM:0:1}/$TERM"; break; }
+done
+if [ -n "$TI" ]; then
+  MOUNTS+=(-v "$TI:$HOME/.terminfo/${TERM:0:1}/$TERM:ro")
+else
+  TERM=xterm-256color
+fi
+export TERM
+
 TTY=(-i); [ -t 0 ] && TTY=(-it)
 
 exec docker run --rm "${TTY[@]}" \
@@ -46,6 +60,6 @@ exec docker run --rm "${TTY[@]}" \
   -v "$HOME/.gitconfig":"$HOME/.gitconfig":ro \
   -v "$PROJECT":"$PROJECT" \
   -w "$PROJECT" \
-  -e TERM -e COLORTERM -e CLAUDE_CONFIG_DIR="$CONF" \
+  -e TERM -e COLORTERM -e TERM_PROGRAM -e TERM_PROGRAM_VERSION -e CLAUDE_CONFIG_DIR="$CONF" \
   "$IMAGE" \
   "$@"

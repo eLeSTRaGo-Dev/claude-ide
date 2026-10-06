@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, PluginOptions, Register, RenderChildren } from 'claude-code'
 
-import type { ExplorerState, SettingsState, SettingsUi } from '../../types'
+import type { ExplorerState, GitState, SettingsState, SettingsUi } from '../../types'
 import { TRANSFER_CHUNK, accept, draftFile, editorColors, parseChunk, parseHView } from './edit'
 import type { EditorProps, HView, Incoming } from './edit'
 import { KEYMAPS, chunks } from './editor'
@@ -24,6 +24,36 @@ import {
 } from './tree'
 import type { Entry, Mode, Row } from './tree'
 import { deleteTargets, pruneMarks, rangeOf, toggleMark } from './marks'
+import {
+  convertArgv,
+  CELL_H,
+  CELL_W,
+  convertedPath,
+  engineArgv,
+  engineOf,
+  firstLine,
+  fitCells,
+  hasSourceView,
+  imageInfo,
+  parseEngines,
+  runFailure,
+  pngSize,
+  pngSizeFromHex,
+  cleanOutput,
+  cleanText,
+  codeChunks,
+  isPictureFile,
+  SVG_ROW_PX,
+  svgSize,
+} from './preview'
+import type { ConvertTool, CustomEngine } from './preview'
+import { parse as parseMarkdown } from './markdown/parse'
+import type { ParseResult } from './markdown/parse'
+import { MIN_WIDTH, layout as layoutMarkdown } from './markdown/layout'
+import type { MdRow, Role, Span } from './markdown/rows'
+import { spansWidth } from './markdown/wrap'
+import { anchorRow, expandPictures, isLinkable, linkHits, linkTarget, localPath } from './markdown/view'
+import type { LinkHit, MdView, Picture, ViewRow } from './markdown/view'
 import { GIT_PANE, changeCounts, shortDir, parseStatus, statusArgv } from '../git-panel/git'
 import { lastAgentColor, parseColorAnswer } from '../shared/color'
 import { H_THUMB, H_TRACK, scrollbar } from '../shared/scrollbar'
@@ -530,6 +560,7 @@ const press = async ($: EngineInterface, row: Row, isKey = false, keepMarks = fa
     selected: row.path,
     previewOffset: s.selected === row.path ? s.previewOffset : 0,
     previewLeft: s.selected === row.path ? s.previewLeft : 0,
+    previewRaw: s.selected === row.path ? s.previewRaw : undefined,
   }))
 }
 
@@ -541,8 +572,421 @@ type Preview =
       language?: string
       lines: string[]
       refs: Ref[]
+      generated?: boolean // a custom engine's output, not the file's text: no `edit`
     }
   | { type: 'text'; lines: string[] }
+  | {
+      type: 'image'
+      path: string
+      mtime: number // whole ms: the Image source's generation
+      bytes: number
+      png?: string // the PNG file the terminal draws: the file itself or a converted copy
+      width?: number // pixels, when known
+      height?: number
+      svg?: string // the SVG text, drawn by `Svg` on remote surfaces
+      note?: string // why there is no picture
+    }
+
+  | {
+      type: 'markdown'
+      path: string
+      mtime: number
+      text: string
+      generated?: boolean // a custom engine's output (`as: markdown`): no `edit`
+    }
+
+type ImagePreview = Extract<Preview, { type: 'image' }>
+type MarkdownPreview = Extract<Preview, { type: 'markdown' }>
+
+// ------------------------------------------------------------------ Images
+
+// The Image's key: the blit probe names it.
+const IMAGE_KEY = 'preview:image'
+// `Svg` takes at most this many characters.
+const MAX_SVG_CHARS = 131072
+
+// Converters found on this machine and where converted PNGs go; looked up
+// once per load (the first image that needs one).
+type ImageTools = { raster?: ConvertTool; svg?: ConvertTool; dir: string }
+let imageTool: Promise<ImageTools> | undefined
+// Image previews per surface kind, path and mtime (the load's promise, so
+// drawings while a conversion runs share it). Keys name the version, so
+// only `refresh`, the pane's close and the session's end clear it.
+const pictures = new Map<string, Promise<ImagePreview>>()
+// Every PNG converted (or written at `{out}`) this load: removed when the
+// pane closes or the session ends, never when a newer version replaces one
+// (a cached markdown view may still draw it); older loads' files are swept
+// by session.start.
+const converted = new Set<string>()
+// Custom engines (userConfig `previewEngines`), parsed once per load, and
+// what was wrong with the config (toasted once per load by session.start).
+let customEngines: Record<string, CustomEngine> = {}
+let engineErrors: string[] = []
+// Custom engine previews per surface kind, path and mtime (the run's promise,
+// so drawings while it runs share it); cleared like the pictures.
+const customCache = new Map<string, Promise<Preview>>()
+// Rendered markdown, the latest version per file only: the parse per path,
+// and the rows per surface kind and path, for one mtime, width, room and
+// probe answer (the layout holds theme roles, not colors). The rows are
+// cleared by every listing clear (an embedded image may have changed).
+const mdParsed = new Map<string, { mtime: number; parsed: ParseResult }>()
+const mdCache = new Map<string, { sig: string; view: MdView }>()
+// What the last drawing of rendered markdown showed, read by the link
+// message: the file, the window's first row, its heading rows and the link
+// runs pressable through a `Client` (`md:link:<i>`, posting `{ link: i,
+// path, offset }`; a press from another drawing is ignored).
+const mdShown = {
+  path: '',
+  offset: 0,
+  anchors: new Map<string, number>() as ReadonlyMap<string, number>,
+  links: [] as LinkHit[],
+}
+// The blit probe: `alt` once a keyed Image answered that it draws its alt here
+// (no kitty graphics, or inside tmux); then images draw metadata only.
+let imageProbe: 'unknown' | 'pending' | 'probing' | 'ok' | 'alt' = 'unknown'
+
+const isRemote = (surface: string): boolean => surface !== 'terminal'
+
+// Exit 0 of `argv`; a missing binary throws, which is a no.
+const runs = async ($: EngineInterface, argv: string[]): Promise<boolean> => {
+  try {
+    return (await $.process.run(argv, { timeoutMs: 5000 })).exitCode === 0
+  } catch {
+    return false
+  }
+}
+
+const detectTools = async ($: EngineInterface): Promise<ImageTools> => {
+  const raster = (await runs($, ['magick', '-version']))
+    ? 'magick'
+    : (await runs($, ['convert', '-version']))
+      ? 'convert'
+      : undefined
+  const svg = (await runs($, ['rsvg-convert', '--version'])) ? 'rsvg-convert' : raster
+  let dir = '/dev/shm'
+  let hasShm = false
+  try {
+    hasShm = await $.fs.exists(dir)
+  } catch {
+    hasShm = false
+  }
+  if (!hasShm) {
+    dir = (await convertDirs($))[1]!
+    await runs($, ['mkdir', '-p', dir])
+  }
+
+  return { raster, svg, dir }
+}
+
+const toolsOf = ($: EngineInterface): Promise<ImageTools> => {
+  imageTool ??= detectTools($)
+
+  return imageTool
+}
+
+// Removes converted PNGs; there is no `$.fs` delete.
+const removeConverted = async ($: EngineInterface, files: readonly string[], timeoutMs = 5000): Promise<void> => {
+  if (files.length === 0) return
+  try {
+    await $.process.run(['rm', '-f', '--', ...files], { timeoutMs })
+  } catch {
+    // left for session.start's sweep (or /dev/shm's next boot)
+  }
+}
+
+// Every preview cache: `refresh`, the blit probe's answer, the pane's close.
+const dropPictures = (): void => {
+  pictures.clear()
+  customCache.clear()
+  mdParsed.clear()
+  mdCache.clear()
+}
+
+// Removes this load's converted PNGs and forgets the previews drawing them.
+const removeAllConverted = async ($: EngineInterface, timeoutMs?: number): Promise<void> => {
+  const files = [...converted]
+  converted.clear()
+  dropPictures()
+  await removeConverted($, files, timeoutMs)
+}
+
+// Where converted PNGs may be: /dev/shm, else the HOME fallback (detectTools).
+const convertDirs = async ($: EngineInterface): Promise<string[]> => [
+  '/dev/shm',
+  ((await $.env.get('HOME')) ?? '/tmp') + '/.claude/ide-panes/previews',
+]
+
+// Once per load (session.start): converted PNGs a day old, left by a load
+// that never closed its pane, are removed.
+let isSwept = false
+const sweepConverted = async ($: EngineInterface): Promise<void> => {
+  if (isSwept) return
+  isSwept = true
+  try {
+    const dirs = await convertDirs($)
+    await $.process.run(
+      ['find', ...dirs, '-maxdepth', '1', '-name', 'ide-panes-preview-*.png', '-mmin', '+1440', '-delete'],
+      { timeoutMs: 5000 },
+    )
+  } catch {
+    // tried again next load
+  }
+}
+
+// A PNG's pixel size from its header: its first 24 bytes through `od`, else
+// (no `od`) the bytes read whole, only up to the preview cap.
+const pngSizeOf = async ($: EngineInterface, file: string, bytes: number) => {
+  try {
+    const ran = await $.process.run(['od', '-An', '-tx1', '-N24', '--', file], { timeoutMs: 5000 })
+    if (ran.exitCode === 0) return pngSizeFromHex(ran.stdout)
+  } catch {
+    // no od: the read below
+  }
+  if (bytes > MAX_PREVIEW_BYTES) return undefined
+  try {
+    return pngSize((await $.fs.read(file, { as: 'bytes' })).base64)
+  } catch {
+    return undefined
+  }
+}
+
+const ext = (name: string): string => name.slice(name.lastIndexOf('.') + 1).toLowerCase()
+
+// The image preview of a file: on the terminal a PNG to draw (the file, or
+// converted once to `/dev/shm`), on remote surfaces the SVG text; else a note
+// saying why there is none. Cached per path and mtime, the promise itself,
+// so drawings while a conversion runs share it (a rejected one is dropped).
+const loadImage = (
+  $: EngineInterface,
+  row: Row,
+  stat: { size: number; mtimeMs: number },
+  surface: string,
+): Promise<ImagePreview> => {
+  const key = (isRemote(surface) ? 'remote' : 'terminal') + '\0' + row.path + '\0' + Math.trunc(stat.mtimeMs)
+  const known = pictures.get(key)
+  if (known !== undefined) return known
+  const made = makeImage($, row, stat, surface)
+  pictures.set(key, made)
+  made.catch(() => {
+    if (pictures.get(key) === made) pictures.delete(key)
+  })
+
+  return made
+}
+
+const makeImage = async (
+  $: EngineInterface,
+  row: Row,
+  stat: { size: number; mtimeMs: number },
+  surface: string,
+): Promise<ImagePreview> => {
+  const mtime = Math.trunc(stat.mtimeMs)
+  const base: ImagePreview = { type: 'image', path: row.path, mtime, bytes: stat.size }
+  const isSvg = engineOf(row.name, customEngines) === 'svg'
+  let made: ImagePreview
+  if (isRemote(surface)) {
+    if (isSvg) {
+      let text: string | undefined
+      try {
+        text = stat.size <= MAX_PREVIEW_BYTES ? await $.fs.read(row.path) : undefined
+      } catch {
+        text = undefined
+      }
+      made =
+        text !== undefined && text.length <= MAX_SVG_CHARS
+          ? { ...base, svg: text, ...svgSize(text) }
+          : { ...base, note: text === undefined ? 'cannot read' : 'too large to draw' }
+    } else {
+      const size = ext(row.name) === 'png' ? await pngSizeOf($, row.path, stat.size) : undefined
+      made = { ...base, ...size, note: 'image preview needs a kitty-graphics terminal' }
+    }
+  } else if (imageProbe === 'alt') {
+    made = { ...base, note: "terminal can't draw images" }
+  } else {
+    // A PNG draws from the file itself; a `.png` that isn't one is converted.
+    const own = ext(row.name) === 'png' ? await pngSizeOf($, row.path, stat.size) : undefined
+    if (own !== undefined || (ext(row.name) === 'png' && stat.size > MAX_PREVIEW_BYTES)) {
+      made = { ...base, png: row.path, ...own }
+    } else {
+      const tools = await toolsOf($)
+      const tool = isSvg ? tools.svg : tools.raster
+      if (tool === undefined) {
+        made = { ...base, note: `install ImageMagick to preview ${ext(row.name)}` }
+      } else {
+        const out = convertedPath(tools.dir, row.path, mtime)
+        const argv = convertArgv(tool, row.path, out)
+        let failure: string | undefined
+        try {
+          if (argv === undefined) throw new Error(`${ext(row.name)} is not a picture`)
+          converted.add(out)
+          const ran = await $.process.run(argv, { timeoutMs: 30000 })
+          if (ran.exitCode !== 0) {
+            failure = cleanOutput(ran.stderr).split('\n').find(line => line.trim() !== '') ?? `${tool} exited ${ran.exitCode}`
+          }
+        } catch (err) {
+          failure = err instanceof Error ? err.message : String(err)
+        }
+        if (failure !== undefined) {
+          made = { ...base, note: 'cannot convert: ' + failure }
+        } else {
+          let outBytes = 0
+          try {
+            outBytes = (await $.fs.stat(out)).size
+          } catch {
+            outBytes = 0
+          }
+          const size = await pngSizeOf($, out, outBytes)
+          made = { ...base, png: out, ...size }
+        }
+      }
+    }
+  }
+
+  return made
+}
+
+// Once per load, after the first Image is drawn: a blit of the keyed Image
+// answers a deny naming its alt where the terminal draws no pictures. Other
+// denies (not mounted yet, the selection moved on) try again a few times.
+// The probe's retries so far (a redraw starts the next one) and its timer:
+// each drawing re-arms it, so the last drawing's Image is the one blitted.
+let probeTries = 0
+let probeTimer: { cancel: () => void } | undefined
+
+const probeImage = ($: EngineInterface, source: { file: string; format: 'png'; generation: number }, key = IMAGE_KEY): void => {
+  if (imageProbe !== 'unknown' && imageProbe !== 'pending') return
+  const tries = probeTries
+  imageProbe = 'pending'
+  probeTimer?.cancel()
+  probeTimer = $.clock.after(250, async () => {
+    probeTimer = undefined
+    imageProbe = 'probing'
+    let deny: string | undefined
+    try {
+      deny = (await $.ui.blit({ requestId: PANE, key, source })).deny
+    } catch (err) {
+      deny = err instanceof Error ? err.message : String(err)
+    }
+    if (deny === undefined) {
+      imageProbe = 'ok'
+    } else if (deny.includes('alt')) {
+      imageProbe = 'alt'
+      dropPictures()
+      $.ui.invalidate('ui.render')
+    } else if (tries < 3) {
+      probeTries = tries + 1
+      imageProbe = 'unknown'
+      $.ui.invalidate('ui.render')
+    } else {
+      // Unanswerable here: keep drawing pictures.
+      imageProbe = 'ok'
+    }
+  })
+}
+
+// ---------------------------------------------------------------- Markdown
+
+// A picture of a markdown image row takes at most this many Preview rows.
+const MD_PICTURE_ROWS = 12
+
+// The rows of a markdown preview at `width` columns. On the terminal (while
+// it can draw pictures) an image row whose src is a file inside the root
+// grows into the rows its picture takes, fitted into the width and at most
+// MD_PICTURE_ROWS (or the room): totals stay exact, so scrolling needs no
+// measuring. Elsewhere, and where no picture comes, the `🖼 alt` row.
+const markdownView = async (
+  $: EngineInterface,
+  preview: MarkdownPreview,
+  width: number,
+  room: number,
+  surface: string,
+  root: string,
+): Promise<MdView> => {
+  const kind = isRemote(surface) ? 'remote' : 'terminal'
+  const mtime = Math.trunc(preview.mtime)
+  const file = preview.path + (preview.generated === true ? '\0custom' : '')
+  const key = kind + '\0' + file
+  const sig = mtime + '\0' + width + '\0' + room + '\0' + (imageProbe === 'alt' ? 'alt' : '')
+  const known = mdCache.get(key)
+  if (known !== undefined && known.sig === sig) return known.view
+  let held = mdParsed.get(file)
+  if (held === undefined || held.mtime !== mtime) {
+    held = { mtime, parsed: parseMarkdown(preview.text) }
+    mdParsed.set(file, held)
+  }
+  const laid = layoutMarkdown(held.parsed, width)
+  const sized = new Map<number, Picture>()
+  if (kind === 'terminal' && imageProbe !== 'alt') {
+    for (const [i, row] of laid.rows.entries()) {
+      if (row.kind !== 'image') continue
+      const path = localPath(row.src, preview.path, root)
+      // Only a built-in picture type reaches the converter.
+      if (path === undefined || !isPictureFile(nameOf(path), customEngines)) continue
+      let stat: Awaited<ReturnType<EngineInterface['fs']['stat']>>
+      try {
+        stat = await $.fs.stat(path)
+      } catch {
+        continue
+      }
+      if (stat.kind !== 'file') continue
+      const name = nameOf(path)
+      const pic = await loadImage($, { path, name, depth: 0, kind: 'file', isExpanded: false }, stat, surface)
+      if (pic.png === undefined || pic.note !== undefined) continue
+      const roomCols = Math.max(1, width - spansWidth(row.prefix))
+      const roomRows = Math.max(1, Math.min(MD_PICTURE_ROWS, room))
+      const cells = fitCells(
+        roomCols,
+        roomRows,
+        pic.width !== undefined && pic.height !== undefined && pic.height > 0
+          ? pic.width / pic.height
+          : (roomCols * CELL_W) / (roomRows * CELL_H),
+      )
+      sized.set(i, { png: pic.png, mtime: pic.mtime, ...cells })
+    }
+  }
+  const made = expandPictures(laid, sized)
+  mdCache.set(key, { sig, view: made })
+
+  return made
+}
+
+// A link run pressed through its `Client`: a heading of this file scrolls
+// Preview to it, a file or dir inside the root is selected (`jump`), a URL
+// (a table's, or one the surface draws no `Link` for) is toasted.
+const followLink = async ($: EngineInterface, href: string): Promise<void> => {
+  const state = await read($, explorer)
+  const root = await rootOf($, state)
+  const target = linkTarget(href, mdShown.path, root)
+  const scrollTo = async (slug: string): Promise<boolean> => {
+    const row = anchorRow(mdShown.anchors, slug)
+    if (row === undefined) return false
+    const previewOffset = clamp(row, view.previewMax)
+    await update($, explorer, s => ({ ...s, previewOffset }))
+
+    return true
+  }
+  if (target.kind === 'anchor') {
+    if (!(await scrollTo(target.slug))) await $.ui.toast('No heading #' + target.slug)
+  } else if (target.kind === 'file') {
+    if (target.path === mdShown.path) {
+      if (target.slug !== undefined) await scrollTo(target.slug)
+
+      return
+    }
+    let isThere = false
+    try {
+      isThere = await $.fs.exists(target.path)
+    } catch {
+      isThere = false
+    }
+    if (!isThere) await $.ui.toast('Not found: ' + relativePath(target.path, root))
+    else if (target.path !== root) await jump($, target.path)
+  } else if (target.kind === 'url') {
+    await $.ui.toast('Link: ' + target.url)
+  } else {
+    await $.ui.toast('Outside the root: ' + target.written)
+  }
+}
 
 const copyName = async (
   $: EngineInterface,
@@ -637,6 +1081,7 @@ const jump = async ($: EngineInterface, path: string): Promise<void> => {
     cursor: path,
     previewOffset: s.selected === path ? s.previewOffset : 0,
     previewLeft: s.selected === path ? s.previewLeft : 0,
+    previewRaw: s.selected === path ? s.previewRaw : undefined,
     expanded,
     offset: win.offset,
   }))
@@ -650,11 +1095,110 @@ const metadata = (name: string, size: number, mtimeMs: number): string[] => [
 
 const RANK = { resolved: 0, unresolved: 1, builtin: 2 } as const
 
+// ---------------------------------------------------------- Custom engines
+
+// How long a custom engine's command may run.
+const CUSTOM_TIMEOUT_MS = 10000
+
+// A custom engine's markdown output (`as: markdown`), rendered.
+const customMarkdown = (path: string, mtime: number, text: string): Preview => ({
+  type: 'markdown',
+  path,
+  mtime,
+  text,
+  generated: true,
+})
+
+// A custom engine's preview of a file: its command's stdout as text, code or
+// markdown, or the PNG it wrote at `{out}` through the image path. Cached per
+// surface kind, path and mtime; a failure is metadata and why.
+const loadCustom = (
+  $: EngineInterface,
+  row: Row,
+  stat: { size: number; mtimeMs: number },
+  engine: CustomEngine,
+  surface: string,
+): Promise<Preview> => {
+  const key = (isRemote(surface) ? 'remote' : 'terminal') + '\0' + row.path + '\0' + Math.trunc(stat.mtimeMs)
+  const known = customCache.get(key)
+  if (known !== undefined) return known
+  const made = runCustom($, row, stat, engine, surface)
+  customCache.set(key, made)
+
+  return made
+}
+
+const runCustom = async (
+  $: EngineInterface,
+  row: Row,
+  stat: { size: number; mtimeMs: number },
+  engine: CustomEngine,
+  surface: string,
+): Promise<Preview> => {
+  const mtime = Math.trunc(stat.mtimeMs)
+  const tool = engine.cmd[0]!
+  const failed = (why: string): Preview => ({
+    type: 'text',
+    lines: [...metadata(row.name, stat.size, stat.mtimeMs), `${tool}: ${why}`],
+  })
+  const base: ImagePreview = { type: 'image', path: row.path, mtime, bytes: stat.size }
+  // Where no picture can draw, the command is not run.
+  if (engine.as === 'png' && isRemote(surface)) return { ...base, note: 'image preview needs a kitty-graphics terminal' }
+  if (engine.as === 'png' && imageProbe === 'alt') return { ...base, note: "terminal can't draw images" }
+  // `{out}`: one file per path and mtime beside the converted pictures,
+  // removed like them (with the pane, or at the session's end).
+  const usesOut = engine.cmd.some(arg => arg.includes('{out}'))
+  const out = usesOut ? convertedPath((await toolsOf($)).dir, row.path, mtime) : ''
+  if (usesOut) converted.add(out)
+  let stdout: string
+  try {
+    const ran = await $.process.run(engineArgv(engine, row.path, out), { timeoutMs: CUSTOM_TIMEOUT_MS })
+    if (ran.exitCode !== 0) return failed(firstLine(cleanOutput(ran.stderr)) ?? `exited ${ran.exitCode}`)
+    // Drawable text: no escape sequences or control characters (pdftotext's
+    // form feed, a colored tool's ANSI), which Code and Text refuse.
+    stdout = cleanOutput(ran.stdout)
+  } catch (err) {
+    return failed(runFailure(err instanceof Error ? err.message : String(err)))
+  }
+  const lines = stdout.replace(/\n$/, '').split('\n')
+  switch (engine.as) {
+    case 'text':
+      // The code preview with no language: plain text that scrolls.
+      return { type: 'code', path: row.path, mtime: stat.mtimeMs, lines, refs: [], generated: true }
+    case 'code':
+      return {
+        type: 'code',
+        path: row.path,
+        mtime: stat.mtimeMs,
+        language: languageOf(row.name),
+        lines,
+        refs: [],
+        generated: true,
+      }
+    case 'markdown':
+      return customMarkdown(row.path, stat.mtimeMs, stdout)
+    case 'png': {
+      let outBytes: number
+      try {
+        outBytes = (await $.fs.stat(out)).size
+      } catch {
+        return failed('wrote no picture')
+      }
+      const size = await pngSizeOf($, out, outBytes)
+      if (size === undefined && outBytes <= MAX_PREVIEW_BYTES) return failed('wrote no PNG')
+
+      return { ...base, png: out, ...size }
+    }
+  }
+}
+
 const loadPreview = async (
   $: EngineInterface,
   row: Row,
   isUnity: boolean,
   root: string,
+  surface: string,
+  isRaw: boolean,
 ): Promise<Preview> => {
   if (row.kind === 'dir') {
     await ensureListed($, row.path)
@@ -673,12 +1217,26 @@ const loadPreview = async (
   }
   try {
     const stat = await $.fs.stat(row.path)
+    // The engine picks the renderer; `isRaw` (`v`) shows a rendered one's source.
+    const engine = engineOf(row.name, customEngines)
+    // A custom engine reads the file itself: no size cap here.
+    if (stat.kind === 'file' && typeof engine === 'object') {
+      return await loadCustom($, row, stat, engine.custom, surface)
+    }
+    if (stat.kind === 'file' && (engine === 'image' || (engine === 'svg' && !isRaw))) {
+      return await loadImage($, row, stat, surface)
+    }
     if (stat.kind !== 'file' || stat.size > MAX_PREVIEW_BYTES) {
       return { type: 'text', lines: metadata(row.name, stat.size, stat.mtimeMs) }
     }
     const text = await $.fs.read(row.path)
     if (typeof text !== 'string' || isBinary(text)) {
       return { type: 'text', lines: metadata(row.name, stat.size, stat.mtimeMs) }
+    }
+    // Markdown renders (laid out by the drawing, which knows the width);
+    // `v` shows its source as code below.
+    if (engine === 'markdown' && !isRaw) {
+      return { type: 'markdown', path: row.path, mtime: stat.mtimeMs, text }
     }
 
     const refs =
@@ -708,6 +1266,8 @@ const dropFile = (file: string): void => {
   }
   footers.clear()
   if (file.endsWith('.meta')) indexes.clear()
+  // Previews are keyed by version; only layouts may hold an image this changed.
+  mdCache.clear()
 }
 
 // ------------------------------------------------------------ Edit section
@@ -844,6 +1404,8 @@ const startEdit = async ($: EngineInterface, path: string): Promise<void> => {
   await update($, explorer, s => ({
     ...s,
     selected: path,
+    // As every selection change: another file starts rendered.
+    previewRaw: s.selected === path ? s.previewRaw : undefined,
     edit: {
       path,
       // Unique across edits, so a chunk of an earlier one is never taken.
@@ -1164,6 +1726,7 @@ const afterRemoved = async ($: EngineInterface, state: ExplorerState, root: stri
   for (const at of [...ignored]) if (isUnder(at)) ignored.delete(at)
   footers.clear()
   if (state.mode === 'unity') indexes.clear()
+  mdCache.clear()
   deleteFacts.clear()
   await update($, explorer, s => {
     const isGone = (at: string | undefined) => at !== undefined && isUnder(at)
@@ -1178,6 +1741,7 @@ const afterRemoved = async ($: EngineInterface, state: ExplorerState, root: stri
       cursor: isGone(s.cursor) || s.cursor === undefined ? next : s.cursor,
       previewOffset: isGone(s.selected) ? 0 : s.previewOffset,
       previewLeft: isGone(s.selected) ? 0 : s.previewLeft,
+      previewRaw: isGone(s.selected) ? undefined : s.previewRaw,
     }
   })
 }
@@ -1401,66 +1965,136 @@ const checkDisk = async ($: EngineInterface): Promise<void> => {
   }
 }
 
+// What session.end left for the process's next session (a `/clear`, a
+// resume, a fork): the IDE's atoms as they were, all but the Settings sheet.
+// Module-level: a reload in between drops it, and the store seeds instead.
+type Stash = {
+  explorer?: ExplorerState
+  git?: GitState
+  settings?: SettingsState
+  sessionColor?: string
+}
+let stash: Stash | undefined
+
+const takeStash = async ($: EngineInterface): Promise<Stash> => ({
+  explorer: (await $.state.get({ plugin: 'ide-panes', key: 'explorer' } as const)).value,
+  git: (await $.state.get({ plugin: 'ide-panes', key: 'git' } as const)).value,
+  settings: (await $.state.get({ plugin: 'ide-panes', key: 'settings' } as const)).value,
+  sessionColor: (await $.state.get({ plugin: 'ide-panes', key: 'sessionColor' } as const)).value,
+})
+
+// The session's atoms: on session.start (a start or a reload) from the
+// session's own state, else the store's presets; on classic.SessionStart (a
+// new session of this process, its state empty) `carried`, the last one's,
+// wins over the store. Every get of one dispatch reads the same moment, so a
+// read after a write here would not see it: each write is computed from what
+// was read before it and from `carried`.
+const seedSession = async ($: EngineInterface, carried?: Stash): Promise<void> => {
+  if (carried?.git !== undefined) await $.state.set({ plugin: 'ide-panes', key: 'git' } as const, carried.git)
+  const color = carried?.sessionColor
+  if (color !== undefined) await update($, sessionColor, () => color)
+  // Settings from an earlier session; a reload keeps the session's own.
+  const held = await $.state.get({ plugin: 'ide-panes', key: 'settings' } as const)
+  let settingsNow: SettingsState = carried?.settings ?? held.value ?? {}
+  if (carried?.settings !== undefined) {
+    await update($, settings, () => settingsNow)
+  } else if (held.version === 0) {
+    const stored = settingsOf(await $.store.get(SETTINGS_KEY))
+    if (stored !== undefined) {
+      await update($, settings, () => stored)
+      settingsNow = stored
+    }
+  }
+  // The keymap again, now over the Settings keys.
+  const withSettings = mergeKeys(pluginOptions, settingsNow)
+  keymap = withSettings.keymap
+  keymapErrors = withSettings.errors
+  const root = await $.session.root()
+  const kept = carried?.explorer
+  const saved = kept === undefined ? await $.store.get(modeKey(root)) : undefined
+  // Sizes from an earlier session; a reload keeps the session's own.
+  const layout = layoutOf(await $.store.get(LAYOUT_KEY), ['tree']) as { tree?: number } | undefined
+  await update($, explorer, now => {
+    const s = kept ?? now
+    const isSame = s.root === '' || s.root === root
+
+    return {
+      ...s,
+      root,
+      split: s.split ?? layout,
+      // A carried view keeps its mode; a root with no mode saved takes the
+      // Settings default.
+      mode: kept !== undefined ? s.mode : isMode(saved) ? saved : (settingsNow.explorerMode ?? 'files'),
+      expanded: isSame ? s.expanded : [],
+      selected: isSame ? s.selected : undefined,
+      cursor: isSame ? s.cursor : undefined,
+      offset: isSame ? s.offset : 0,
+      previewOffset: isSame ? (s.previewOffset ?? 0) : 0,
+      previewLeft: isSame ? (s.previewLeft ?? 0) : 0,
+      previewRaw: isSame ? s.previewRaw : undefined,
+      // A reload, restart or new session: the editor asks for its text
+      // again, and a draft newer than the file comes back with it (loadEdit).
+      edit:
+        s.edit === undefined
+          ? undefined
+          : { ...s.edit, version: s.edit.version + 1, confirm: undefined, pending: undefined },
+    }
+  })
+  resetEditing()
+  // A resumed session keeps its `/color`.
+  await syncColor($)
+}
+
 export const register = (on: On, options?: PluginOptions): void => {
   pluginOptions = options
   const merged = mergeKeys(options, undefined)
   keymap = merged.keymap
   keymapErrors = merged.errors
+  const engines = parseEngines(typeof options?.previewEngines === 'string' ? options.previewEngines : '')
+  customEngines = engines.engines
+  engineErrors = engines.errors
+  // A new config may change what a path previews as.
+  customCache.clear()
 
   on('session.start', async ($, e, next) => {
-    // Settings from an earlier session; a reload keeps the session's own.
-    // (Kept here too: every get of one dispatch reads the same moment, so a
-    // read after the update would not see it.)
-    const held = await $.state.get({ plugin: 'ide-panes', key: 'settings' } as const)
-    let settingsNow: SettingsState = held.value ?? {}
-    if (held.version === 0) {
-      const stored = settingsOf(await $.store.get(SETTINGS_KEY))
-      if (stored !== undefined) {
-        await update($, settings, () => stored)
-        settingsNow = stored
-      }
-    }
-    // The keymap again, now over the Settings keys.
-    const withSettings = mergeKeys(options, settingsNow)
-    keymap = withSettings.keymap
-    keymapErrors = withSettings.errors
     // The plugin's one command (one session.start hook per plugin).
     await $.command.register({
       name: 'ide-panels',
       description: 'Open every ide-panes pane (explorer and git)',
     })
-    const root = await $.session.root()
-    const saved = await $.store.get(modeKey(root))
-    // Sizes from an earlier session; a reload keeps the session's own.
-    const layout = layoutOf(await $.store.get(LAYOUT_KEY), ['tree']) as { tree?: number } | undefined
-    await update($, explorer, s => {
-      const isSame = s.root === '' || s.root === root
-
-      return {
-        ...s,
-        root,
-        split: s.split ?? layout,
-        // A root with no mode saved takes the Settings default.
-        mode: isMode(saved) ? saved : (settingsNow.explorerMode ?? 'files'),
-        expanded: isSame ? s.expanded : [],
-        selected: isSame ? s.selected : undefined,
-        cursor: isSame ? s.cursor : undefined,
-        offset: isSame ? s.offset : 0,
-        previewOffset: isSame ? (s.previewOffset ?? 0) : 0,
-        previewLeft: isSame ? (s.previewLeft ?? 0) : 0,
-        // A reload or restart: the editor asks for its text again, and a
-        // draft newer than the file comes back with it (loadEdit).
-        edit:
-          s.edit === undefined
-            ? undefined
-            : { ...s.edit, version: s.edit.version + 1, confirm: undefined, pending: undefined },
-      }
-    })
-    resetEditing()
+    await seedSession($)
     // Bad `editorKeys` overrides are named once per load.
     if (keymapErrors.length > 0) await toast($, keymapErrors.join('; '))
-    // A resumed session keeps its `/color`.
-    await syncColor($)
+    // So are bad `previewEngines` entries.
+    if (engineErrors.length > 0) await toast($, engineErrors.join('; '))
+    // Converted pictures older loads left behind (once per load).
+    await sweepConverted($)
+
+    return next(e)
+  })
+
+  // A `/clear`, a resume or a fork goes on under a new session id, its
+  // `$.state` empty, with no session.start: the IDE comes back as the last
+  // session left it (session.end's stash), else from the store's presets.
+  // `startup` is session.start's; `compact` keeps the session and its state.
+  on('classic.SessionStart', async ($, e, next) => {
+    if (e.source !== 'startup' && e.source !== 'compact') {
+      const carried = stash
+      stash = undefined
+      await seedSession($, carried)
+    }
+
+    return next(e)
+  })
+
+  // The session's converted pictures go with it (a /clear ends the session
+  // and no session.start follows, so the caches drawing them go too). The
+  // whole chain shares one short bound: the rm gets what is left of it, so
+  // the view is stashed first for the next session (classic.SessionStart).
+  on('session.end', async ($, e, next) => {
+    stash = await takeStash($)
+    const left = next.budget.remainingMs
+    await removeAllConverted($, Number.isFinite(left) ? Math.max(100, Math.min(2000, left - 200)) : 2000)
 
     return next(e)
   })
@@ -1510,6 +2144,7 @@ export const register = (on: On, options?: PluginOptions): void => {
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
     const ran = await next(e)
     listings.clear()
+    mdCache.clear()
     footers.clear()
     ignored.clear()
     unityRoots.clear()
@@ -1535,8 +2170,10 @@ export const register = (on: On, options?: PluginOptions): void => {
   // The two panes are one window: the ✕ on either closes both. The explorer
   // closes first (its guard may hold both open); Git goes once it has.
   on('ui.close', { id: PANE }, async ($, e, next) => {
+    if (e.origin.kind !== 'unload' && (await guarded($, 'pane'))) return { value: undefined }
+    // Converted pictures go with the pane (a reload forgets them otherwise).
+    await removeAllConverted($)
     if (e.origin.kind === 'unload') return next(e)
-    if (await guarded($, 'pane')) return { value: undefined }
     const closed = await next(e)
     if ((await $.ui.panes()).some(pane => pane.id === GIT_PANE)) await $.ui.close({ id: GIT_PANE })
 
@@ -1634,6 +2271,17 @@ export const register = (on: On, options?: PluginOptions): void => {
   // A scrollbar dragged: the window moves, the selection stays (as the wheel).
   on('ui.message', { requestId: PANE }, async ($, e) => {
     if (e.element === 'editor') return editorMessage($, e.data, e.surface)
+    if (e.element.startsWith('md:link:')) {
+      // A link run of rendered markdown (link-client.tsx), pressed in the
+      // drawing still shown (same file, same first row); else ignored.
+      const data = e.data as { link?: unknown; path?: unknown; offset?: unknown } | null
+      const i = data?.link
+      const isShown = data?.path === mdShown.path && data.offset === mdShown.offset
+      const hit = typeof i === 'number' && isShown ? mdShown.links[i] : undefined
+      if (hit !== undefined) await followLink($, hit.href)
+
+      return {}
+    }
     if (e.element.startsWith('item:')) {
       // A tree row's Client (row-client.tsx): the arrow opens or closes a dir,
       // the name selects, a double-click copies the path. The mark cell or a
@@ -1804,7 +2452,7 @@ export const register = (on: On, options?: PluginOptions): void => {
           ? { type: 'text', lines: (await inRowOrder($, state)).map(path => relativePath(path, root)) }
           : current === undefined
             ? undefined
-            : await loadPreview($, current, isUnity, root)
+            : await loadPreview($, current, isUnity, root, surface, state.previewRaw === true)
     // Reference section: a header line, up to `shown` refs and a "+n more"
     // line; Code gets the rest of the pane rows.
     const refs = preview?.type === 'code' ? preview.refs : []
@@ -1824,10 +2472,18 @@ export const register = (on: On, options?: PluginOptions): void => {
         : win.rows.some(row => row.path === home)
           ? home
           : undefined
-    const previewTotal = preview?.type === 'code' ? preview.lines.length : 0
     const previewRows = Math.max(1, innerRows - refLines)
-    const previewOffset = clamp(state.previewOffset ?? 0, previewTotal - previewRows)
     const treeCols = splitAt(e.props.bodyColumns, state.split?.tree ?? 0.35, MIN_COLS)
+    const previewInner = Math.max(1, e.props.bodyColumns - treeCols - 2)
+    // Rendered markdown: rows at Preview's inner columns less the vertical
+    // bar, one Preview row each, so the total drives `sb:preview`, the wheel
+    // and page keys as code lines do; they wrap, so no `hb:preview`.
+    const md =
+      preview?.type === 'markdown'
+        ? await markdownView($, preview, Math.max(MIN_WIDTH, previewInner - 1), previewRows, surface, root)
+        : undefined
+    const previewTotal = md !== undefined ? md.rows.length : preview?.type === 'code' ? preview.lines.length : 0
+    const previewOffset = clamp(state.previewOffset ?? 0, previewTotal - previewRows)
     view.columns = e.props.bodyColumns
     view.treeEnd = treeCols
     view.treeMax = Math.max(0, rows.length - treeRows)
@@ -1839,8 +2495,7 @@ export const register = (on: On, options?: PluginOptions): void => {
     // widest shown number, one space (probed live on 2.1.289: ` 9 `, `  99 `
     // for 99-100). `total` measures every line, so a vertical scroll keeps the
     // thumb's size.
-    const previewInner = Math.max(1, e.props.bodyColumns - treeCols - 2)
-    const previewLines = preview === undefined ? [] : preview.lines
+    const previewLines = preview === undefined || preview.type === 'image' || preview.type === 'markdown' ? [] : preview.lines
     const shownLast = preview?.type === 'code' ? Math.min(previewTotal, previewOffset + previewRows) : 0
     const gutter = preview?.type === 'code' ? String(Math.max(1, shownLast)).length + 2 : 0
     const previewWide =
@@ -1853,6 +2508,182 @@ export const register = (on: On, options?: PluginOptions): void => {
     view.editRows = innerRows
     view.editColumns = Math.max(1, e.props.bodyColumns - view.treeEnd - 2)
     view.isEditDrawn = edit !== undefined
+    // An image: the picture fitted to Preview's inner room less its info row
+    // (no scrollbars). The terminal draws the PNG file (`Image`) unless the
+    // blit probe found it draws only alts; remote surfaces draw an `.svg`'s
+    // text (`Svg`); anything else is metadata and the note saying why.
+    const Image = 'Image' in elements ? elements.Image : undefined
+    const Svg = 'Svg' in elements ? elements.Svg : undefined
+    const image = preview?.type === 'image' ? preview : undefined
+    const imageRows = Math.max(1, innerRows - 1)
+    const imageCols = Math.max(1, previewInner)
+    const imageCells =
+      image === undefined
+        ? undefined
+        : fitCells(
+            imageCols,
+            imageRows,
+            image.width !== undefined && image.height !== undefined && image.height > 0
+              ? image.width / image.height
+              : (imageCols * CELL_W) / (imageRows * CELL_H),
+          )
+    const imageSource =
+      image?.png !== undefined && image.note === undefined && imageProbe !== 'alt' && Image !== undefined && surface === 'terminal'
+        ? { file: image.png, format: 'png' as const, generation: image.mtime }
+        : undefined
+    if (imageSource !== undefined) probeImage($, imageSource)
+    const imageSvg = image?.svg !== undefined && Svg !== undefined ? image.svg : undefined
+    const imageText = image === undefined ? '' : imageInfo(formatSize(image.bytes), image.width, image.height)
+    // Rendered markdown's window. A link draws as a `Link` where isLinkable
+    // says so; every other link is underlined accent text, pressable on
+    // terminal and desktop through a `Client` laid over it (`md:link:<i>`).
+    const Link = 'Link' in elements ? elements.Link : undefined
+    const mdWindow: ViewRow[] = md === undefined ? [] : md.rows.slice(previewOffset, previewOffset + previewRows)
+    const isTableRow = (row: ViewRow): boolean => row.kind === 'text' && row.table === true
+    const isLinkHere = (href: string, row: ViewRow): boolean => Link !== undefined && isLinkable(href, surface, isTableRow(row))
+    const canPressLinks = Client !== undefined && (surface === 'terminal' || surface === 'desktop')
+    const mdLinks = md === undefined || !canPressLinks ? [] : linkHits(mdWindow, (href, row) => !isLinkHere(href, row))
+    if (preview?.type === 'markdown' && md !== undefined) {
+      mdShown.path = preview.path
+      mdShown.anchors = md.anchors
+      mdShown.links = mdLinks
+      mdShown.offset = previewOffset
+    }
+    const roleColor = (role: Role | undefined): string => (role === undefined || role === 'text' ? t.text : t[role])
+    const spanEl = (span: Span, k: string, row: ViewRow) => {
+      const style = span.style ?? {}
+      const text = cleanText(span.text)
+      if (style.href !== undefined && Link !== undefined && isLinkHere(style.href, row)) {
+        return (
+          <Link key={k} href={style.href}>
+            {text}
+          </Link>
+        )
+      }
+
+      return (
+        <Text
+          key={k}
+          color={roleColor(style.color)}
+          {...(style.background === undefined ? {} : { backgroundColor: style.background === 'surface' ? t.surface : t.warning })}
+          bold={style.bold === true}
+          italic={style.italic === true}
+          underline={style.underline === true || style.href !== undefined}
+          strikethrough={style.strike === true}
+          inverse={style.inverse === true}
+          dimColor={style.dim === true}
+        >
+          {text}
+        </Text>
+      )
+    }
+    // ' ' for an empty row: an empty Text takes no row.
+    const spansRow = (spans: Span[], k: string, row: ViewRow) =>
+      spans.length === 0 || spans.every(span => span.text === '') ? (
+        <Text key={k}> </Text>
+      ) : (
+        <Text key={k} wrap="truncate-end">
+          {spans.map((span, i) => spanEl(span, k + '.' + i, row))}
+        </Text>
+      )
+    // The window's rows as elements: a text row one Text; the rows of one code
+    // block one Code (its prefix a column before it); a picture wholly inside
+    // the window one Image, else its `🖼 alt` row and blank rows.
+    const markdownRows = (rowsShown: ViewRow[], base: number): RenderChildren[] => {
+      const out: RenderChildren[] = []
+      let i = 0
+      while (i < rowsShown.length) {
+        const row = rowsShown[i]!
+        const k = 'md:' + (base + i)
+        if (row.kind === 'text') {
+          out.push(spansRow(row.spans, k, row))
+          i += 1
+        } else if (row.kind === 'image') {
+          out.push(spansRow([...row.prefix, { text: '🖼 ' + (row.alt || row.src), style: { color: 'muted', italic: true } }], k, row))
+          i += 1
+        } else if (row.kind === 'picture') {
+          let j = i
+          while (j < rowsShown.length) {
+            const next = rowsShown[j]!
+            if (next.kind !== 'picture' || next.at !== row.at) break
+            j += 1
+          }
+          const hasPrefix = row.prefix.some(span => span.text !== '')
+          if (row.part === 0 && j - i === row.rows && Image !== undefined && surface === 'terminal') {
+            const key = 'md:image:' + row.at
+            const source = { file: row.png, format: 'png' as const, generation: row.mtime }
+            probeImage($, source, key)
+            out.push(
+              <Box key={k} flexDirection="row" height={row.rows}>
+                {hasPrefix && (
+                  <Box flexDirection="column" flexShrink={0}>
+                    {Array.from({ length: row.rows }, (_, n) => spansRow(row.prefix, k + 'p' + n, row))}
+                  </Box>
+                )}
+                <Image key={key} source={source} columns={row.columns} rows={row.rows} alt={row.alt || nameOf(row.src)} />
+              </Box>,
+            )
+          } else {
+            for (let n = i; n < j; n++) {
+              const part = rowsShown[n]!
+              const label: Span[] =
+                n === i ? [{ text: '🖼 ' + (row.alt || row.src), style: { color: 'muted', italic: true } }] : []
+              out.push(spansRow([...row.prefix, ...label], 'md:' + (base + n), part))
+            }
+          }
+          i = j
+        } else {
+          let j = i
+          while (j < rowsShown.length) {
+            const next = rowsShown[j]!
+            if (next.kind !== 'code' || next.block !== row.block) break
+            j += 1
+          }
+          const group = rowsShown.slice(i, j) as Extract<MdRow, { kind: 'code' }>[]
+          const prefixKey = (prefix: Span[]) => JSON.stringify(prefix)
+          const isSamePrefix = group.every(g => prefixKey(g.prefix) === prefixKey(row.prefix))
+          const language = row.lang === '' ? undefined : row.lang
+          const code = (source: string, ck: string) => (
+            <Code key={ck} source={cleanText(source) || ' '} {...(language === undefined ? {} : { language })} wrap="truncate-end" />
+          )
+          if (isSamePrefix) {
+            const hasPrefix = row.prefix.some(span => span.text !== '')
+            out.push(
+              <Box key={k} flexDirection="row">
+                {hasPrefix && (
+                  <Box flexDirection="column" flexShrink={0}>
+                    {group.map((g, n) => spansRow(g.prefix, k + 'p' + n, g))}
+                  </Box>
+                )}
+                <Box flexDirection="column" flexGrow={1}>
+                  {/* Several Codes when the rows pass Code's 10000 characters,
+                      one row per line still. */}
+                  {codeChunks(group.map(g => cleanText(g.text))).map((lines, n) => code(lines.join('\n'), k + 'c' + (n === 0 ? '' : n)))}
+                </Box>
+              </Box>,
+            )
+          } else {
+            group.forEach((g, n) =>
+              out.push(
+                <Box key={k + '.' + n} flexDirection="row">
+                  <Box flexShrink={0}>{spansRow(g.prefix, k + '.' + n + 'p', g)}</Box>
+                  {code(g.text, k + '.' + n + 'c')}
+                </Box>,
+              ),
+            )
+          }
+          i = j
+        }
+      }
+
+      return out
+    }
+    // A rendered engine's `v`: its source through the code preview, and back.
+    // Not over metadata (too big, binary): there is nothing to flip; the
+    // source view always keeps it, so there is a way back.
+    const viewEngine = current?.kind === 'file' && edit === undefined && !multi ? engineOf(current.name, customEngines) : 'code'
+    const isRaw = state.previewRaw === true
+    const hasView = hasSourceView(viewEngine) && (isRaw || preview?.type === 'markdown' || preview?.type === 'image')
     // A Client on the seam, two cells across: the first section's last column
     // and the second's first (both frames' borders), so the seam takes a grab
     // from either side. Drawn last in the container holding both sections, so
@@ -1969,9 +2800,9 @@ export const register = (on: On, options?: PluginOptions): void => {
 
     // A small Button on a frame's top border, as the title: its own label on a
     // tinted fill (accent for the main action, the selection fill otherwise).
-    const edgeButton = (key: string, label: string, isMain: boolean, onPress: () => void) => (
+    const edgeButton = (key: string, label: string, isMain: boolean, onPress: () => void, hotkey?: string) => (
       <Box key={key + ':chrome'} backgroundColor={isMain ? onDefaultFg(t.accent) : sel}>
-        <Button key={key} plain label={' ' + label + ' '} onPress={onPress} />
+        <Button key={key} plain label={' ' + label + ' '} hotkey={hotkey} onPress={onPress} />
       </Box>
     )
 
@@ -2039,6 +2870,9 @@ export const register = (on: On, options?: PluginOptions): void => {
             'ghost',
             () => {
               listings.clear()
+              dropPictures()
+              // a converter installed since is found
+              imageTool = undefined
               footers.clear()
               ignored.clear()
               unityRoots.clear()
@@ -2053,7 +2887,8 @@ export const register = (on: On, options?: PluginOptions): void => {
           {canEdit &&
             edit === undefined &&
             !multi &&
-            preview?.type === 'code' &&
+            (preview?.type === 'code' || preview?.type === 'markdown') &&
+            preview.generated !== true &&
             btn('edit', 'edit', 'secondary', () => void startEdit($, preview.path), 'e')}
           {canNew &&
             !multi &&
@@ -2274,6 +3109,7 @@ export const register = (on: On, options?: PluginOptions): void => {
                 wrap="truncate-end"
               />
             )}
+            {md !== undefined && markdownRows(mdWindow, previewOffset)}
             {refs.length > 0 && (
               <Text bold color={t.accent}>
                 References ({refs.length})
@@ -2294,11 +3130,96 @@ export const register = (on: On, options?: PluginOptions): void => {
               ),
             )}
             {hidden > 0 && <Text color={t.muted}>+{hidden} more</Text>}
+            {image !== undefined &&
+              (imageSource !== undefined && Image !== undefined && imageCells !== undefined ? (
+                <Box flexDirection="column" alignItems="center">
+                  <Image
+                    key={IMAGE_KEY}
+                    source={imageSource}
+                    columns={imageCells.columns}
+                    rows={imageCells.rows}
+                    alt={nameOf(image.path) + ' (' + imageText + ')'}
+                  />
+                  <Text color={t.muted} wrap="truncate-end">
+                    {imageText}
+                  </Text>
+                </Box>
+              ) : imageSvg !== undefined && Svg !== undefined ? (
+                <Box flexDirection="column" alignItems="center">
+                  {/* At most the room under the info row (SVG_ROW_PX a row),
+                      never taller than the markup's own height. */}
+                  <Svg
+                    key={IMAGE_KEY}
+                    source={imageSvg}
+                    alt={nameOf(image.path)}
+                    height={Math.min(image.height ?? Infinity, imageRows * SVG_ROW_PX)}
+                  />
+                  <Text color={t.muted} wrap="truncate-end">
+                    {imageText}
+                  </Text>
+                </Box>
+              ) : (
+                <Box flexDirection="column">
+                  <Text color={t.text} wrap="truncate-end">
+                    {nameOf(image.path)}
+                  </Text>
+                  <Text color={t.muted} wrap="truncate-end">
+                    {imageText}
+                  </Text>
+                  <Text color={t.muted} wrap="truncate-end">
+                    {'modified ' + new Date(image.mtime).toISOString()}
+                  </Text>
+                  {image.note !== undefined && (
+                    <Text color={t.warning} wrap="truncate-end">
+                      {image.note}
+                    </Text>
+                  )}
+                </Box>
+              ))}
             </Box>
-            {dragBar('sb:preview', previewTotal, previewRows, previewOffset)}
+            {image === undefined && dragBar('sb:preview', previewTotal, previewRows, previewOffset)}
           </Box>
           {titled('title:preview', 'Preview')}
-          {hbar('hb:preview', previewWide, previewVisible, previewLeft, previewInner - 1)}
+          {/* Link runs pressable through a Client, laid over their Text
+              (past the frame's top-left corner). */}
+          {Client !== undefined &&
+            mdLinks.map((hit, i) => (
+              <Box key={'md:link:' + i + ':at'} position="absolute" top={1 + hit.y} left={1 + hit.x}>
+                <Client
+                  key={'md:link:' + i}
+                  module="./link-client.tsx"
+                  props={{
+                    i,
+                    path: mdShown.path,
+                    offset: previewOffset,
+                    color: t.accent,
+                    segments: hit.spans.map(span => ({
+                      text: cleanText(span.text),
+                      ...(span.style?.bold === true ? { bold: true } : {}),
+                      ...(span.style?.italic === true ? { italic: true } : {}),
+                      ...(span.style?.strike === true ? { strike: true } : {}),
+                    })),
+                  }}
+                  width={hit.width}
+                  height={1}
+                />
+              </Box>
+            ))}
+          {image === undefined && md === undefined && hbar('hb:preview', previewWide, previewVisible, previewLeft, previewInner - 1)}
+          {/* A rendered engine's source view (`v`) and back. */}
+          {hasView && (
+            <Box position="absolute" top={0} right={1} flexDirection="row">
+              {edgeButton(
+                'preview:view',
+                isRaw ? 'rendered' : 'source',
+                false,
+                asleep(() =>
+                  void update($, explorer, s => ({ ...s, previewRaw: s.previewRaw === true ? undefined : true, previewOffset: 0, previewLeft: 0 })),
+                ),
+                'v',
+              )}
+            </Box>
+          )}
           </Box>
           )}
           {splitter('split:tree', 'x', treeCols - 1, 1, sectionRows - 2, treeCols)}
