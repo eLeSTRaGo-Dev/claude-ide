@@ -1,6 +1,0 @@
-{
-  "name": "gfx-gallery",
-  "version": "0.1.0",
-  "description": "Graphics showcase: Raster, Image, Svg and Client demos",
-  "types": "./types/index.d.ts"
-}
