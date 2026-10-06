@@ -9,6 +9,8 @@ import {
   isBinary,
   languageOf,
   newFilePath,
+  relativePath,
+  rowHit,
   window,
 } from './tree'
 import type { Entry, Row } from './tree'
@@ -244,4 +246,32 @@ test('afterDelete selects the next sibling, else the previous, else the parent',
   expect(afterDelete(rows, '/p/gone')).toBeUndefined()
   const only = flatten(new Map([['/q', [file('one')]]]), new Set(), '/q')
   expect(afterDelete(only, '/q/one')).toBeUndefined()
+})
+
+test('relativePath names a path from the repo toplevel', () => {
+  expect(relativePath('/r/hooks/explorer-panel', '/r')).toBe('hooks/explorer-panel')
+  expect(relativePath('/r/a.ts', '/r/')).toBe('a.ts')
+  expect(relativePath('/r', '/r')).toBe('.')
+  expect(relativePath('/r', '/r/')).toBe('.')
+  expect(relativePath('/rx/a.ts', '/r')).toBe('/rx/a.ts')
+  expect(relativePath('/elsewhere/a.ts', '/r')).toBe('/elsewhere/a.ts')
+  expect(relativePath('/a.ts', '/')).toBe('a.ts')
+})
+
+test('rowHit splits a row into mark, rails, arrow and name', () => {
+  // depth 0 dir: `▌▸ name`
+  expect(rowHit(0, 'dir', 0)).toBe('mark')
+  expect(rowHit(0, 'dir', 1)).toBe('arrow')
+  expect(rowHit(0, 'dir', 2)).toBe('arrow')
+  expect(rowHit(0, 'dir', 3)).toBe('name')
+  // depth 2 dir: `▌│ │ ▸ name`: rails 1..4, arrow 5..6
+  expect(rowHit(2, 'dir', 1)).toBe('name')
+  expect(rowHit(2, 'dir', 4)).toBe('name')
+  expect(rowHit(2, 'dir', 5)).toBe('arrow')
+  expect(rowHit(2, 'dir', 6)).toBe('arrow')
+  expect(rowHit(2, 'dir', 7)).toBe('name')
+  // a file has no arrow
+  expect(rowHit(0, 'file', 0)).toBe('mark')
+  expect(rowHit(0, 'file', 1)).toBe('name')
+  expect(rowHit(1, 'file', 3)).toBe('name')
 })

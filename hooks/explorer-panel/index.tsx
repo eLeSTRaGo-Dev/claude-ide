@@ -19,9 +19,11 @@ import {
   languageOf,
   newFilePath,
   parentOf,
+  relativePath,
   window as windowOf,
 } from './tree'
 import type { Entry, Mode, Row } from './tree'
+import { deleteTargets, pruneMarks, rangeOf, toggleMark } from './marks'
 import { GIT_PANE, changeCounts, shortDir, parseStatus, statusArgv } from '../git-panel/git'
 import { lastAgentColor, parseColorAnswer } from '../shared/color'
 import { H_THUMB, H_TRACK, scrollbar } from '../shared/scrollbar'
@@ -388,26 +390,136 @@ const setMode = async ($: EngineInterface, mode: Mode): Promise<void> => {
   if (await leaveEdit($, 'mode', mode)) return
   const state = await read($, explorer)
   const root = await rootOf($, state)
-  await update($, explorer, s => ({ ...s, root, mode, offset: 0 }))
+  await update($, explorer, s => ({ ...s, root, mode, offset: 0, marked: undefined }))
   await $.store.set(modeKey(root), mode)
 }
 
-// Enter or a click: the row becomes the selection (shown in the preview);
-// a press on the selected dir opens or closes it.
-const press = async ($: EngineInterface, row: Row): Promise<void> => {
-  const edit = (await read($, explorer)).edit
-  if (edit !== undefined && (row.kind === 'dir' || row.path === edit.path)) {
-    // While editing, a dir only opens or closes and the selection stays.
-    await update($, explorer, s => ({
+// A dir's arrow (a Client hit, or the `arrow:` Button): opens or closes it,
+// moving the cursor there; the selection stays.
+// Closing a dir unmarks the rows it hides (no hidden row is acted on).
+const toggle = async ($: EngineInterface, path: string): Promise<void> => {
+  await update($, explorer, s => {
+    const isOpen = s.expanded.includes(path)
+    const marked = isOpen && s.marked !== undefined ? atLeastTwo(pruneMarks(s.marked, at => at.startsWith(path + '/'))) : s.marked
+
+    return {
       ...s,
-      cursor: row.path,
-      expanded:
-        row.kind !== 'dir'
-          ? s.expanded
-          : s.expanded.includes(row.path)
-            ? s.expanded.filter(path => path !== row.path)
-            : [...s.expanded, row.path],
-    }))
+      cursor: path,
+      expanded: isOpen ? s.expanded.filter(at => at !== path) : [...s.expanded, path],
+      marked,
+    }
+  })
+}
+
+// ---------------------------------------------------------- Multi-selection
+
+// The marks that make a multi-selection: two or more, else none (one mark is
+// just the selection).
+const atLeastTwo = (marked: readonly string[]): string[] | undefined => (marked.length >= 2 ? [...marked] : undefined)
+
+const marksOf = (state: ExplorerState): readonly string[] => state.marked ?? []
+
+const isMulti = (state: ExplorerState): boolean => marksOf(state).length >= 2
+
+// A mark toggled (ctrl-click, the mark cell, `m`): the first one adds the
+// selection too, as an IDE's ctrl-click adds to it. Left with one path, the
+// marks go and that path is selected.
+const markToggle = async ($: EngineInterface, path: string): Promise<void> => {
+  const state = await read($, explorer)
+  const seed = state.marked ?? (state.selected !== undefined && state.selected !== path ? [state.selected] : [])
+  await settleMarks($, state, toggleMark(seed, path), path)
+}
+
+// A shift-click: the rows from the selection to `path` become the marks.
+const markRange = async ($: EngineInterface, path: string): Promise<void> => {
+  const state = await read($, explorer)
+  const root = await rootOf($, state)
+  const rows = flatten(listings, new Set(state.expanded), root, { mode: state.mode })
+  await settleMarks($, state, rangeOf(rows, state.selected, path), path)
+}
+
+const settleMarks = async ($: EngineInterface, state: ExplorerState, marked: string[], cursor: string): Promise<void> => {
+  collapse?.cancel()
+  collapse = undefined
+  if (marked.length >= 2) {
+    await update($, explorer, s => ({ ...s, marked, cursor }))
+
+    return
+  }
+  await update($, explorer, s => ({ ...s, marked: undefined }))
+  const only = marked[0]
+  const row = only === undefined || only === state.selected ? undefined : await rowAt($, only)
+  if (row !== undefined) await press($, row)
+}
+
+// A plain click on a row of the multi-selection keeps the marks for a
+// double-click's time (its second click copies them all); then the marks go.
+let collapse: { path: string; cancel: () => void } | undefined
+
+const collapseLater = ($: EngineInterface, path: string): void => {
+  collapse?.cancel()
+  const timer = $.clock.after(DOUBLE_MS, () => {
+    if (collapse?.path !== path) return
+    collapse = undefined
+    void update($, explorer, s => ({ ...s, marked: undefined }))
+  })
+  collapse = { path, cancel: () => timer.cancel() }
+}
+
+const DOUBLE_MS = 400
+
+// After the listings were dropped (a Bash call): marks on paths no longer on
+// disk go.
+const pruneGone = async ($: EngineInterface): Promise<void> => {
+  const marked = (await read($, explorer)).marked
+  if (marked === undefined) return
+  const gone = new Set<string>()
+  for (const path of marked) {
+    try {
+      if (!(await $.fs.exists(path))) gone.add(path)
+    } catch {
+      gone.add(path)
+    }
+  }
+  if (gone.size === 0) return
+  await update($, explorer, s => ({ ...s, marked: atLeastTwo(pruneMarks(s.marked ?? [], path => gone.has(path))) }))
+}
+
+// The marked paths in tree order (a mark in a closed dir last).
+const inRowOrder = async ($: EngineInterface, state: ExplorerState): Promise<string[]> => {
+  const root = await rootOf($, state)
+  const rows = flatten(listings, new Set(state.expanded), root, { mode: state.mode })
+  const marks = marksOf(state)
+  const shown = rows.filter(row => marks.includes(row.path)).map(row => row.path)
+
+  return [...shown, ...marks.filter(path => !shown.includes(path))]
+}
+
+// A click on the name (or Enter): the row becomes the selection (shown in
+// the preview); only the arrow opens or closes a dir. `isKey`: the press came
+// through the keyboard ring (the blank `row:` Button), where Enter on the
+// selected dir still opens or closes it, as there is no arrow to reach.
+//
+// A plain press ends a multi-selection, unless `keepMarks` (a click on one of
+// its rows, see `collapseLater`).
+const press = async ($: EngineInterface, row: Row, isKey = false, keepMarks = false): Promise<void> => {
+  if (!keepMarks) {
+    collapse?.cancel()
+    collapse = undefined
+    if ((await read($, explorer)).marked !== undefined) await update($, explorer, s => ({ ...s, marked: undefined }))
+  }
+  const state = await read($, explorer)
+  const edit = state.edit
+  if (edit !== undefined && (row.kind === 'dir' || row.path === edit.path)) {
+    // While editing, a dir press only moves the cursor (Enter opens or closes
+    // it); the selection stays on the edited file.
+    if (isKey && row.kind === 'dir') await toggle($, row.path)
+    else await update($, explorer, s => ({ ...s, cursor: row.path }))
+
+    return
+  }
+  if (isKey && row.kind === 'dir' && state.selected === row.path) {
+    await toggle($, row.path)
 
     return
   }
@@ -418,12 +530,6 @@ const press = async ($: EngineInterface, row: Row): Promise<void> => {
     selected: row.path,
     previewOffset: s.selected === row.path ? s.previewOffset : 0,
     previewLeft: s.selected === row.path ? s.previewLeft : 0,
-    expanded:
-      row.kind !== 'dir' || s.selected !== row.path
-        ? s.expanded
-        : s.expanded.includes(row.path)
-          ? s.expanded.filter(path => path !== row.path)
-          : [...s.expanded, row.path],
   }))
 }
 
@@ -448,6 +554,61 @@ const copyName = async (
   await $.ui.toast(
     copied.isCopied ? `Copied: ${text}` : `Copy failed: ${copied.reason}`,
   )
+}
+
+// The repo toplevel a root's paths are named from (the root itself outside
+// a repo); `copyPath` fills it, `refresh` clears it.
+const toplevels = new Map<string, string>()
+
+const toplevelOf = async ($: EngineInterface, root: string): Promise<string> => {
+  const known = toplevels.get(root)
+  if (known !== undefined) return known
+  let base = root
+  try {
+    const ran = await $.process.run(['git', '-C', root, 'rev-parse', '--show-toplevel'], { timeoutMs: 5000 })
+    const out = ran.stdout.trim()
+    if (ran.exitCode === 0 && out.startsWith('/')) base = out
+  } catch {
+    // no git: the root names the paths
+  }
+  toplevels.set(root, base)
+
+  return base
+}
+
+// A double-click on a row, or `copy path` (`y`): the path as named from the
+// repo toplevel goes to the clipboard.
+const copyPath = async (
+  $: EngineInterface,
+  path: string,
+  surface: Parameters<EngineInterface['ui']['copy']>[0]['surface'],
+): Promise<void> => {
+  const root = await rootOf($, await read($, explorer))
+  const text = relativePath(path, await toplevelOf($, root))
+  const copied = await $.ui.copy({ text, surface })
+  await $.ui.toast(copied.isCopied ? `Copied: ${text}` : `Copy failed: ${copied.reason}`)
+}
+
+// `copy path` (`y`), or a double-click on a marked row, with 2+ marked: every
+// marked path (named as `copyPath` names one), one per line, in tree order.
+const copyMarked = async (
+  $: EngineInterface,
+  surface: Parameters<EngineInterface['ui']['copy']>[0]['surface'],
+): Promise<void> => {
+  const state = await read($, explorer)
+  const base = await toplevelOf($, await rootOf($, state))
+  const paths = await inRowOrder($, state)
+  const copied = await $.ui.copy({ text: paths.map(path => relativePath(path, base)).join('\n'), surface })
+  await $.ui.toast(copied.isCopied ? `Copied ${paths.length} paths` : `Copy failed: ${copied.reason}`)
+}
+
+// The visible row at `path`, as the tree draws it now.
+const rowAt = async ($: EngineInterface, path: string): Promise<Row | undefined> => {
+  const state = await read($, explorer)
+  const root = await rootOf($, state)
+  const rows = flatten(listings, new Set(state.expanded), root, { mode: state.mode })
+
+  return rows.find(row => row.path === path)
 }
 
 // Select `path` and expand every dir between the root and it; the window
@@ -825,9 +986,8 @@ const openNaming = async ($: EngineInterface, dir: string): Promise<void> => {
   if (await guarded($, 'new', dir)) return
   naming = dir
   // One question at a time: the field replaces the delete bar.
-  if ((await read($, explorer)).deleting !== undefined) {
-    await update($, explorer, s => ({ ...s, deleting: undefined }))
-  }
+  const asked = await read($, explorer)
+  if (asked.deleting !== undefined || asked.deletingMany !== undefined) await cancelDelete($)
   $.ui.invalidate('ui.render')
   focusOn($, 'new-file')
 }
@@ -881,13 +1041,16 @@ const nameOf = (path: string): string => path.slice(path.lastIndexOf('/') + 1)
 // Past this many entries a dir's count reads `1000+`.
 const COUNT_CAP = 1000
 
-// What the delete bar says about its target, kept for the path it was read
-// for. Module-level: a reload reads it again.
-let deleteFacts: { key: string; isDir: boolean; count?: string; hasMeta: boolean } | undefined
+type Facts = { isDir: boolean; count?: string; hasMeta: boolean }
 
-const factsOf = async ($: EngineInterface, path: string, mode: Mode) => {
+// What the delete bar says about each target, kept per mode and path.
+// Module-level: a reload reads them again.
+const deleteFacts = new Map<string, Facts>()
+
+const factsOf = async ($: EngineInterface, path: string, mode: Mode): Promise<Facts> => {
   const key = mode + ':' + path
-  if (deleteFacts?.key === key) return deleteFacts
+  const known = deleteFacts.get(key)
+  if (known !== undefined) return known
   await ensureListed($, parentOf(path))
   const isDir = listings.get(parentOf(path))?.find(entry => entry.name === nameOf(path))?.kind === 'dir'
   let count: string | undefined
@@ -911,9 +1074,22 @@ const factsOf = async ($: EngineInterface, path: string, mode: Mode) => {
       hasMeta = false
     }
   }
-  deleteFacts = { key, isDir, count, hasMeta }
+  const facts = { isDir, count, hasMeta }
+  deleteFacts.set(key, facts)
 
-  return deleteFacts
+  return facts
+}
+
+// The multi-delete bar's entry count: each target and everything under it,
+// `1000+` past the cap (or when a dir's own count was capped).
+const entriesOf = (all: readonly Facts[]): string => {
+  let total = 0
+  for (const facts of all) {
+    if (facts.count?.endsWith('+') === true) return `${COUNT_CAP}+`
+    total += 1 + (facts.count === undefined ? 0 : Number.parseInt(facts.count, 10))
+  }
+
+  return total > COUNT_CAP ? `${COUNT_CAP}+` : String(total)
 }
 
 // The editor's file is the target or inside it.
@@ -923,13 +1099,112 @@ const isEditIn = (edit: Edit | undefined, path: string): edit is Edit =>
 // `delete (d)`: the bar names the target; nothing is removed until its `delete`.
 const askDelete = async ($: EngineInterface, path: string): Promise<void> => {
   naming = undefined
-  deleteFacts = undefined
-  await update($, explorer, s => ({ ...s, deleting: path }))
+  deleteFacts.clear()
+  await update($, explorer, s => ({ ...s, deleting: path, deletingMany: undefined }))
+  $.ui.invalidate('ui.render')
+}
+
+// `delete (d)` with 2+ marked: the bar asks about the marks as they are now
+// (a later mark does not change what it removes).
+const askDeleteMany = async ($: EngineInterface, paths: readonly string[]): Promise<void> => {
+  naming = undefined
+  deleteFacts.clear()
+  await update($, explorer, s => ({ ...s, deleting: undefined, deletingMany: [...paths] }))
   $.ui.invalidate('ui.render')
 }
 
 const cancelDelete = async ($: EngineInterface): Promise<void> => {
-  await update($, explorer, s => ({ ...s, deleting: undefined }))
+  await update($, explorer, s => ({ ...s, deleting: undefined, deletingMany: undefined }))
+}
+
+// The rm operands of a delete: the targets, each one's `.meta` where it has
+// one (Unity mode), no path twice.
+const rmArgv = (targets: readonly string[], all: readonly Facts[]): string[] => [
+  'rm',
+  '-rf',
+  '--',
+  ...new Set(targets.flatMap((path, i) => [path, ...(all[i]?.hasMeta === true ? [path + '.meta'] : [])])),
+]
+
+// Runs `rm`; the failure's first stderr line, or undefined on success.
+const runRm = async ($: EngineInterface, argv: string[]): Promise<string | undefined> => {
+  try {
+    const ran = await $.process.run(argv, { timeoutMs: 60000 })
+    if (ran.exitCode !== 0) {
+      return ran.stderr.split('\n').find(line => line.trim() !== '') ?? `rm exited ${ran.exitCode}`
+    }
+  } catch (err) {
+    return err instanceof Error ? err.message : String(err)
+  }
+
+  return undefined
+}
+
+// After a successful rm of `targets`: the editor closes if it was in one (its
+// draft goes too), the cached listings under each and its parent's are
+// dropped, and the selection moves off them to the row after the first
+// target among those that stay. Marks are cleared.
+const afterRemoved = async ($: EngineInterface, state: ExplorerState, root: string, targets: readonly string[]) => {
+  const edit = (await read($, explorer)).edit
+  if (targets.some(path => isEditIn(edit, path)) && edit !== undefined) {
+    await removeDraft($, edit.path)
+    await clearEdit($)
+  }
+  const isUnder = (at: string): boolean => targets.some(path => at === path || at.startsWith(path + '/'))
+  // The rows as they were, less the other targets, to find the neighbour.
+  const first = targets[0]!
+  const rows = flatten(listings, new Set(state.expanded), root, { mode: state.mode }).filter(
+    row => row.path === first || !isUnder(row.path),
+  )
+  const next = afterDelete(rows, first)
+  const parents = new Set(targets.map(parentOf))
+  for (const dir of [...listings.keys()]) {
+    if (isUnder(dir) || parents.has(dir)) listings.delete(dir)
+  }
+  for (const at of [...ignored]) if (isUnder(at)) ignored.delete(at)
+  footers.clear()
+  if (state.mode === 'unity') indexes.clear()
+  deleteFacts.clear()
+  await update($, explorer, s => {
+    const isGone = (at: string | undefined) => at !== undefined && isUnder(at)
+
+    return {
+      ...s,
+      deleting: undefined,
+      deletingMany: undefined,
+      marked: undefined,
+      expanded: s.expanded.filter(dir => !isUnder(dir)),
+      selected: isGone(s.selected) || s.selected === undefined ? next : s.selected,
+      cursor: isGone(s.cursor) || s.cursor === undefined ? next : s.cursor,
+      previewOffset: isGone(s.selected) ? 0 : s.previewOffset,
+      previewLeft: isGone(s.selected) ? 0 : s.previewLeft,
+    }
+  })
+}
+
+// The multi-delete bar's `delete`: one `rm -rf --` with every target (marks
+// under another marked dir left to it) and, in Unity mode, their `.meta`s.
+const confirmDeleteMany = async ($: EngineInterface, paths: readonly string[]): Promise<void> => {
+  const state = await read($, explorer)
+  const root = await rootOf($, state)
+  const targets = deleteTargets(paths, root)
+  if ('error' in targets) {
+    await cancelDelete($)
+    await toast($, targets.error)
+
+    return
+  }
+  const all = await Promise.all(targets.paths.map(path => factsOf($, path, state.mode)))
+  const failure = await runRm($, rmArgv(targets.paths, all))
+  if (failure !== undefined) {
+    await cancelDelete($)
+    await toast($, 'Delete failed: ' + failure)
+
+    return
+  }
+  await afterRemoved($, state, root, targets.paths)
+  await toast($, `Deleted ${targets.paths.length} items`)
+  $.ui.invalidate('ui.render')
 }
 
 // The delete bar's `delete`: `rm -rf --` the target (and its `.meta` in Unity
@@ -938,6 +1213,7 @@ const cancelDelete = async ($: EngineInterface): Promise<void> => {
 // cached listings under it and selects the next row.
 const confirmDelete = async ($: EngineInterface): Promise<void> => {
   const state = await read($, explorer)
+  if (state.deletingMany !== undefined) return confirmDeleteMany($, state.deletingMany)
   const path = state.deleting
   if (path === undefined) return
   const root = await rootOf($, state)
@@ -949,51 +1225,14 @@ const confirmDelete = async ($: EngineInterface): Promise<void> => {
     return
   }
   const facts = await factsOf($, target.path, state.mode)
-  const argv = ['rm', '-rf', '--', target.path, ...(facts.hasMeta ? [target.path + '.meta'] : [])]
-  let failure: string | undefined
-  try {
-    const ran = await $.process.run(argv, { timeoutMs: 60000 })
-    if (ran.exitCode !== 0) {
-      failure = ran.stderr.split('\n').find(line => line.trim() !== '') ?? `rm exited ${ran.exitCode}`
-    }
-  } catch (err) {
-    failure = err instanceof Error ? err.message : String(err)
-  }
+  const failure = await runRm($, rmArgv([target.path], [facts]))
   if (failure !== undefined) {
     await cancelDelete($)
     await toast($, 'Delete failed: ' + failure)
 
     return
   }
-  const edit = (await read($, explorer)).edit
-  if (isEditIn(edit, target.path)) {
-    await removeDraft($, edit.path)
-    await clearEdit($)
-  }
-  // The rows as they were, to find the neighbour to select.
-  const rows = flatten(listings, new Set(state.expanded), root, { mode: state.mode })
-  const next = afterDelete(rows, target.path)
-  const isUnder = (at: string): boolean => at === target.path || at.startsWith(target.path + '/')
-  for (const dir of [...listings.keys()]) {
-    if (isUnder(dir) || dir === parentOf(target.path)) listings.delete(dir)
-  }
-  for (const at of [...ignored]) if (isUnder(at)) ignored.delete(at)
-  footers.clear()
-  if (state.mode === 'unity') indexes.clear()
-  deleteFacts = undefined
-  await update($, explorer, s => {
-    const isGone = (at: string | undefined) => at !== undefined && isUnder(at)
-
-    return {
-      ...s,
-      deleting: undefined,
-      expanded: s.expanded.filter(dir => !isUnder(dir)),
-      selected: isGone(s.selected) || s.selected === undefined ? next : s.selected,
-      cursor: isGone(s.cursor) || s.cursor === undefined ? next : s.cursor,
-      previewOffset: isGone(s.selected) ? 0 : s.previewOffset,
-      previewLeft: isGone(s.selected) ? 0 : s.previewLeft,
-    }
-  })
+  await afterRemoved($, state, root, [target.path])
   await toast($, 'Deleted ' + nameOf(target.path) + (facts.hasMeta ? ' + .meta' : ''))
   $.ui.invalidate('ui.render')
 }
@@ -1274,8 +1513,9 @@ export const register = (on: On, options?: PluginOptions): void => {
     footers.clear()
     ignored.clear()
     unityRoots.clear()
-    deleteFacts = undefined
+    deleteFacts.clear()
     if (isIndexCommand(e.command)) indexes.clear()
+    await pruneGone($)
     await checkDisk($)
     $.ui.invalidate('ui.render')
 
@@ -1292,10 +1532,23 @@ export const register = (on: On, options?: PluginOptions): void => {
 
   // Closing the pane over unsaved text (the person, or another plugin) gets
   // the unsaved-changes bar instead; answering without `next` keeps it open.
+  // The two panes are one window: the ✕ on either closes both. The explorer
+  // closes first (its guard may hold both open); Git goes once it has.
   on('ui.close', { id: PANE }, async ($, e, next) => {
-    if (e.origin.kind !== 'unload' && (await guarded($, 'pane'))) return { value: undefined }
+    if (e.origin.kind === 'unload') return next(e)
+    if (await guarded($, 'pane')) return { value: undefined }
+    const closed = await next(e)
+    if ((await $.ui.panes()).some(pane => pane.id === GIT_PANE)) await $.ui.close({ id: GIT_PANE })
 
-    return next(e)
+    return closed
+  })
+
+  on('ui.close', { id: GIT_PANE }, async ($, e, next) => {
+    if (e.origin.kind !== 'person' || !(await $.ui.panes()).some(pane => pane.id === PANE)) return next(e)
+    // The explorer's hook closes Git after it, or the unsaved bar keeps both.
+    await $.ui.close({ id: PANE })
+
+    return { value: undefined }
   })
 
   on('ui.focus', { requestId: PANE }, async ($, e, next) => {
@@ -1381,6 +1634,32 @@ export const register = (on: On, options?: PluginOptions): void => {
   // A scrollbar dragged: the window moves, the selection stays (as the wheel).
   on('ui.message', { requestId: PANE }, async ($, e) => {
     if (e.element === 'editor') return editorMessage($, e.data, e.surface)
+    if (e.element.startsWith('item:')) {
+      // A tree row's Client (row-client.tsx): the arrow opens or closes a dir,
+      // the name selects, a double-click copies the path. The mark cell or a
+      // ctrl-click toggles the row's mark, a shift-click marks the rows from
+      // the selection to it.
+      const data = e.data as { hit?: unknown; ctrl?: unknown; shift?: unknown } | null
+      const hit = data?.hit
+      const row = await rowAt($, e.element.slice(5))
+      if (row === undefined) return {}
+      const state = await read($, explorer)
+      const isMarkedRow = isMulti(state) && marksOf(state).includes(row.path)
+      if (hit === 'arrow' && row.kind === 'dir') await toggle($, row.path)
+      else if ((hit === 'name' || hit === 'mark') && data?.shift === true) await markRange($, row.path)
+      else if (hit === 'mark' || (hit === 'name' && data?.ctrl === true)) await markToggle($, row.path)
+      else if (hit === 'name' && isMarkedRow) {
+        await press($, row, false, true)
+        collapseLater($, row.path)
+      } else if (hit === 'name') await press($, row)
+      else if (hit === 'double' && isMarkedRow) {
+        collapse?.cancel()
+        collapse = undefined
+        await copyMarked($, e.surface)
+      } else if (hit === 'double') await copyPath($, row.path, e.surface)
+
+      return {}
+    }
     const data = e.data as { offset?: unknown; start?: unknown; delta?: unknown; done?: unknown } | null
     if (e.element === 'split:tree') {
       // The splitter dragged: Files' new width is where it started plus the
@@ -1461,9 +1740,22 @@ export const register = (on: On, options?: PluginOptions): void => {
     const isAsking = edit?.confirm !== undefined || edit?.conflict !== undefined
     // The delete bar waits behind the conflict and unsaved-changes bars.
     const deleting = isAsking ? undefined : state.deleting
+    const deletingMany = isAsking ? undefined : state.deletingMany
     const facts = deleting === undefined ? undefined : await factsOf($, deleting, state.mode)
+    // Many: the marks `rm` would take (those under another marked dir go
+    // with it), counted together.
+    const manyTargets = deletingMany === undefined ? undefined : deleteTargets(deletingMany, root)
+    const manyPaths = manyTargets === undefined || 'error' in manyTargets ? deletingMany ?? [] : manyTargets.paths
+    const manyFacts =
+      deletingMany === undefined ? [] : await Promise.all(manyPaths.map(path => factsOf($, path, state.mode)))
+    const manyEntries = entriesOf(manyFacts)
     const deleteText =
-      deleting === undefined || facts === undefined
+      deletingMany !== undefined
+        ? `Delete ${manyPaths.length} items?` +
+          (manyEntries === String(manyPaths.length) ? '' : ` (${manyEntries} entries)`) +
+          (manyFacts.some(f => f.hasMeta) ? ' + .meta' : '') +
+          (manyPaths.some(path => isEditIn(state.edit, path)) && isEditDirty(state.edit) ? ' (open in editor, unsaved)' : '')
+        : deleting === undefined || facts === undefined
         ? ''
         : 'Delete ' +
           nameOf(deleting) +
@@ -1478,7 +1770,7 @@ export const register = (on: On, options?: PluginOptions): void => {
         ? 'conflict'
         : edit?.confirm !== undefined
           ? 'unsaved'
-          : deleting !== undefined
+          : deleting !== undefined || deletingMany !== undefined
             ? 'delete'
             : namingIn !== undefined
               ? 'naming'
@@ -1500,11 +1792,19 @@ export const register = (on: On, options?: PluginOptions): void => {
     // The wheel moves the window off the selection, so it only clamps here.
     const win = windowOf(rows, -1, treeRows, state.offset)
     const current = index < 0 ? undefined : rows[index]
+    // `mark (m)` toggles the cursor's row, else the selection's.
+    const markAt = [state.cursor, state.selected].find(path => path !== undefined && rows.some(row => row.path === path))
     const isUnity = state.mode === 'unity' && !isNotUnity
-    const preview =
-      current === undefined || edit !== undefined
+    // While 2+ rows are marked Preview lists them, the paths from the root.
+    const multi = isMulti(state)
+    const preview: Preview | undefined =
+      edit !== undefined
         ? undefined
-        : await loadPreview($, current, isUnity, root)
+        : multi
+          ? { type: 'text', lines: (await inRowOrder($, state)).map(path => relativePath(path, root)) }
+          : current === undefined
+            ? undefined
+            : await loadPreview($, current, isUnity, root)
     // Reference section: a header line, up to `shown` refs and a "+n more"
     // line; Code gets the rest of the pane rows.
     const refs = preview?.type === 'code' ? preview.refs : []
@@ -1742,17 +2042,21 @@ export const register = (on: On, options?: PluginOptions): void => {
               footers.clear()
               ignored.clear()
               unityRoots.clear()
-              deleteFacts = undefined
+              deleteFacts.clear()
               indexes.clear()
+              toplevels.clear()
+              if (state.marked !== undefined) void update($, explorer, s => ({ ...s, marked: undefined }))
               $.ui.invalidate('ui.render')
             },
             'r',
           )}
           {canEdit &&
             edit === undefined &&
+            !multi &&
             preview?.type === 'code' &&
             btn('edit', 'edit', 'secondary', () => void startEdit($, preview.path), 'e')}
           {canNew &&
+            !multi &&
             btn(
               'new',
               'new',
@@ -1770,7 +2074,20 @@ export const register = (on: On, options?: PluginOptions): void => {
                 ),
               'n',
             )}
-          {current !== undefined && !isAsking && btn('delete', 'delete', 'danger', () => void askDelete($, current.path), 'd')}
+          {markAt !== undefined && btn('mark', 'mark', 'ghost', () => void markToggle($, markAt), 'm')}
+          {multi
+            ? btn('copy', 'copy paths', 'ghost', () => void copyMarked($, surface), 'y')
+            : current !== undefined &&
+              btn('copy', 'copy path', 'ghost', () => void copyPath($, state.cursor ?? current.path, surface), 'y')}
+          {(multi || current !== undefined) &&
+            !isAsking &&
+            btn(
+              'delete',
+              'delete',
+              'danger',
+              () => void (multi ? askDeleteMany($, marksOf(state)) : current !== undefined && askDelete($, current.path)),
+              'd',
+            )}
         </Box>
         {/* The interactive line, only while something asks: the question or
             the name field on the left, its Buttons in the right corner. */}
@@ -1825,33 +2142,77 @@ export const register = (on: On, options?: PluginOptions): void => {
             <Box flexDirection="column" flexGrow={1}>
             {rows.length === 0 && <Text color={t.muted}>(empty)</Text>}
             {win.rows.map(row => {
-              // Selection mark, a rail per depth level, the dir arrow (a Text
-              // beside the Button: a Button has no color), then the name.
-              const isSelected = row.path === state.selected
+              // Selection mark, a rail per depth level, the dir arrow, then
+              // the name. Where a `Client` draws (terminal, desktop) the row is
+              // one (row-client.tsx: every click, the double-click, the arrow)
+              // and a blank 1-cell Button after it carries the keyboard ring.
+              // Elsewhere: Texts, the arrow a Button of its own, the name a
+              // Button (a Button has no color, so the arrow can't be in it).
+              // A marked row draws as the selected one; while 2+ are marked
+              // the selection shows only if it is one of them.
+              const isMarked = multi && marksOf(state).includes(row.path)
+              const isSelected = row.path === state.selected && (!multi || isMarked)
+              const isLit = isSelected || isMarked
               const isIgnored = ignored.has(row.path)
+              // The row's room: frame (2) and vertical bar (1).
+              const room = treeCols - 2 - 1
+              const label = (cells: number) =>
+                // the name's room past mark, rails and arrow; no horizontal
+                // scroll in list sections, so a long name is cut
+                fitLabel(row.kind === 'dir' ? row.name + '/' : row.name, Math.max(3, cells - 1 - 2 * row.depth - 2))
+              const arrow = row.kind === 'dir' ? (row.isExpanded ? '▾ ' : '▸ ') : '  '
+              if (canEdit && Client !== undefined) {
+                return (
+                  <Box key={'line:' + row.path} flexDirection="row" backgroundColor={isLit ? sel : undefined}>
+                    <Client
+                      key={'item:' + row.path}
+                      module="./row-client.tsx"
+                      props={{
+                        depth: row.depth,
+                        kind: row.kind,
+                        isExpanded: row.isExpanded,
+                        isSelected,
+                        isMarked,
+                        // the ring is on the blank cell: the name shows where
+                        // it is when it has left the selection
+                        isCursor: state.cursor === row.path && state.cursor !== state.selected,
+                        isIgnored,
+                        label: label(room - 1),
+                        colors: { accent: t.accent, border: t.border, muted: t.muted, selection: sel },
+                      }}
+                      width={Math.max(1, room - 1)}
+                      height={1}
+                    />
+                    <Button
+                      key={'row:' + row.path}
+                      plain
+                      label=" "
+                      autoFocus={row.path === focusKey ? true : undefined}
+                      onPress={() => press($, row, true)}
+                    />
+                  </Box>
+                )
+              }
 
               return (
                 <Box
                   key={'line:' + row.path}
                   flexDirection="row"
-                  backgroundColor={isSelected ? sel : undefined}
+                  backgroundColor={isLit ? sel : undefined}
                 >
-                  <Text color={t.accent}>{isSelected ? '▌' : ' '}</Text>
+                  <Text color={t.accent}>{isLit ? '▌' : ' '}</Text>
                   {row.depth > 0 && <Text color={t.border}>{'│ '.repeat(row.depth)}</Text>}
-                  <Text color={isIgnored ? t.muted : t.accent}>
-                    {row.kind === 'dir' ? (row.isExpanded ? '▾ ' : '▸ ') : '  '}
-                  </Text>
+                  {row.kind === 'dir' ? (
+                    <Button key={'arrow:' + row.path} plain label={arrow} onPress={() => toggle($, row.path)} />
+                  ) : (
+                    <Text color={isIgnored ? t.muted : t.accent}>{arrow}</Text>
+                  )}
                   <Button
                     key={'row:' + row.path}
                     plain
                     dimColor={isIgnored}
                     autoFocus={row.path === focusKey ? true : undefined}
-                    label={fitLabel(
-                      row.kind === 'dir' ? row.name + '/' : row.name,
-                      // the room left: frame, vertical bar, mark, rails, arrow;
-                      // no horizontal scroll in list sections, so a long name is cut
-                      Math.max(3, treeCols - 2 - 1 - 1 - 2 * row.depth - 2),
-                    )}
+                    label={label(room)}
                     onPress={() => press($, row)}
                   />
                 </Box>

@@ -260,3 +260,25 @@ export const fitLabel = (label: string, width: number): string => {
 
   return out + '…'
 }
+
+// `path` as named from `base` (the repo's toplevel): `base` itself is `.`, a
+// path outside it stays as given.
+export const relativePath = (path: string, base: string): string => {
+  const trimmed = base.length > 1 && base.endsWith('/') ? base.slice(0, -1) : base
+  if (path === trimmed) return '.'
+  const inside = trimmed.endsWith('/') ? trimmed : trimmed + '/'
+
+  return path.startsWith(inside) ? path.slice(inside.length) : path
+}
+
+export type RowHit = 'mark' | 'arrow' | 'name'
+
+// What column `x` of a tree row is: cell 0 the selection mark, then a rail
+// (`│ `) per depth level and the arrow's 2 cells (a dir's; a file's blank
+// pair counts as its name), then the name.
+export const rowHit = (depth: number, kind: Entry['kind'], x: number): RowHit => {
+  if (x <= 0) return 'mark'
+  const arrow = 1 + 2 * Math.max(0, depth)
+
+  return kind === 'dir' && x >= arrow && x < arrow + 2 ? 'arrow' : 'name'
+}

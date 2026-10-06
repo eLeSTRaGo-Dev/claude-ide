@@ -31,6 +31,8 @@ export type ExplorerState = {
   previewOffset: number // first preview line shown
   previewLeft?: number // first preview column shown (horizontal bar); reset with previewOffset
   deleting?: string // the file or dir the delete bar asks about; cleared by its `delete` or `cancel`
+  deletingMany?: string[] // the marked paths the delete bar asks about (2+ marked when it opened); cleared with `deleting`
+  marked?: string[] // the multi-selection (ctrl/shift-click, the mark cell, `m`); absent or empty: only `selected`
   edit?: {
     path: string // the file open in the Edit section
     baseMtime?: number // its mtime when loaded or last saved; absent for a new file

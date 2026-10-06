@@ -52,6 +52,9 @@ let clock = 1_800_000_000_000
 // `grep` output per cwd, for the Unity GUID index.
 const GREP: Record<string, string> = {}
 
+// The repo toplevel per root, for `copy path`; a root not here is no repo.
+const TOPLEVELS: Record<string, string> = { '/proj': '/proj', '/mono/app': '/mono' }
+
 // Paths the fake `rm` refuses (its exit 1 and stderr).
 const FAIL_RM = new Set<string>()
 
@@ -147,6 +150,20 @@ const fake = (
           exitCode: 0,
           stdout: `${descendants(e.argv[4] ?? '')}\n`,
           stderr: '',
+          isStdoutTruncated: false,
+          isStderrTruncated: false,
+        },
+      }
+    }
+    // `git -C <root> rev-parse --show-toplevel`: the repo holding the root
+    if (e.argv[0] === 'git' && e.argv.includes('--show-toplevel')) {
+      const top = TOPLEVELS[e.argv[2] ?? '']
+
+      return {
+        value: {
+          exitCode: top === undefined ? 128 : 0,
+          stdout: top === undefined ? '' : top + '\n',
+          stderr: top === undefined ? 'fatal: not a git repository\n' : '',
           isStdoutTruncated: false,
           isStderrTruncated: false,
         },
@@ -263,7 +280,66 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect(code?.props.language).toBe('typescript')
   })
 
-  test(`${surface}: a dir press selects, a press on the selected dir toggles it`, async ($, on) => {
+  // A left click on a row Client's cell `x` (a dir's arrow is x 1-2 at depth 0).
+  const click = async (ui: Pane, path: string, x: number, flags: { ctrl?: true; shift?: true } = {}) => {
+    await ui.pointer({ type: 'down', x, y: 0, button: 'left', in: 'item:' + path, ...flags })
+    await ui.pointer({ type: 'up', x, y: 0, button: 'left', in: 'item:' + path, ...flags })
+  }
+
+  test(`${surface}: a name click selects a dir, only its arrow opens and closes it`, async ($, on) => {
+    mock.store(on)
+    fake(on)
+    await $.session.start(start(surface))
+    const ui = await $.ui.mount({
+      plugin: PLUGIN,
+      surface,
+      component: 'Pane',
+      props: PROPS,
+      requestId: 'ide-explorer',
+      viewport: VIEWPORT,
+    })
+    const rowOf = async (path: string) =>
+      (await ui.find({ key: 'item:' + path }))?.props.props as
+        | { label?: string; isSelected?: boolean; isExpanded?: boolean }
+        | undefined
+
+    expect((await rowOf('/proj/src'))?.label).toBe('src/')
+    expect(await ui.find({ type: 'Text', text: '▸ ', in: 'item:/proj/src' })).toBeDefined()
+    // the keyboard ring: one blank cell after the row
+    expect((await ui.find({ key: 'row:/proj/src' }))?.props.label).toBe(' ')
+
+    // the name: selects (the preview shows the dir), never opens it
+    await click(ui, '/proj/src', 3)
+    expect((await rowOf('/proj/src'))?.isSelected).toBe(true)
+    expect(await ui.find({ type: 'Text', text: /1 entries/ })).toBeDefined()
+    expect(await ui.find({ key: 'item:/proj/src/main.ts' })).toBeUndefined()
+    await ui.advance(500)
+    await click(ui, '/proj/src', 4)
+    expect(await ui.find({ key: 'item:/proj/src/main.ts' })).toBeUndefined()
+    await ui.advance(500)
+
+    // the arrow: opens and closes, the selection stays
+    await click(ui, '/proj/src', 1)
+    expect(await ui.find({ key: 'item:/proj/src/main.ts' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: '▾ ', in: 'item:/proj/src' })).toBeDefined()
+    await click(ui, '/proj/src', 2)
+    expect(await ui.find({ key: 'item:/proj/src/main.ts' })).toBeUndefined()
+    expect((await rowOf('/proj/src'))?.isSelected).toBe(true)
+
+    // the arrow of an unselected dir opens it without selecting it
+    await click(ui, '/proj/notes.txt', 5)
+    await ui.advance(500)
+    await click(ui, '/proj/src', 1)
+    expect(await ui.find({ key: 'item:/proj/src/main.ts' })).toBeDefined()
+    expect((await rowOf('/proj/src'))?.isSelected).toBe(false)
+    expect((await rowOf('/proj/notes.txt'))?.isSelected).toBe(true)
+
+    // the message the Client posts does the same
+    await ui.post({ hit: 'arrow' }, { in: 'item:/proj/src' })
+    expect(await ui.find({ key: 'item:/proj/src/main.ts' })).toBeUndefined()
+  })
+
+  test(`${surface}: Enter on the selected dir still opens and closes it`, async ($, on) => {
     mock.store(on)
     fake(on)
     await $.session.start(start(surface))
@@ -276,18 +352,92 @@ for (const surface of ['terminal', 'desktop'] as const) {
       viewport: VIEWPORT,
     })
 
+    // the blank `row:` Button is the keyboard ring: Enter selects, then toggles
     await ui.press({ key: 'row:/proj/src' })
-    expect(await ui.find({ key: 'row:/proj/src/main.ts' })).toBeUndefined()
-    expect((await ui.find({ key: 'row:/proj/src' }))?.props.label).toBe('src/')
-    expect(await ui.find({ type: 'Text', text: '▸ ' })).toBeDefined()
+    expect(await ui.find({ key: 'item:/proj/src/main.ts' })).toBeUndefined()
+    await ui.press({ key: 'row:/proj/src' })
+    expect(await ui.find({ key: 'item:/proj/src/main.ts' })).toBeDefined()
+    await ui.press({ key: 'row:/proj/src' })
+    expect(await ui.find({ key: 'item:/proj/src/main.ts' })).toBeUndefined()
+  })
 
-    await ui.press({ key: 'row:/proj/src' })
-    expect(await ui.find({ key: 'row:/proj/src/main.ts' })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: '▾ ' })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: '▸ ' })).toBeUndefined()
+  test(`${surface}: a double-click copies the path from the repo toplevel`, async ($, on) => {
+    mock.store(on)
+    fake(on)
+    const copied: string[] = []
+    const toasts: string[] = []
+    on('ui.copy', (_$, e) => {
+      copied.push(e.text)
 
-    await ui.press({ key: 'row:/proj/src' })
-    expect(await ui.find({ key: 'row:/proj/src/main.ts' })).toBeUndefined()
+      return { value: { isCopied: true } }
+    })
+    on('ui.toast', (_$, e) => {
+      toasts.push(e.text)
+
+      return { value: undefined }
+    })
+    await $.session.start(start(surface))
+    const ui = await $.ui.mount({
+      plugin: PLUGIN,
+      surface,
+      component: 'Pane',
+      props: PROPS,
+      requestId: 'ide-explorer',
+      viewport: VIEWPORT,
+    })
+    await ui.post({ hit: 'arrow' }, { in: 'item:/proj/src' })
+
+    // two clicks 120 ms apart on a nested file's name: select, then copy
+    await click(ui, '/proj/src/main.ts', 6)
+    await ui.advance(100)
+    await click(ui, '/proj/src/main.ts', 6)
+    expect(copied).toEqual(['src/main.ts'])
+    expect(toasts.at(-1)).toBe('Copied: src/main.ts')
+    expect(await ui.find({ type: 'Code' })).toBeDefined()
+
+    // two clicks further apart than 400 ms are two clicks
+    await ui.advance(500)
+    await click(ui, '/proj/notes.txt', 3)
+    await ui.advance(500)
+    await click(ui, '/proj/notes.txt', 3)
+    expect(copied).toHaveLength(1)
+
+    // two quick clicks on an arrow open and close the dir, no copy
+    await ui.advance(500)
+    await click(ui, '/proj/src', 1)
+    await click(ui, '/proj/src', 1)
+    expect(copied).toHaveLength(1)
+    expect(await ui.find({ key: 'item:/proj/src/main.ts' })).toBeDefined()
+
+    // `copy path` (y) copies the cursor's row
+    expect((await ui.find({ key: 'copy' }))?.props.hotkey).toBe('y')
+    await ui.press({ key: 'copy' })
+    expect(copied.at(-1)).toBe('src')
+  })
+
+  test(`${surface}: copy path names a root inside a repo from the repo's top`, async ($, on) => {
+    mock.store(on)
+    fake(on, [], [], [], () => '/mono/app')
+    TREE['/mono/app'] = [entry('a.ts', 'file')]
+    FILES['/mono/app/a.ts'] = 'a\n'
+    const copied: string[] = []
+    on('ui.copy', (_$, e) => {
+      copied.push(e.text)
+
+      return { value: { isCopied: true } }
+    })
+    await $.session.start({ cwd: '/mono/app', surface, isInteractive: true })
+    const ui = await $.ui.mount({
+      plugin: PLUGIN,
+      surface,
+      component: 'Pane',
+      props: PROPS,
+      requestId: 'ide-explorer',
+      viewport: VIEWPORT,
+    })
+    expect(await ui.find({ key: 'copy' })).toBeUndefined()
+    await ui.post({ hit: 'double' }, { in: 'item:/mono/app/a.ts' })
+    expect(copied).toEqual(['app/a.ts'])
   })
 
   test(`${surface}: footer shows dir, branch and change counts`, async ($, on) => {
@@ -359,10 +509,13 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect(await ui.find({ type: 'Text', text: /10 B/ })).toBeDefined()
 
     expect(calls.some(argv => argv[1] === 'check-ignore')).toBe(true)
-    const log = await ui.find({ key: 'row:/proj/out.log' })
-    expect(log?.props.dimColor).toBe(true)
-    const notes = await ui.find({ key: 'row:/proj/notes.txt' })
-    expect(notes?.props.dimColor).toBeFalsy()
+    // the row Client draws the name, dimmed when ignored
+    const rowProps = async (path: string) =>
+      (await ui.find({ key: 'item:' + path }))?.props.props as { isIgnored?: boolean } | undefined
+    expect((await rowProps('/proj/out.log'))?.isIgnored).toBe(true)
+    expect((await rowProps('/proj/notes.txt'))?.isIgnored).toBe(false)
+    const name = await ui.find({ type: 'Text', text: 'out.log', in: 'item:/proj/out.log' })
+    expect(name?.props.dimColor).toBe(true)
   })
 
   test(`${surface}: dir preview counts entries`, async ($, on) => {
@@ -950,17 +1103,18 @@ for (const surface of ['terminal', 'desktop'] as const) {
     await ui.pointer({ type: 'move', button: 'left', x: -100, y: 3, in: 'split:tree' })
     await ui.pointer({ type: 'up', button: 'left', x: -100, y: 3, in: 'split:tree' })
     expect(await cellsOf(ui)).toBe(12)
-    const labels = (await ui.findAll({ type: 'Button' }))
-      .filter(b => (b.key ?? '').startsWith('row:'))
-      .map(b => String(b.props.label))
+    const items = (await ui.findAll({ type: 'Client' })).filter(c => (c.key ?? '').startsWith('item:'))
+    const labels = items.map(c => String((c.props.props as { label?: string }).label))
     expect(labels.length > 0).toBe(true)
-    // 12 columns: frame 2, vertical bar 1, mark 1, file glyph 2, so 6 for 'h00.txt'
+    // 12 columns: frame 2, vertical bar 1 and the keyboard cell 1 leave the
+    // row Client 8: mark 1, file glyph 2, so 5 for 'h00.txt'
+    for (const item of items) expect(item.props.width).toBe(8)
     for (const label of labels) {
-      expect(label.length).toBe(6)
+      expect(label.length).toBe(5)
       expect(label.endsWith('…')).toBe(true)
       expect(label.includes('\n')).toBe(false)
     }
-    expect(labels[0]).toBe('h00.t…')
+    expect(labels[0]).toBe('h00.…')
   })
 
   test(`${surface}: a Files seam drag writes layout:explorer on release only`, async ($, on) => {
@@ -1145,6 +1299,27 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect(closed).toBe(1)
   })
 
+  test(`${surface}: closing the explorer closes Git too`, { plugins: [closer] }, async ($, on) => {
+    fake(on)
+    const open = new Set(['ide-explorer', 'ide-git'])
+    on('ui.panes', () => ({ value: [...open].map(id => ({ id, isFocused: false })) as never }))
+    const closed: string[] = []
+    on('ui.close', (_$, e) => {
+      closed.push(e.id)
+      open.delete(e.id)
+
+      return { value: undefined }
+    })
+    await $.session.start({ cwd: CWD, surface, isInteractive: true })
+    await $.command.run({
+      command: 'close-explorer',
+      args: '',
+      origin: { kind: 'composer' },
+      presentation: PRESENTATION,
+    })
+    expect(closed).toEqual(['ide-explorer', 'ide-git'])
+  })
+
   test(`${surface}: session.start restores the draft`, async ($, on) => {
     const { ui, settle, text, title } = await editing($, on, surface, '/ed6', { 'a.ts': 'one\n' })
     await ui.key({ key: 'x', in: 'editor' })
@@ -1311,6 +1486,44 @@ test('vscode: no Client, so no edit button', async ($, on) => {
   expect(await ui.find({ key: 'edit' })).toBeUndefined()
   // `new` opens the editor, so it needs a Client too, though vscode has Input.
   expect(await ui.find({ key: 'new' })).toBeUndefined()
+})
+
+test('vscode: the name Button selects, the arrow Button opens and closes', async ($, on) => {
+  mock.store(on)
+  fake(on)
+  const copied: string[] = []
+  on('ui.copy', (_$, e) => {
+    copied.push(e.text)
+
+    return { value: { isCopied: true } }
+  })
+  await $.session.start({ cwd: CWD, surface: 'vscode', isInteractive: true })
+  const ui = await $.ui.mount({
+    plugin: PLUGIN,
+    surface: 'vscode',
+    component: 'Pane',
+    props: PROPS,
+    requestId: 'ide-explorer',
+    viewport: VIEWPORT,
+  })
+  expect(await ui.find({ key: 'item:/proj/src' })).toBeUndefined()
+  expect((await ui.find({ key: 'row:/proj/src' }))?.props.label).toBe('src/')
+  expect((await ui.find({ key: 'arrow:/proj/src' }))?.props.label).toBe('▸ ')
+  expect(await ui.find({ key: 'arrow:/proj/notes.txt' })).toBeUndefined()
+
+  // a press on the name never opens the dir, the selected one neither
+  await ui.press({ key: 'row:/proj/src' })
+  await ui.press({ key: 'row:/proj/src' })
+  expect(await ui.find({ key: 'row:/proj/src/main.ts' })).toBeUndefined()
+  await ui.press({ key: 'arrow:/proj/src' })
+  expect(await ui.find({ key: 'row:/proj/src/main.ts' })).toBeDefined()
+  expect((await ui.find({ key: 'arrow:/proj/src' }))?.props.label).toBe('▾ ')
+  await ui.press({ key: 'arrow:/proj/src' })
+  expect(await ui.find({ key: 'row:/proj/src/main.ts' })).toBeUndefined()
+
+  // no double-click here: `copy path` copies
+  await ui.press({ key: 'copy' })
+  expect(copied).toEqual(['src'])
 })
 
 // ---------------------------------------------------------------- New file
@@ -1990,5 +2203,234 @@ for (const surface of ['terminal', 'desktop'] as const) {
     await $.session.start(start(surface))
     const ui = await mountPane($, 'ide-explorer')
     expect(await isActiveTab(ui, surface, 'unity')).toBe(true)
+  })
+}
+
+// ---------------------------------------------------------- Multi-selection
+
+// Mounts `/proj` with copies and toasts recorded.
+const marking = async <S extends 'terminal' | 'desktop' | 'vscode'>($: Engine, on: On, surface: S) => {
+  mock.store(on)
+  const clock = mock.clock(on)
+  fake(on)
+  const copied: string[] = []
+  const toasts: string[] = []
+  on('ui.copy', (_$, e) => {
+    copied.push(e.text)
+
+    return { value: { isCopied: true } }
+  })
+  on('ui.toast', (_$, e) => {
+    toasts.push(e.text)
+
+    return { value: undefined }
+  })
+  await $.session.start({ cwd: CWD, surface, isInteractive: true })
+  const ui = await $.ui.mount({
+    plugin: PLUGIN,
+    surface,
+    component: 'Pane',
+    props: PROPS,
+    requestId: 'ide-explorer',
+    viewport: VIEWPORT,
+  })
+
+  return { ui, copied, toasts, clock }
+}
+
+for (const surface of ['terminal', 'desktop'] as const) {
+  const click = async (ui: Pane, path: string, x: number, flags: { ctrl?: true; shift?: true } = {}) => {
+    await ui.pointer({ type: 'down', x, y: 0, button: 'left', in: 'item:' + path, ...flags })
+    await ui.pointer({ type: 'up', x, y: 0, button: 'left', in: 'item:' + path, ...flags })
+  }
+  const rowOf = async (ui: Pane, path: string) =>
+    (await ui.find({ key: 'item:' + path }))?.props.props as { isSelected?: boolean; isMarked?: boolean }
+  const lit = async (ui: Pane, path: string) => {
+    const row = await rowOf(ui, path)
+
+    return row.isSelected === true || row.isMarked === true
+  }
+
+  test(`${surface}: ctrl-click and the mark cell mark rows; Preview lists them; a plain click clears`, async ($, on) => {
+    const { ui } = await marking($, on, surface)
+    await ui.press({ key: 'row:/proj/notes.txt' })
+    expect(await ui.find({ key: 'edit' })).toBeDefined()
+
+    // ctrl-click adds to the selection
+    await click(ui, '/proj/out.log', 4, { ctrl: true })
+    expect((await rowOf(ui, '/proj/notes.txt')).isMarked).toBe(true)
+    expect((await rowOf(ui, '/proj/out.log')).isMarked).toBe(true)
+    expect(await ui.find({ type: 'Text', text: 'notes.txt' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'out.log' })).toBeDefined()
+    expect(await ui.find({ type: 'Code' })).toBeUndefined()
+    expect((await ui.find({ key: 'title:preview' }))?.props.label).toBe(' Preview ')
+    expect(await ui.find({ key: 'edit' })).toBeUndefined()
+    expect(await ui.find({ key: 'new' })).toBeUndefined()
+
+    // the mark cell toggles a row in and out
+    await ui.advance(500)
+    await click(ui, '/proj/app.bin', 0)
+    expect((await rowOf(ui, '/proj/app.bin')).isMarked).toBe(true)
+    await ui.advance(500)
+    await click(ui, '/proj/notes.txt', 0)
+    expect(await lit(ui, '/proj/notes.txt')).toBe(false)
+    expect(await ui.find({ type: 'Text', text: 'notes.txt' })).toBeUndefined()
+    // the message the Client posts does the same
+    await ui.post({ hit: 'name', ctrl: true }, { in: 'item:/proj/out.log' })
+    // one left: the marks go, that row is the selection
+    expect((await rowOf(ui, '/proj/app.bin')).isMarked).toBe(false)
+    expect((await rowOf(ui, '/proj/app.bin')).isSelected).toBe(true)
+
+    // a plain click on an unmarked row ends a multi-selection
+    await ui.post({ hit: 'mark' }, { in: 'item:/proj/notes.txt' })
+    expect((await rowOf(ui, '/proj/notes.txt')).isMarked).toBe(true)
+    await ui.advance(500)
+    await click(ui, '/proj/src', 4)
+    expect(await lit(ui, '/proj/notes.txt')).toBe(false)
+    expect(await lit(ui, '/proj/app.bin')).toBe(false)
+    expect((await rowOf(ui, '/proj/src')).isSelected).toBe(true)
+    expect(await ui.find({ type: 'Text', text: /1 entries/ })).toBeDefined()
+  })
+
+  test(`${surface}: shift-click marks a range; a plain click on a marked row collapses after the double-click window`, async ($, on) => {
+    const { ui, clock } = await marking($, on, surface)
+    await ui.press({ key: 'row:/proj/src' })
+    // files sort app.bin, notes.txt, out.log
+    await ui.press({ key: 'row:/proj/app.bin' })
+    await click(ui, '/proj/out.log', 4, { shift: true })
+    for (const path of ['/proj/app.bin', '/proj/notes.txt', '/proj/out.log']) {
+      expect((await rowOf(ui, path)).isMarked).toBe(true)
+    }
+    expect(await lit(ui, '/proj/src')).toBe(false)
+
+    await ui.advance(500)
+    await click(ui, '/proj/notes.txt', 4)
+    expect((await rowOf(ui, '/proj/app.bin')).isMarked).toBe(true)
+    await clock.advance(500)
+    expect(await lit(ui, '/proj/app.bin')).toBe(false)
+    expect((await rowOf(ui, '/proj/notes.txt')).isSelected).toBe(true)
+  })
+
+  test(`${surface}: y and a double-click on a marked row copy every marked path`, async ($, on) => {
+    const { ui, copied, toasts, clock } = await marking($, on, surface)
+    await ui.post({ hit: 'arrow' }, { in: 'item:/proj/src' })
+    await ui.press({ key: 'row:/proj/src/main.ts' })
+    await ui.post({ hit: 'name', ctrl: true }, { in: 'item:/proj/out.log' })
+    await ui.post({ hit: 'mark' }, { in: 'item:/proj/notes.txt' })
+    expect((await ui.find({ key: 'copy' }))?.props.hotkey).toBe('y')
+    await ui.press({ key: 'copy' })
+    // tree order, named from the repo toplevel
+    expect(copied).toEqual(['src/main.ts\nnotes.txt\nout.log'])
+    expect(toasts.at(-1)).toBe('Copied 3 paths')
+
+    await ui.advance(500)
+    await click(ui, '/proj/notes.txt', 4)
+    await ui.advance(100)
+    await click(ui, '/proj/notes.txt', 4)
+    expect(copied).toHaveLength(2)
+    expect(copied.at(-1)).toBe('src/main.ts\nnotes.txt\nout.log')
+    // the double-click kept the marks
+    await ui.advance(500)
+    await clock.advance(500)
+    expect((await rowOf(ui, '/proj/out.log')).isMarked).toBe(true)
+  })
+
+  test(`${surface}: refresh and a mode switch clear the marks; closing a dir unmarks what it hides`, async ($, on) => {
+    const { ui } = await marking($, on, surface)
+    await ui.press({ key: 'row:/proj/notes.txt' })
+    await ui.post({ hit: 'mark' }, { in: 'item:/proj/out.log' })
+    expect((await rowOf(ui, '/proj/out.log')).isMarked).toBe(true)
+    await ui.press({ key: 'refresh' })
+    expect(await lit(ui, '/proj/out.log')).toBe(false)
+
+    await ui.post({ hit: 'mark' }, { in: 'item:/proj/out.log' })
+    expect((await rowOf(ui, '/proj/out.log')).isMarked).toBe(true)
+    await ui.press({ key: 'tab:unity' })
+    await ui.press({ key: 'tab:files' })
+    expect(await lit(ui, '/proj/out.log')).toBe(false)
+
+    await ui.post({ hit: 'arrow' }, { in: 'item:/proj/src' })
+    await ui.post({ hit: 'mark' }, { in: 'item:/proj/src/main.ts' })
+    await ui.post({ hit: 'mark' }, { in: 'item:/proj/out.log' })
+    expect(await ui.find({ type: 'Text', text: 'src/main.ts' })).toBeDefined()
+    await ui.post({ hit: 'arrow' }, { in: 'item:/proj/src' })
+    expect(await ui.find({ type: 'Text', text: 'src/main.ts' })).toBeUndefined()
+    expect((await rowOf(ui, '/proj/out.log')).isMarked).toBe(true)
+  })
+
+  test(`${surface}: a Bash call that removes a marked file unmarks it`, async ($, on) => {
+    on('tool.call', () => ({ result: {}, text: '' }) as never)
+    TREE['/proj'] = [...(TREE['/proj'] ?? []), entry('gone.txt', 'file')]
+    FILES['/proj/gone.txt'] = 'g\n'
+    const { ui } = await marking($, on, surface)
+    await ui.press({ key: 'row:/proj/notes.txt' })
+    await ui.post({ hit: 'mark' }, { in: 'item:/proj/gone.txt' })
+    expect((await rowOf(ui, '/proj/notes.txt')).isMarked).toBe(true)
+    removePath('/proj/gone.txt')
+    await $.tool.call({ tool: 'Bash', command: 'rm gone.txt' })
+    expect(await ui.find({ key: 'item:/proj/gone.txt' })).toBeUndefined()
+    expect((await rowOf(ui, '/proj/notes.txt')).isMarked).toBe(false)
+    expect((await ui.find({ type: 'Code' }))?.text).toContain('hello notes')
+  })
+
+  test(`${surface}: delete with 2+ marked asks once and removes them in one rm`, async ($, on) => {
+    const root = '/delm-' + surface
+    const { ui, toasts, bar, rms } = await deleting($, on, surface, root)
+    await ui.post({ hit: 'arrow' }, { in: `item:${root}/src` })
+    await ui.press({ key: `row:${root}/src` })
+    // x.ts goes with its marked dir; it is not an operand of its own
+    await click(ui, `${root}/src/x.ts`, 6, { ctrl: true })
+    await ui.advance(500)
+    await click(ui, `${root}/a.txt`, 4, { ctrl: true })
+    expect((await rowOf(ui, `${root}/a.txt`)).isMarked).toBe(true)
+
+    await ui.press({ key: 'delete' })
+    expect(await bar()).toBe('Delete 2 items? (4 entries)')
+    await ui.press({ key: 'delete:cancel' })
+    expect(rms()).toEqual([])
+    expect(await bar()).toBeUndefined()
+
+    await ui.press({ key: 'delete' })
+    await ui.press({ key: 'delete:confirm' })
+    expect(rms()).toEqual([['rm', '-rf', '--', `${root}/src`, `${root}/a.txt`]])
+    expect(await bar()).toBeUndefined()
+    for (const path of ['src', 'src/x.ts', 'a.txt']) expect(await ui.find({ key: `row:${root}/${path}` })).toBeUndefined()
+    expect(FILES[`${root}/src/y.ts`]).toBeUndefined()
+    // the row after the first target among those that stay
+    expect((await rowOf(ui, `${root}/b.txt`)).isSelected).toBe(true)
+    expect((await ui.find({ type: 'Code' }))?.text).toContain('bbb')
+    expect(toasts.at(-1)).toBe('Deleted 2 items')
+    expect((await ui.find({ key: 'copy' }))?.props.label).not.toBe('copy paths')
+  })
+
+  test(`${surface}: two marked files: no entry count`, async ($, on) => {
+    const root = '/delm2-' + surface
+    const { ui, bar } = await deleting($, on, surface, root)
+    await ui.press({ key: `row:${root}/a.txt` })
+    await ui.post({ hit: 'mark' }, { in: `item:${root}/b.txt` })
+    await ui.press({ key: 'delete' })
+    expect(await bar()).toBe('Delete 2 items?')
+  })
+}
+
+for (const surface of ['terminal', 'desktop', 'vscode'] as const) {
+  test(`${surface}: mark (m) toggles the cursor's row`, async ($, on) => {
+    const { ui } = await marking($, on, surface)
+    expect(await ui.find({ key: 'mark' })).toBeUndefined()
+    await ui.press({ key: 'row:/proj/notes.txt' })
+    expect((await ui.find({ key: 'mark' }))?.props.hotkey).toBe('m')
+    // the arrow moves the cursor to src
+    if (surface === 'vscode') await ui.press({ key: 'arrow:/proj/src' })
+    else await (ui as unknown as Pane).post({ hit: 'arrow' }, { in: 'item:/proj/src' })
+    await ui.press({ key: 'mark' })
+    expect(await ui.find({ type: 'Text', text: 'src' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'notes.txt' })).toBeDefined()
+    expect((await ui.find({ key: 'copy' }))?.props.label).toBe('copy paths')
+    if (surface === 'vscode') {
+      expect((await ui.find({ key: 'line:/proj/src' }))?.props.backgroundColor).toBeDefined()
+    }
+    await ui.press({ key: 'mark' })
+    expect((await ui.find({ key: 'copy' }))?.props.label).toBe('copy path')
+    expect((await ui.find({ type: 'Code' }))?.text).toContain('hello notes')
   })
 }
